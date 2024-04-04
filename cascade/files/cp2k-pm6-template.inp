@@ -1,0 +1,38 @@
+&FORCE_EVAL
+   &DFT
+      CHARGE 0  ! Species should be charged balanced
+      UKS T
+      MULTIPLICITY $mult ! Unpaired electrons for the metal ion and surrounding ligands
+
+      &POISSON
+        &EWALD
+            ALPHA .5
+            EWALD_TYPE EWALD
+            GMAX 31
+            &MULTIPOLES
+              MAX_MULTIPOLE_EXPANSION QUADRUPOLE
+            &END MULTIPOLES
+        &END EWALD
+      &END
+      &QS
+        METHOD PM6-FM
+        &SE
+            ANALYTICAL_GRADIENTS TRUE
+            PERIODIC EWALD
+        &END SE
+
+      &END QS
+
+      &SCF
+        IGNORE_CONVERGENCE_FAILURE
+        EPS_SCF 1.E-6
+        &OT ON
+            PRECONDITIONER FULL_SINGLE_INVERSE
+            MINIMIZER DIIS
+        &END
+        &OUTER_SCF
+            MAX_SCF 8
+        &END OUTER_SCF
+      &END SCF
+   &END DFT
+&END FORCE_EVAL

@@ -1,0 +1,43 @@
+&FORCE_EVAL
+   &DFT
+      BASIS_SET_FILE_NAME BASIS_MOLOPT_UZH
+      POTENTIAL_FILE_NAME POTENTIAL_UZH
+
+      CHARGE 0  ! Species should be charged balanced
+      UKS T
+      MULTIPLICITY $mult ! Unpaired electrons for the metal ion and surrounding ligands
+
+      &QS
+        METHOD GPW
+      &END QS
+
+      &SCF
+         IGNORE_CONVERGENCE_FAILURE
+         ADDED_MOS 60
+         &SMEAR
+             WINDOW_SIZE [eV] 0.3
+         &END SMEAR
+         &MIXING
+            METHOD BROYDEN_MIXING
+            ALPHA 0.4
+            NMIXING 16
+         &END MIXING
+      &END SCF
+      &XC
+         &XC_FUNCTIONAL BLYP
+         &END XC_FUNCTIONAL
+        &VDW_POTENTIAL
+            DISPERSION_FUNCTIONAL PAIR_POTENTIAL
+            &PAIR_POTENTIAL
+                TYPE DFTD3
+                PARAMETER_FILE_NAME ./dftd3.dat
+                REFERENCE_FUNCTIONAL BLYP
+            &END PAIR_POTENTIAL
+        &END VDW_POTENTIAL
+      &END XC
+      &MGRID
+         NGRIDS 5
+         REL_CUTOFF [Ry] 60
+      &END MGRID
+   &END DFT
+&END FORCE_EVAL

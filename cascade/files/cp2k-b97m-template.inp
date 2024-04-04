@@ -1,0 +1,42 @@
+&FORCE_EVAL
+   &DFT
+
+      CHARGE 0  ! Species should be charged balanced
+      UKS T
+      MULTIPLICITY $mult
+
+      &QS
+        METHOD GPW
+      &END QS
+
+      &SCF
+         IGNORE_CONVERGENCE_FAILURE
+         ADDED_MOS 60
+         &SMEAR
+             WINDOW_SIZE [eV] 0.3
+         &END SMEAR
+         &MIXING
+            METHOD BROYDEN_MIXING
+            ALPHA 0.4
+            NMIXING 16
+         &END MIXING
+      &END SCF
+      &XC
+         &XC_FUNCTIONAL
+            &MGGA_XC_B97M_V
+            &END MGGA_XC_B97M_V
+         &END XC_FUNCTIONAL
+         &VDW_POTENTIAL
+            POTENTIAL_TYPE NON_LOCAL
+            &NON_LOCAL
+                TYPE RVV10
+                PARAMETERS 6.0 0.01
+            &END NON_LOCAL
+         &END VDW_POTENTIAL
+      &END XC
+      &MGRID
+         NGRIDS 5
+         REL_CUTOFF [Ry] 60
+      &END MGRID
+   &END DFT
+&END FORCE_EVAL

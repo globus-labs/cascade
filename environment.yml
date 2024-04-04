@@ -1,0 +1,25 @@
+name: cascade
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Core dependencies
+  - python==3.11
+  - matplotlib
+  - scikit-learn>=1
+  - jupyterlab
+  - pandas
+  - pytest
+  - flake8
+  - pip
+
+  # Computational chemistry
+  - packmol
+
+# Pip packages for all of them
+  - pip:
+      - git+https://gitlab.com/ase/ase.git
+      - git+https://github.com/ACEsuit/mace.git
+      - torch
+      - mlflow
+      - -e .
