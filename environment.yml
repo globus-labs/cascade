@@ -15,6 +15,7 @@ dependencies:
 
   # Computational chemistry
   - packmol
+  - cp2k # comment if using gpu cp2k
 
 # Pip packages for all of them
   - pip:
