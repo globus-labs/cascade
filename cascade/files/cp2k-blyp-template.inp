@@ -9,7 +9,6 @@
       &END QS
 
       &SCF
-         IGNORE_CONVERGENCE_FAILURE
          ADDED_MOS 60
          &SMEAR
              WINDOW_SIZE [eV] 0.3

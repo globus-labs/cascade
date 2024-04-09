@@ -24,7 +24,6 @@
       &END QS
 
       &SCF
-        IGNORE_CONVERGENCE_FAILURE
         EPS_SCF 1.E-6
         &OT ON
             PRECONDITIONER FULL_SINGLE_INVERSE

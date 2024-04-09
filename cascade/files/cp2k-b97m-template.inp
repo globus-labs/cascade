@@ -1,13 +1,13 @@
 &FORCE_EVAL
    &DFT
       CHARGE 0  ! Species should be charged balanced
+      MULTIPLICITY $mult ! Unpaired electrons for the metal ion and surrounding ligands
 
       &QS
         METHOD GPW
       &END QS
 
       &SCF
-         IGNORE_CONVERGENCE_FAILURE
          ADDED_MOS 60
          &SMEAR
              WINDOW_SIZE [eV] 0.3

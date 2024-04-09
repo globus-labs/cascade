@@ -17,4 +17,5 @@ def example_cell() -> Atoms:
 @mark.parametrize('method', ['blyp', 'pm6', 'b97m'])
 def test_make_calculator(method, example_cell, tmpdir):
     calc = make_calculator(method, directory=tmpdir)
-    calc.get_potential_energy(example_cell)
+    with calc:
+        calc.get_potential_energy(example_cell)

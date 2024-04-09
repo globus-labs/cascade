@@ -11,6 +11,7 @@ _file_dir = Path(__file__).parent / 'files'
 def make_calculator(
         method: str,
         multiplicity: int = 0,
+        command: str | None = None,
         directory: str = 'run'
 ) -> CP2K:
     """Make a calculator ready to run with different configurations
@@ -25,6 +26,7 @@ def make_calculator(
     Args:
         method: Which method to run
         multiplicity: Multiplicity of the system
+        command: Command used to launch CP2K. Defaults to whatever ASE autodetermines or ``cp2k_shell``
         directory: Path in which to write run file
     Returns:
         Calculator configured for target method
@@ -48,9 +50,7 @@ def make_calculator(
         'b97m': 'GTH-BLYP'
     }.get(method)
 
-    inp = Template(input_file.read_text()).substitute(
-        mult=multiplicity,
-    )
+    inp = Template(input_file.read_text()).substitute(mult=multiplicity)  # No changes as of it
 
     cp2k_opts = dict(
         xc=None,
@@ -59,8 +59,9 @@ def make_calculator(
         pseudo_potential=potential,
         poisson_solver=None,
     )
+    if command is not None:
+        cp2k_opts['command'] = command
     return CP2K(directory=directory,
-                command='/home/lward/Software/cp2k-2024.1/exe/local_cuda/cp2k_shell.ssmp',
                 stress_tensor=True,
                 max_scf=max_scf,
                 cutoff=cutoff,
