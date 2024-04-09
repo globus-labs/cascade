@@ -10,7 +10,7 @@ _file_dir = Path(__file__).parent / 'files'
 
 def make_calculator(
         method: str,
-        multiplicity: int,
+        multiplicity: int = 0,
         directory: str = 'run'
 ) -> CP2K:
     """Make a calculator ready to run with different configurations
@@ -38,6 +38,16 @@ def make_calculator(
     }.get(method, None)
     max_scf = {'b97m': 32}.get(method, 128)
 
+    # Get the basis set and potential type
+    basis_set = {
+        'blyp': 'DZVP-MOLOPT-SR-GTH',
+        'b97m': 'DZVP-MOLOPT-SR-GTH',
+    }.get(method)
+    potential = {
+        'blyp': 'GTH-PBE',
+        'b97m': 'GTH-BLYP'
+    }.get(method)
+
     inp = Template(input_file.read_text()).substitute(
         mult=multiplicity,
     )
@@ -45,9 +55,8 @@ def make_calculator(
     cp2k_opts = dict(
         xc=None,
         inp=inp,
-        basis_set_file=None,
-        basis_set=None,
-        pseudo_potential=None,
+        basis_set=basis_set,
+        pseudo_potential=potential,
         poisson_solver=None,
     )
     return CP2K(directory=directory,
