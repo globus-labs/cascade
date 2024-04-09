@@ -1,10 +1,7 @@
 &FORCE_EVAL
    &DFT
-      BASIS_SET_FILE_NAME BASIS_MOLOPT_UZH
-      POTENTIAL_FILE_NAME POTENTIAL_UZH
-
       CHARGE 0  ! Species should be charged balanced
-      UKS T
+      UKS F
       MULTIPLICITY $mult ! Unpaired electrons for the metal ion and surrounding ligands
 
       &QS
@@ -12,7 +9,6 @@
       &END QS
 
       &SCF
-         IGNORE_CONVERGENCE_FAILURE
          ADDED_MOS 60
          &SMEAR
              WINDOW_SIZE [eV] 0.3
