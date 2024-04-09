@@ -22,4 +22,6 @@ dependencies:
       - git+https://github.com/ACEsuit/mace.git
       - torch
       - mlflow
+      - pytorch-ignite
+      - tqdm
       - -e .
