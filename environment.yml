@@ -16,6 +16,9 @@ dependencies:
   # Computational chemistry
   - packmol
 
+  # For nersc's jupyterlab
+  - ipykernel
+
 # Pip packages for all of them
   - pip:
       - git+https://gitlab.com/ase/ase.git
@@ -24,4 +27,5 @@ dependencies:
       - mlflow
       - pytorch-ignite
       - tqdm
+      - papermill
       - -e .
