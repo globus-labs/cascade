@@ -66,4 +66,5 @@ def make_calculator(
                 max_scf=max_scf,
                 cutoff=cutoff,
                 potential_file=None,
+                set_pos_file=True,
                 **cp2k_opts)
