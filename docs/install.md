@@ -17,3 +17,5 @@ We need a version of CP2K and ASE that are not relased yet:
 
 1. Use the CP2K installation at `/lcrc/project/Athena/cp2k`
 2. Install ASE from [this branch](https://gitlab.com/WardLT/ase/-/tree/cp2k-set-pos-file): `pip install git+https://gitlab.com/wardlt/ase.git@cp2k-set-pos-file`
+
+The build file for CP2K is in [./cp2k-build](./cp2k-build)
