@@ -1,6 +1,6 @@
 #PBS -A Athena
-#PBS -l select=2:ncpus=128:mpiprocs=128
-#PBS -l walltime=0:30:00
+#PBS -l select=1:ncpus=128:mpiprocs=128
+#PBS -l walltime=1:00:00
 
 
 # Load the conda environment
@@ -24,4 +24,4 @@ export ASE_CP2K_COMMAND="mpirun -N $total_ranks -n $ranks_per_node --cpus-per-pr
 
 # Run the stuff
 cd $PBS_O_WORKDIR
-papermill 1_relax-initial-geometry.ipynb /dev/null
+papermill 2_equilibrate-at-room-temperature.ipynb /dev/null
