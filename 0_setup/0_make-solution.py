@@ -1,4 +1,9 @@
-"""
+"""Use packmol to generate initial structures
+
+
+This is a parsl app only since it was a useful exercise
+to get parsl working: it only takes O(1) seconds to generate
+an individual structure.
 """
 from concurrent.futures import as_completed
 from tqdm.auto import tqdm
@@ -22,14 +27,16 @@ def generate_structure(solute: str = 'CH4',
                        ):
     """Generate an initial solution structure for downstream simulations.
 
-    Structure contains a single solute molecule and many solvents. Wrapped in 
-    PBC and witha minimum distance between atoms.
+    Structure contains a single solute and many solvent molecules wrapped in 
+    PBC and witha minimum distance between molecules
     
     Arguments: 
-        solute (str): SMILES string for a solute molecule
-        solvent (str): SMILES string for solvent molecule
+        solute (str): ASE molecule name for solute
+        solvent (str): ASE molecule name for solvent
         num_solvent (int): how many solvent molecules to include
-        distance_tolerance (float): (angstroms) structure will be rescaled with respect to this
+        density (float): target mass density that determines the cell volume
+        distance_tolerance (float): minimum distance between molecules
+        seed (int): packmol rng seed
     """
 
     import numpy as np
@@ -80,11 +87,20 @@ def generate_structure(solute: str = 'CH4',
             end structure 
             '''
             Path('packmol.inp').write_text(packmol_inp)
+            
+            # run packmol
             with Path('packmol.inp').open() as fp:
                 run('packmol', stdin=fp, capture_output=True)
+            
+            # Postprocess packmol structure
             cell = read('cell.pdb')
             cell.pbc = True
             cell.cell = [side_length + distance_tolerance / 2] * 3
+            
+            # exit temp directory chdir context
+        # exit temp directory context
+    
+    # save initial geometry
     Path('initial-geometries').mkdir(exist_ok=True)
     cell.write(f'initial-geometries/packmol-{solute}-in-{solvent}={num_solvent}-seed={seed}.vasp', sort=True)
     return
