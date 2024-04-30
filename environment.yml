@@ -1,7 +1,7 @@
 name: cascade
 channels:
-  - conda-forge
   - defaults
+  - conda-forge
 dependencies:
   # Core dependencies
   - python==3.11

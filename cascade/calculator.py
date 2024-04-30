@@ -18,7 +18,7 @@ def make_calculator(
 
     Supported methods:
         - `pm6`: A force-matched PM6 shown by `Welborn et al <https://onlinelibrary.wiley.com/doi/10.1002/jcc.23887>`_
-           to agree better for proeprties of liquid water than the original formulation
+           to agree better for properties of liquid water than the original formulation
         - `blyp`: The BLYP GGA potential with D3 vdW corrections, suggested by `Lin et al. <https://pubs.acs.org/doi/10.1021/ct3001848>`_
             to give the best properties of liquid water
         - `b97m`: The `B97M-rV <http://xlink.rsc.org/?DOI=C6SC04711D>`_ metaGGA functional
@@ -66,4 +66,5 @@ def make_calculator(
                 max_scf=max_scf,
                 cutoff=cutoff,
                 potential_file=None,
+                set_pos_file=True,
                 **cp2k_opts)
