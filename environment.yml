@@ -28,4 +28,5 @@ dependencies:
       - pytorch-ignite
       - tqdm
       - papermill
+      - parsl
       - -e .
