@@ -1,6 +1,7 @@
 """Make a CP2K calculator ready to run a specific environment"""
 from pathlib import Path
 from string import Template
+import os
 
 from ase.calculators.cp2k import CP2K
 from ase import units
@@ -10,10 +11,11 @@ _file_dir = Path(__file__).parent / 'files'
 
 
 def make_calculator(
-        method: str,
-        multiplicity: int = 0,
-        command: str | None = None,
-        directory: str = 'run'
+    method: str,
+    multiplicity: int = 0,
+    command: str | None = None,
+    directory: str = 'run',
+    template_dir: str | Path | None = None,
 ) -> CP2K:
     """Make a calculator ready to run with different configurations
 
@@ -22,12 +24,20 @@ def make_calculator(
         multiplicity: Multiplicity of the system
         command: Command used to launch CP2K. Defaults to whatever ASE autodetermines or ``cp2k_shell``
         directory: Path in which to write run file
+        template_dir: Path to the directory containing templates.
+            Default is to use the value of CASCADE_CP2K_TEMPLATE environment variable
+            or the template directory provided with cascade if the environment variable
+            has not been set.
     Returns:
         Calculator configured for target method
     """
 
+    # Default to the environment variable
+    if template_dir is None:
+        template_dir = Path(os.environ.get('CASCADE_CP2K_TEMPLATE', _file_dir))
+
     # Load the presets file
-    with (_file_dir / 'presets.yml').open() as fp:
+    with (template_dir / 'presets.yml').open() as fp:
         presets = yaml.safe_load(fp)
     if method not in presets:
         raise ValueError(f'"{method}" not in presets file')
@@ -37,7 +47,7 @@ def make_calculator(
     kwargs.pop('description')
 
     # Get the input file and replace any templated arguments
-    input_file = _file_dir / f'cp2k-{method}-template.inp'
+    input_file = template_dir / f'cp2k-{method}-template.inp'
     inp = Template(input_file.read_text()).substitute(mult=multiplicity)
 
     cp2k_opts = dict(
