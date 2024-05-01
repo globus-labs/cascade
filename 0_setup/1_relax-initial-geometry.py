@@ -105,12 +105,12 @@ if __name__ == '__main__':
     retries=1,
     executors=[
         HighThroughputExecutor(
-            #address=address_by_hostname(),
-            prefetch_capacity=0,  # Increase if you have many more tasks than workers
-            #start_method="fork",  # Needed to avoid interactions between MPI and os.fork
+            #enable_mpi_mode=True,
             max_workers_per_node=1,
+            #cores_per_worker=1e-6,
             provider=PBSProProvider(
                     account="Athena",
+                    select_options="mpiranks=128",
                     worker_init=inspect.cleandoc(f"""
                         module reset
                         # set up conda                         
@@ -138,7 +138,7 @@ if __name__ == '__main__':
                     queue="debug",
                     launcher=SimpleLauncher(),
                     nodes_per_block=1,
-                    cpus_per_node=128,
+                    #cpus_per_node=128,
                     init_blocks=args.num_parallel,
                     min_blocks=args.num_parallel,
                     max_blocks=args.num_parallel,
