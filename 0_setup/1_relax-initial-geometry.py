@@ -12,7 +12,7 @@ import time
 
 from parsl.addresses import address_by_hostname
 from parsl.executors import HighThroughputExecutor
-from parsl.launchers import MpiExecLauncher, SimpleLauncher
+from parsl.launchers import MpiExecLauncher, SimpleLauncher, SingleNodeLauncher
 from parsl.providers import PBSProProvider, LocalProvider
 from parsl.channels import LocalChannel
 from parsl.config import Config
@@ -110,7 +110,7 @@ if __name__ == '__main__':
             #cores_per_worker=1e-6,
             provider=PBSProProvider(
                     account="Athena",
-                    select_options="mpiranks=128",
+                    select_options="mpiprocs=128",
                     worker_init=inspect.cleandoc(f"""
                         module reset
                         # set up conda                         
@@ -136,7 +136,7 @@ if __name__ == '__main__':
                         """),
                     walltime="01:00:00",
                     queue="debug",
-                    launcher=SimpleLauncher(),
+                    launcher=SimpleLauncher(),#SingleNodeLauncher(),
                     nodes_per_block=1,
                     #cpus_per_node=128,
                     init_blocks=args.num_parallel,
