@@ -7,7 +7,6 @@ import inspect
 import os
 from pathlib import Path
 from tqdm.auto import tqdm
-import time
 
 
 from parsl.addresses import address_by_hostname
@@ -23,6 +22,7 @@ import parsl
 @python_app
 def relax_geometry_cp2k(initial_geometry: str, 
                         method: str = 'blyp',
+                        stdout: str = None,
                         ):
     
     from pathlib import Path
@@ -31,7 +31,13 @@ def relax_geometry_cp2k(initial_geometry: str,
     from ase.optimize import LBFGS
     from ase.io import read
     from cascade.calculator import make_calculator
-
+    import time
+    from hashlib import sha256
+    import logging
+    from tempfile import TemporaryDirectory
+    
+    #logging.basicConfig(filename='run.log', level=logging.DEBUG)
+    print(f"Setting up relaxation for {initial_geometry} with {method}")
 
     # make a directory to store the relaxation trajectory and logs
     name = f'{Path(initial_geometry).name[:-5]}-{method}'
@@ -47,25 +53,21 @@ def relax_geometry_cp2k(initial_geometry: str,
     else:
         atoms = read(initial_geometry)
 
-
-    # create directory for cp2k logs
-    cp2k_dir = Path(f'cp2k-run/{name}')
-    if cp2k_dir.exists():
-        (cp2k_dir / 'cp2k.out').write_text('')
-
-    atoms.calc = make_calculator(method, 
-                                 directory=cp2k_dir,
-                                 )
-    init_vol = atoms.get_volume()
-    ecf = UnitCellFilter(atoms, hydrostatic_strain=True)
-    with Trajectory(str(relax_traj), mode='a') as traj:
-        dyn = LBFGS(ecf, 
-                    logfile=str(run_dir / 'relax.log'),
-                    trajectory=traj)
-        #run the dynamics timed    
-        start = time.perf_counter()
-        dyn.run(fmax=0.1)
-        elapsed = time.perf_counter() - start
+    # save cp2k logs in a temporary directory inside of cp2k-run
+    with TemporaryDirectory(dir='cp2k-run') as tmpdir:
+        atoms.calc = make_calculator(method, 
+                                     directory=tmpdir,
+                                    )
+        init_vol = atoms.get_volume()
+        ecf = UnitCellFilter(atoms, hydrostatic_strain=True)
+        with Trajectory(str(relax_traj), mode='a') as traj:
+            dyn = LBFGS(ecf, 
+                        logfile=str(run_dir / 'relax.log'),
+                        trajectory=traj)
+            #run the dynamics timed    
+            start = time.perf_counter()
+            dyn.run(fmax=0.1)
+            elapsed = time.perf_counter() - start
     
     final_vol = atoms.get_volume()
 
@@ -154,7 +156,8 @@ if __name__ == '__main__':
     for input_file in input_files:
         futures.append(
             relax_geometry_cp2k(Path(input_dir) / input_file, 
-                                method=args.method)
+                                method=args.method, 
+                                stdout=f'{input_file}.txt')
         )
 
     for future in tqdm(as_completed(futures), 
