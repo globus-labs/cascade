@@ -12,7 +12,10 @@ def make_calculator(
         method: str,
         multiplicity: int = 0,
         command: str | None = None,
-        directory: str = 'run'
+        directory: str = 'run',
+        set_pos_file=True,
+        timeout=None, 
+        debug=False
 ) -> CP2K:
     """Make a calculator ready to run with different configurations
 
@@ -66,5 +69,7 @@ def make_calculator(
                 max_scf=max_scf,
                 cutoff=cutoff,
                 potential_file=None,
-                set_pos_file=True,
+                set_pos_file=set_pos_file,
+                timeout=timeout,
+                debug=debug,
                 **cp2k_opts)
