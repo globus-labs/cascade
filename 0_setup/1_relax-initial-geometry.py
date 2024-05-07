@@ -135,7 +135,7 @@ if __name__ == '__main__':
                         export OMP_NUM_THREADS=$threads_per_rank
                         export ASE_CP2K_COMMAND="mpiexec -n $total_ranks -ppn $ranks_per_node --bind-to numa /lcrc/project/Athena/cp2k-mpich/exe/local/cp2k_shell.psmp"
                         """),
-                    walltime="02:00:00",
+                    walltime="00:30:00",
                     queue="compute",
                     launcher=SimpleLauncher(),#SingleNodeLauncher(),
                     nodes_per_block=1,
