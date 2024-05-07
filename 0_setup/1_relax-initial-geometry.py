@@ -9,11 +9,9 @@ from pathlib import Path
 from tqdm.auto import tqdm
 
 
-from parsl.addresses import address_by_hostname
 from parsl.executors import HighThroughputExecutor
-from parsl.launchers import MpiExecLauncher, SimpleLauncher, SingleNodeLauncher
-from parsl.providers import PBSProProvider, LocalProvider
-from parsl.channels import LocalChannel
+from parsl.launchers import SimpleLauncher
+from parsl.providers import PBSProProvider
 from parsl.config import Config
 from parsl import python_app
 import parsl
@@ -22,7 +20,6 @@ import parsl
 @python_app
 def relax_geometry_cp2k(initial_geometry: str, 
                         method: str = 'blyp',
-                        stdout: str = None,
                         ):
     
     from pathlib import Path
@@ -155,8 +152,7 @@ if __name__ == '__main__':
     for input_file in input_files:
         futures.append(
             relax_geometry_cp2k(Path(input_dir) / input_file, 
-                                method=args.method, 
-                                stdout=f'{input_file}.txt')
+                                method=args.method)
         )
 
     for future in tqdm(as_completed(futures), 
