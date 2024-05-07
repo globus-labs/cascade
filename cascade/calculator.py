@@ -1,24 +1,49 @@
 """Make a CP2K calculator ready to run a specific environment"""
 from pathlib import Path
 from string import Template
+from hashlib import sha256
 import os
 
 from ase.calculators.cp2k import CP2K
-from ase import units
+from ase import units, Atoms
 import yaml
 
 _file_dir = Path(__file__).parent / 'files'
 
 
+def create_run_hash(atoms: Atoms, **kwargs) -> str:
+    """Generate a unique has for a certain simulation
+
+    Args:
+        atoms: Atoms describing the start of the dynamics
+        kwargs: Any other keyword arguments used to describe the run
+    Returns:
+        A hash describing the run
+    """
+
+    # Update using the structure
+    hasher = sha256()
+    hasher.update(atoms.get_atomic_numbers().tobytes())
+    hasher.update(atoms.positions.tobytes())
+
+    # Add the optional arguments
+    options = sorted(kwargs.items())
+    for key, value in options:
+        hasher.update(key.encode())
+        hasher.update(str(value).encode())
+
+    return hasher.hexdigest()[-8:]
+
+
 def make_calculator(
-    method: str,
-    multiplicity: int = 0,
-    command: str | None = None,
-    directory: str = 'run',
-    template_dir: str | Path | None = None,
-    set_pos_file: bool = True,
-    timeout: float | None = None, 
-    debug: bool = False
+        method: str,
+        multiplicity: int = 0,
+        command: str | None = None,
+        directory: str = 'run',
+        template_dir: str | Path | None = None,
+        set_pos_file: bool = True,
+        timeout: float | None = None,
+        debug: bool = False
 ) -> CP2K:
     """Make a calculator ready to run with different configurations
 
