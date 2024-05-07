@@ -122,8 +122,7 @@ if __name__ == '__main__':
                         pwd
 
                         # Load environment
-                        module load gcc openmpi
-                        module load cp2k
+                        module load gcc mpich
                         module list
 
                         nnodes=`cat $PBS_NODEFILE | sort | uniq | wc -l`
@@ -134,10 +133,10 @@ if __name__ == '__main__':
                         echo Running $total_ranks ranks across $nnodes nodes with $threads_per_rank threads per rank
 
                         export OMP_NUM_THREADS=$threads_per_rank
-                        export ASE_CP2K_COMMAND="mpirun -N $total_ranks -n $ranks_per_node --cpus-per-proc $threads_per_rank /lcrc/project/Athena/cp2k/exe/local/cp2k_shell.psmp"
+                        export ASE_CP2K_COMMAND="mpiexec -n $total_ranks -ppn $ranks_per_node --bind-to numa /lcrc/project/Athena/cp2k-mpich/exe/local/cp2k_shell.psmp"
                         """),
-                    walltime="01:00:00",
-                    queue="debug",
+                    walltime="02:00:00",
+                    queue="compute",
                     launcher=SimpleLauncher(),#SingleNodeLauncher(),
                     nodes_per_block=1,
                     #cpus_per_node=128,
