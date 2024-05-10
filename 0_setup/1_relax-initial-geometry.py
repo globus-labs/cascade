@@ -3,23 +3,23 @@
 # Produce a relaxed structure based on one of the initial geometries
 
 from concurrent.futures import as_completed
+import inspect
+import os
+from pathlib import Path
+from tqdm.auto import tqdm
 
-from tempfile import TemporaryDirectory
-from contextlib import chdir
 
-from parsl.addresses import address_by_hostname
 from parsl.executors import HighThroughputExecutor
-from parsl.launchers import MpiExecLauncher, SimpleLauncher
-from parsl.providers import PBSProProvider, LocalProvider
-from parsl.channels import LocalChannel
+from parsl.launchers import SimpleLauncher
+from parsl.providers import PBSProProvider
 from parsl.config import Config
 from parsl import python_app
 import parsl
 
 
+@python_app
 def relax_geometry_cp2k(initial_geometry: str, 
-                        method: str = 'b3lyp',
-                        persist_cp2k_logs: bool = False
+                        method: str = 'blyp',
                         ):
     
     from pathlib import Path
@@ -28,7 +28,13 @@ def relax_geometry_cp2k(initial_geometry: str,
     from ase.optimize import LBFGS
     from ase.io import read
     from cascade.calculator import make_calculator
-
+    import time
+    from hashlib import sha256
+    import logging
+    from tempfile import TemporaryDirectory
+    
+    #logging.basicConfig(filename='run.log', level=logging.DEBUG)
+    print(f"Setting up relaxation for {initial_geometry} with {method}")
 
     # make a directory to store the relaxation trajectory and logs
     name = f'{Path(initial_geometry).name[:-5]}-{method}'
@@ -44,125 +50,118 @@ def relax_geometry_cp2k(initial_geometry: str,
     else:
         atoms = read(initial_geometry)
 
-
-    # create directory for cp2k logs
-    if persist_cp2k_logs:
-        cp2k_dir = Path(f'cp2k-run/{name}')
-        if cp2k_dir.exists():
-            (cp2k_dir / 'cp2k.out').write_text('')
-    else: 
-        pass # todo add tempfiles before merge
-
-    atoms.calc = make_calculator(method, 
-                                 directory=cp2k_dir,
-                                 )
-    init_vol = atoms.get_volume()
-    ecf = UnitCellFilter(atoms, hydrostatic_strain=True)
-    with Trajectory(str(relax_traj), mode='a') as traj:
-        dyn = LBFGS(ecf, 
-                    logfile=str(run_dir / 'relax.log'),
-                    trajectory=traj)
-        dyn.run(fmax=0.1)
+    # save cp2k logs in a temporary directory inside of cp2k-run
+    with TemporaryDirectory(dir='cp2k-run') as tmpdir:
+        atoms.calc = make_calculator(method, 
+                                     directory=tmpdir,
+                                    )
+        init_vol = atoms.get_volume()
+        ecf = UnitCellFilter(atoms, hydrostatic_strain=True)
+        with Trajectory(str(relax_traj), mode='a') as traj:
+            dyn = LBFGS(ecf, 
+                        logfile=str(run_dir / 'relax.log'),
+                        trajectory=traj)
+            #run the dynamics timed    
+            start = time.perf_counter()
+            dyn.run(fmax=0.1)
+            elapsed = time.perf_counter() - start
+    
     final_vol = atoms.get_volume()
 
 
     Path('final-geometries').mkdir(exist_ok=True)
     atoms.write(f'final-geometries/{name}.vasp')
+    return name, elapsed
 
 if __name__ == '__main__':
-    # set up possible parsl configs
-    parsl_configs = {}
 
-    parsl_configs['improv'] = Config(
-        retries=1,
-        executors=[
-            HighThroughputExecutor(
-                address=address_by_hostname(),
-                prefetch_capacity=0,  # Increase if you have many more tasks than workers
-                start_method="fork",  # Needed to avoid interactions between MPI and os.fork
-                max_workers=1,
-                provider=PBSProProvider(
+
+    # handle arguments
+    from argparse import ArgumentParser
+    parser = ArgumentParser(
+        description="Relax geometries using CP2K. One relaxation per node. Within a node, cp2k uses MPI+OMP parallelism."
+    )
+    parser.add_argument('--num_parallel', 
+                        type=int, 
+                        required=True,
+                        help='Number of nodes to ask for (one cp2k relaxation per node)')
+    parser.add_argument('--method',
+                        type=str, 
+                        default='blyp', 
+                        help='Level of chemical theory, passed to cascade.calculator.make_calculator')
+    parser.add_argument('--ranks_per_node',
+                        type=int, 
+                        default=16, 
+                        help='Number of MPI ranks for a cp2k calculation')
+    parser.add_argument('--input_dir',
+                        type=str, 
+                        default='initial-geometries',
+                        required=False)
+    args = parser.parse_args()
+
+    # Make the parsl configurations
+    config = Config(
+    retries=1,
+    executors=[
+        HighThroughputExecutor(
+            #enable_mpi_mode=True,
+            max_workers_per_node=1,
+            #cores_per_worker=1e-6,
+            provider=PBSProProvider(
                     account="Athena",
-                    worker_init=f"""
-module reset
-# set up conda
-module load miniconda3
-conda activate /lcrc/project/Athena/cascade/env
-which python
+                    select_options="mpiprocs=128",
+                    worker_init=inspect.cleandoc(f"""
+                        module reset
+                        # set up conda                         
+                        source activate /lcrc/project/Athena/cascade/env
+                        which python
+                        cd $PBS_O_WORKDIR
+                        pwd
 
-# Load environment
-module load gcc openmpi
-module load cp2k
-module list
+                        # Load environment
+                        module load gcc mpich
+                        module list
 
-nnodes=`cat $PBS_NODEFILE | sort | uniq | wc -l`
-ranks_per_node=16
-total_ranks=$(($ranks_per_node * $nnodes))
-threads_per_rank=$((128 / ranks_per_node))
+                        nnodes=`cat $PBS_NODEFILE | sort | uniq | wc -l`
+                        ranks_per_node={args.ranks_per_node}
+                        total_ranks=$(($ranks_per_node * $nnodes))
+                        threads_per_rank=$((128 / ranks_per_node))
 
-echo Running $total_ranks ranks across $nnodes nodes with $threads_per_rank threads per rank
+                        echo Running $total_ranks ranks across $nnodes nodes with $threads_per_rank threads per rank
 
-export OMP_NUM_THREADS=$threads_per_rank
-export ASE_CP2K_COMMAND="mpirun -N $total_ranks -n $ranks_per_node --cpus-per-proc $threads_per_rank /lcrc/project/Athena/cp2k/exe/local/cp2k_shell.psmp"
-cd $PBS_O_WORKDIR""",
-                    walltime="1:00:00",
-                    queue="debug",
-                    scheduler_options="#PBS -l filesystems=home:eagle:grand",
-                    launcher=SimpleLauncher(),
+                        export OMP_NUM_THREADS=$threads_per_rank
+                        export ASE_CP2K_COMMAND="mpiexec -n $total_ranks -ppn $ranks_per_node --bind-to numa /lcrc/project/Athena/cp2k-mpich/exe/local/cp2k_shell.psmp"
+                        """),
+                    walltime="00:30:00",
+                    queue="compute",
+                    launcher=SimpleLauncher(),#SingleNodeLauncher(),
                     nodes_per_block=1,
-                    min_blocks=0,
-                    max_blocks=1,
+                    #cpus_per_node=128,
+                    init_blocks=args.num_parallel,
+                    min_blocks=args.num_parallel,
+                    max_blocks=args.num_parallel,
                 ),
             ),
         ]
     )
-    parsl_configs['local'] = Config(
-        executors=[
-            HighThroughputExecutor(
-                label="htex_Local",
-                worker_debug=True,
-                cores_per_worker=1,
-                provider=LocalProvider(
-                    channel=LocalChannel(),
-                    init_blocks=1,
-                    max_blocks=1,
-                ),
-            )
-        ],
-        strategy=None,
-    )
+    parsl.load(config)
 
-    # handle arguments
-    from argparse import ArgumentParser
-    parser = ArgumentParser()
-    parser.add_argument('--input_files', 
-                        type=str,
-                        nargs='+', 
-                        help='VASP files holding initial geometries')
-    parser.add_argument('--method',
-                        type=str, 
-                        default='b3lyp', 
-                        help='Level of chemical theory, passed to cascade.calculator.make_calculator')
-    parser.add_argument('--persist_cp2k_logs',
-                        type=int, 
-                        default=0, 
-                        choices=[0,1],
-                        help='1 to persist cp2k logs in their own directory, 0 to use a temp directory')
-    parser.add_argument('--parsl_config', 
-                        type=str, 
-                        required=True,
-                        options=list(parsl_configs.keys())
-                        )
-    args = parser.parse_args()
-
-    # Make the parsl configurations
-
-    parsl.load(parsl_configs[args.parsl_config])
-
+    input_dir = args.input_dir
+    input_files = os.listdir(input_dir)
     futures = []
-    for input_file in args.input_files:
+    for input_file in input_files:
         futures.append(
-            relax_geometry_cp2k(input_file, 
-                                method=args.method, 
-                                persist_cp2k_logs=args.persist_cp2k_logs)
+            relax_geometry_cp2k(Path(input_dir) / input_file, 
+                                method=args.method)
         )
+
+    for future in tqdm(as_completed(futures), 
+                       total=len(futures),
+                       desc='Completed relaxations'
+                       ):
+        exc = future.exception()
+        if exc is not None: 
+            print(exc)
+            continue
+        name, elapsed = future.result()
+        print(f'Finished calculation for {name}\nIn {elapsed:0.3f}s')
