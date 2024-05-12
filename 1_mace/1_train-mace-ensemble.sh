@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-for seed in {0,}; do
+for seed in {0..3}; do
     echo "training replica $seed"
     time python 1_train-mace-replica.py \
     --seed $seed \
