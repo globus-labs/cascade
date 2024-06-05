@@ -24,14 +24,14 @@ def equilibrate_cp2k(initial_geometry: str,
     from cascade.calculator import make_calculator
     from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
     from ase.md.npt import NPT
-    from ase.io import read
+    from ase.io import read, write
     from ase import units
     from pathlib import Path
-    import shutil
+    import numpy as np
+    import re
     from tempfile import TemporaryDirectory
 
     # Set up MD trajectory directory and file
-    # Derived
     name = f'{Path(initial_geometry).name[:-5]}-npt={temperature}'
     run_dir = Path('md') / name
     run_dir.mkdir(exist_ok=True, parents=True)
@@ -46,7 +46,17 @@ def equilibrate_cp2k(initial_geometry: str,
     else:
         atoms = read(initial_geometry)
         start = 0
-        MaxwellBoltzmannDistribution(atoms, temperature_K=temperature * 2)
+        # seed maxwell-boltzmann with same seed as geometry
+        seed = int(re.search('seed=(\d+)', initial_geometry).group(1))
+        MaxwellBoltzmannDistribution(atoms, 
+                                     temperature_K=temperature * 2,
+                                     seed=np.random.default_rng(seed=seed))
+        
+        # save the initial configuration and velocities
+        # this way we can run trajectories with other potentials starting here
+        # (The ASE MD run will not save this for us)
+        initial_frame_file = run_dir/'initial_cfg.traj'
+        write(str(initial_frame_file), atoms)  
 
     # save DFT logs in temporary directory
     with TemporaryDirectory(dir='cp2k-run') as tmpdir:
