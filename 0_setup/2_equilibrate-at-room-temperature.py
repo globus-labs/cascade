@@ -47,10 +47,10 @@ def equilibrate_cp2k(initial_geometry: str,
         atoms = read(initial_geometry)
         start = 0
         # seed maxwell-boltzmann with same seed as geometry
-        seed = int(re.search('seed=(\d+)', initial_geometry).group(1))
+        seed = int(re.search('seed=(\d+)', str(initial_geometry)).group(1))
         MaxwellBoltzmannDistribution(atoms, 
                                      temperature_K=temperature * 2,
-                                     seed=np.random.default_rng(seed=seed))
+                                     rng=np.random.default_rng(seed=seed))
         
         # save the initial configuration and velocities
         # this way we can run trajectories with other potentials starting here
