@@ -4,6 +4,7 @@ from string import Template
 from hashlib import sha256
 import os
 
+from ase.calculators.calculator import Calculator
 from ase.calculators.cp2k import CP2K
 from ase import units, Atoms
 import yaml
@@ -96,3 +97,50 @@ def make_calculator(
                 timeout=timeout,
                 debug=debug,
                 **cp2k_opts)
+
+
+class EnsembleCalculator(Calculator): 
+    implemented_properties = ['energy', 'forces', 'forces_std']
+    
+    def __init__(self, 
+                 calculators: List[Calculator], 
+                 **kwargs):
+
+        Calculator.__init__(self, **kwargs)
+        self.calculators = calculators
+        self.num_calculators = len(calculators)
+        self.count = 0
+
+    def calculate(self,
+                  atoms: ase.Atoms=None, 
+                  properties=('energy', 'forces'), 
+                  system_changes=all_changes):
+        
+        # create arrays for energy and forces 
+        results = {
+            'energy': np.zeros(self.num_calculators).copy(),
+            'forces': np.zeros((self.num_calculators, len(atoms), 3)).copy()
+        }
+
+        # compute and store energy and forces for each calculator
+        for i, calc in enumerate(self.calculators):
+            #super().calculate(atoms=atoms, system_changes=system_changes)
+            calc.calculate(atoms,
+                           properties=properties,
+                           system_changes=system_changes)
+            # self.count += 1
+            # print('hi from pass '+str(self.count))
+            # print(calc.results['forces'][0,0])
+            
+            for k in results.keys(): 
+                results[k][i] = calc.results[k]
+
+        # store the force std
+        results['forces_std'] = results['forces'].std(0)
+        atoms.info['forces_std'] = results['forces_std']
+
+        # average over the ensemble dimension
+        for k in 'energy', 'forces':
+            results[k] = results[k].mean(0)
+
+        self.results.update(results)
