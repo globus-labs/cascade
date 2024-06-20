@@ -3,8 +3,9 @@ from pathlib import Path
 from string import Template
 from hashlib import sha256
 import os
+import numpy as np
 
-from ase.calculators.calculator import Calculator
+from ase.calculators.calculator import Calculator, all_changes
 from ase.calculators.cp2k import CP2K
 from ase import units, Atoms
 import yaml
@@ -103,7 +104,7 @@ class EnsembleCalculator(Calculator):
     implemented_properties = ['energy', 'forces', 'forces_std']
     
     def __init__(self, 
-                 calculators: List[Calculator], 
+                 calculators: list[Calculator], 
                  **kwargs):
 
         Calculator.__init__(self, **kwargs)
@@ -112,7 +113,7 @@ class EnsembleCalculator(Calculator):
         self.count = 0
 
     def calculate(self,
-                  atoms: ase.Atoms=None, 
+                  atoms: Atoms=None, 
                   properties=('energy', 'forces'), 
                   system_changes=all_changes):
         
@@ -136,8 +137,9 @@ class EnsembleCalculator(Calculator):
                 results[k][i] = calc.results[k]
 
         # store the force std
-        results['forces_std'] = results['forces'].std(0)
-        atoms.info['forces_std'] = results['forces_std']
+        atoms.info['forces_std'] = results['forces'].std(0)
+        atoms.info['forces_std_max'] = atoms.info['forces_std'].max()
+        atoms.info['forces_std_mean'] = atoms.info['forces_std'].mean()
 
         # average over the ensemble dimension
         for k in 'energy', 'forces':
