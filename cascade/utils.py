@@ -1,5 +1,5 @@
-import io
 from io import StringIO
+import ase
 from ase import Atoms
 
 # Taken from ExaMol
@@ -30,9 +30,9 @@ def read_from_string(atoms_msg: str, fmt: str) -> Atoms:
     """
 
     out = StringIO(str(atoms_msg))  # str() ensures that Proxies are resolved
-    return io.read(out, format=fmt)
+    return ase.io.read(out, format=fmt)
 
-def canonicalize(atoms: Atoms) -> Atoms:
+def canonicalize(atoms: Atoms, fmt: str = 'xyz') -> Atoms:
     """A convenience function to standardize the format of an ase.Atoms object
 
     The main motiviation is to freeze the Atoms.calc attribute into an immutable
@@ -40,8 +40,9 @@ def canonicalize(atoms: Atoms) -> Atoms:
     
     Args:
         atoms: Structure to write
+        fmt: the ase.io format to write to and read from
     Returns: 
         Atoms object that has been serialied and deserialized
     
     """
-    return read_from_string(write_to_string(atoms))
+    return read_from_string(write_to_string(atoms, fmt), fmt)
