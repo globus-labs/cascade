@@ -32,7 +32,7 @@ def read_from_string(atoms_msg: str, fmt: str) -> Atoms:
     out = StringIO(str(atoms_msg))  # str() ensures that Proxies are resolved
     return ase.io.read(out, format=fmt)
 
-def canonicalize(atoms: Atoms, fmt: str = 'xyz') -> Atoms:
+def canonicalize(atoms: Atoms, fmt: str = 'extxyz') -> Atoms:
     """A convenience function to standardize the format of an ase.Atoms object
 
     The main motiviation is to freeze the Atoms.calc attribute into an immutable
