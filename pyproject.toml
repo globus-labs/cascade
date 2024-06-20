@@ -40,5 +40,6 @@ test = [
 ]
 ani = [
     'torchani',
+    'ignite',
     'h5py'
 ]

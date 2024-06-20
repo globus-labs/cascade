@@ -1,14 +1,17 @@
 """Interface and glue code for to models built using `TorchANI <https://github.com/aiqm/torchani>_"""
 import ase
 import numpy as np
+import pandas as pd
 from torch.utils.data import DataLoader
 
 from torchani import AEVComputer, ANIModel
 from torchani.aev import SpeciesAEV
 from torchani.data import collate_fn
+from ignite.engine import Engine
 import torch
 
-from cascade.learning.base import BaseLearnableForcefield
+from cascade.learning.base import BaseLearnableForcefield, State
+from cascade.learning.utils import estimate_atomic_energies
 
 __all__ = ['TorchANI']
 
@@ -142,4 +145,88 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
             for entry_f, entry_n in zip(batch_f_pred.detach().cpu().numpy(), batch_n):
                 forces.append(entry_f[:entry_n, :])
 
+        # Move model back from device
+        model.to('cpu')
+        aev_computer.to('cpu')
+
         return np.array(energies), list(forces)
+
+    def train(self,
+              model_msg: bytes | State,
+              train_data: list[ase.Atoms],
+              valid_data: list[ase.Atoms],
+              num_epochs: int,
+              device: str = 'cpu',
+              batch_size: int = 32,
+              learning_rate: float = 1e-3,
+              huber_deltas: (float, float) = (0.5, 1),
+              force_weight: float = 0.9,
+              reset_weights: bool = False,
+              **kwargs) -> (bytes, pd.DataFrame):
+
+        # Unpack the model and move to device
+        if isinstance(model_msg, bytes):
+            model_msg = self.get_model(model_msg)
+        aev_computer, model, atomic_energies = model_msg
+        species = list(atomic_energies.keys())
+        model.to(device)
+        aev_computer.to(device)
+
+        # Re-fit the atomic energies
+        atomic_energies.update(estimate_atomic_energies(train_data))
+        ref_energies = np.array([atomic_energies[s] for s in species], dtype=np.float32)  # Don't forget to cast to f32!
+
+        # Reset the weights, if desired
+        def init_params(m):
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.kaiming_normal_(m.weight, a=1.0)
+                torch.nn.init.zeros_(m.bias)
+
+        if reset_weights:
+            model.apply(init_params)
+
+        # Build the data loader
+        pbc = torch.from_numpy(np.ones((3,), bool)).to(device)  # TODO (don't hard code to 3D)
+        train_loader = DataLoader([ase_to_ani(a, species) for a in train_data],
+                                  collate_fn=lambda x: collate_fn(x, my_collate_dict),
+                                  batch_size=batch_size,
+                                  shuffle=True,
+                                  drop_last=True)
+        # valid_loader = DataLoader([ase_to_ani(a, species) for a in valid_data],
+        #                           collate_fn=lambda x: collate_fn(x, my_collate_dict),
+        #                           batch_size=batch_size)  # TODO (wardlt): Actually use this
+
+        # Prepare optimizer and loss functions
+        opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+        huber_e, huber_f = huber_deltas
+        loss_e = torch.nn.HuberLoss(reduction='none', delta=huber_e)
+        loss_f = torch.nn.HuberLoss(reduction='none', delta=huber_f)
+
+        def train_step(engine, batch):
+            """Borrowed from the training step used inside MACE"""
+            model.train()
+            opt.zero_grad()
+
+            # Run the forward step
+            batch_e_pred, batch_f_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device=device)
+
+            # Compute the losses
+            # TODO (wardlt): Add stresses
+            batch_e = batch['energies'].to(device).squeeze()
+            batch_f = batch['forces'].to(device)
+            batch_n = (batch['species'] >= 0).sum(dim=1, dtype=batch_e.dtype).to(device)
+
+            energy_loss = (loss_e(batch_e_pred, batch_e) / batch_n.sqrt()).mean()
+            force_loss = (loss_f(batch_f_pred, batch_f).sum(dim=(1, 2)) / batch_n).mean()
+            loss = energy_loss + force_weight * force_loss
+            loss.backward()
+            opt.step()
+            return loss.item()
+
+        # Run training
+        # TODO (wardlt): Track the learning, use early stopping
+        trainer = Engine(train_step)
+        trainer.run(train_loader, max_epochs=num_epochs)
+
+        return self.serialize_model((aev_computer, model, atomic_energies)), pd.DataFrame()
