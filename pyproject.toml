@@ -38,3 +38,7 @@ test = [
     'pytest-timeout',
     'pytest-cov',
 ]
+ani = [
+    'torchani',
+    'h5py'
+]
