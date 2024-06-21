@@ -136,12 +136,13 @@ class EnsembleCalculator(Calculator):
             for k in results.keys(): 
                 results[k][i] = calc.results[k]
 
-        # store the force std
-        atoms.info['forces_std'] = results['forces'].std(0)
-        atoms.info['forces_std_max'] = atoms.info['forces_std'].max()
-        atoms.info['forces_std_mean'] = atoms.info['forces_std'].mean()
+        # store the ensemble forces in atoms.info
+        atoms.info['forces_ens'] = results['forces'].copy()
+        # atoms.info['forces_std'] = results['forces'].std(0)
+        # atoms.info['forces_std_max'] = atoms.info['forces_std'].max()
+        # atoms.info['forces_std_mean'] = atoms.info['forces_std'].mean()
 
-        # average over the ensemble dimension
+        # average over the ensemble dimension for the mean forces
         for k in 'energy', 'forces':
             results[k] = results[k].mean(0)
 
