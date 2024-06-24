@@ -100,20 +100,20 @@ def make_calculator(
                 **cp2k_opts)
 
 
-class EnsembleCalculator(Calculator): 
+class EnsembleCalculator(Calculator):
+    """A single calculator which combines the results of many
+
+    The when run on atoms, ensemble average of energy and forces are stored in atoms.calc.results
+    Additionally, the forces from each ensemble member are stored in atoms.info['forces_ens']
+
+    Args:
+        calculators: the calculators to ensemble over
+    """
     implemented_properties = ['energy', 'forces']
-    
-    def __init__(self, 
-                 calculators: list[Calculator], 
+
+    def __init__(self,
+                 calculators: list[Calculator],
                  **kwargs):
-        """Creates an ensemble of calculators that are averaged over
-
-        The when run on atoms, ensemble average of energy and forces are stored in atoms.calc.results 
-        Additionally, the forces from each ensemble member are stored in atoms.info['forces_ens']
-
-        Args: 
-            calculators: the calculators to ensemble over
-        """
 
         Calculator.__init__(self, **kwargs)
         self.calculators = calculators
@@ -121,16 +121,10 @@ class EnsembleCalculator(Calculator):
         self.count = 0
 
     def calculate(self,
-                  atoms: Atoms=None, 
-                  properties=('energy', 'forces'), 
+                  atoms: Atoms = None,
+                  properties=('energy', 'forces'),
                   system_changes=all_changes):
-        """Calculate the energy and forces using the ensemble members. 
-
-        Ensemble average of energy and forces are stored in atoms.calc.results 
-        Additionally, the forces from each ensemble member are stored in atoms.info['forces_ens']
-        """
-        
-        # create arrays for energy and forces 
+        # create arrays for energy and forces
         results = {
             'energy': np.zeros(self.num_calculators).copy(),
             'forces': np.zeros((self.num_calculators, len(atoms), 3)).copy()
@@ -141,8 +135,8 @@ class EnsembleCalculator(Calculator):
             calc.calculate(atoms,
                            properties=properties,
                            system_changes=system_changes)
-            
-            for k in results.keys(): 
+
+            for k in results.keys():
                 results[k][i] = calc.results[k]
 
         # store the ensemble forces in atoms.info
