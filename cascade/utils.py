@@ -1,6 +1,10 @@
 from io import StringIO
+from copy import deepcopy
+
 import ase
 from ase import Atoms
+from ase.calculators.calculator import Calculator
+
 
 # Taken from ExaMol
 # Taken from jitterbug
@@ -32,7 +36,7 @@ def read_from_string(atoms_msg: str, fmt: str) -> Atoms:
     out = StringIO(str(atoms_msg))  # str() ensures that Proxies are resolved
     return ase.io.read(out, format=fmt)
 
-def canonicalize(atoms: Atoms, fmt: str = 'extxyz') -> Atoms:
+def canonicalize(atoms: Atoms) -> Atoms:
     """A convenience function to standardize the format of an ase.Atoms object
 
     The main motiviation is to freeze the Atoms.calc attribute into an immutable
@@ -40,9 +44,27 @@ def canonicalize(atoms: Atoms, fmt: str = 'extxyz') -> Atoms:
     
     Args:
         atoms: Structure to write
-        fmt: the ase.io format to write to and read from
     Returns: 
         Atoms object that has been serialied and deserialized
     
     """
+    fmt = 'extxyz' # the ase.io format to write to and read from
     return read_from_string(write_to_string(atoms, fmt), fmt)
+
+def apply_calculator(
+    calc: Calculator, 
+    traj: list[Atoms]) -> list[Atoms]:
+    """Run a calculator on every atoms object in a list, returning a new list
+    
+    Args: 
+        calc: the calculator to be applied
+        traj: the list of atoms to have the calculator applied to
+    Returns: 
+        list of atoms that have been canonicalized s.t. their results are stored in a SinglePointcalculator
+    """
+    traj = deepcopy(traj)
+    for i, atoms in enumerate(traj): 
+        atoms.calc = calc
+        atoms.get_forces()
+        traj[i] = canonicalize(atoms)
+    return traj

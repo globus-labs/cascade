@@ -101,11 +101,19 @@ def make_calculator(
 
 
 class EnsembleCalculator(Calculator): 
-    implemented_properties = ['energy', 'forces', 'forces_std']
+    implemented_properties = ['energy', 'forces']
     
     def __init__(self, 
                  calculators: list[Calculator], 
                  **kwargs):
+        """Creates an ensemble of calculators that are averaged over
+
+        The when run on atoms, ensemble average of energy and forces are stored in atoms.calc.results 
+        Additionally, the forces from each ensemble member are stored in atoms.info['forces_ens']
+
+        Args: 
+            calculators: the calculators to ensemble over
+        """
 
         Calculator.__init__(self, **kwargs)
         self.calculators = calculators
@@ -116,6 +124,11 @@ class EnsembleCalculator(Calculator):
                   atoms: Atoms=None, 
                   properties=('energy', 'forces'), 
                   system_changes=all_changes):
+        """Calculate the energy and forces using the ensemble members. 
+
+        Ensemble average of energy and forces are stored in atoms.calc.results 
+        Additionally, the forces from each ensemble member are stored in atoms.info['forces_ens']
+        """
         
         # create arrays for energy and forces 
         results = {
@@ -125,22 +138,15 @@ class EnsembleCalculator(Calculator):
 
         # compute and store energy and forces for each calculator
         for i, calc in enumerate(self.calculators):
-            #super().calculate(atoms=atoms, system_changes=system_changes)
             calc.calculate(atoms,
                            properties=properties,
                            system_changes=system_changes)
-            # self.count += 1
-            # print('hi from pass '+str(self.count))
-            # print(calc.results['forces'][0,0])
             
             for k in results.keys(): 
                 results[k][i] = calc.results[k]
 
         # store the ensemble forces in atoms.info
         atoms.info['forces_ens'] = results['forces'].copy()
-        # atoms.info['forces_std'] = results['forces'].std(0)
-        # atoms.info['forces_std_max'] = atoms.info['forces_std'].max()
-        # atoms.info['forces_std_mean'] = atoms.info['forces_std'].mean()
 
         # average over the ensemble dimension for the mean forces
         for k in 'energy', 'forces':
