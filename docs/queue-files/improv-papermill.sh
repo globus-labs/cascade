@@ -20,7 +20,7 @@ threads_per_rank=$((128 / ranks_per_node))
 echo Running $total_ranks ranks across $nnodes nodes with $threads_per_rank threads per rank
 
 export OMP_NUM_THREADS=$threads_per_rank
-export ASE_CP2K_COMMAND="mpirun -n $total_ranks -N $ranks_per_node --cpus-per-proc $threads_per_rank /lcrc/project/Athena/cp2k/exe/local/cp2k_shell.psmp"
+export ASE_CP2K_COMMAND="mpirun -N $total_ranks -n $ranks_per_node --cpus-per-proc $threads_per_rank /lcrc/project/Athena/cp2k/exe/local/cp2k_shell.psmp"
 
 # Run the stuff
 cd $PBS_O_WORKDIR

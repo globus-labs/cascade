@@ -45,7 +45,6 @@ if __name__ == "__main__":
     group.add_argument('--model-type', default='mace_mp', help='Name of the foundation model to use')
     group.add_argument('--model-size', default='small', help='Size of the model to create')
     group.add_argument('--model-dtype', default='float32', help='Precision to use for model weights')
-    group.add_argument('--seed', default=0, help='Random seed for bootstrap sampling', type=int)
 
     args = parser.parse_args()
 
@@ -93,11 +92,6 @@ if __name__ == "__main__":
         configs['train'].extend(my_configs[:-valid_start])
         configs['valid'].extend(my_configs[-valid_start:])
         logger.info(f'Loaded {len(my_configs)} from {file}. Stored {valid_start} as validation entries')
-
-    # bootstrap sample the training configs
-    rng = np.random.RandomState(args.seed)
-    configs['train'] = rng.choice(configs['train'], size=(len(configs['train']),), replace=True)
-    logger.info(f'Bootstrap resampled configs with seed {args.seed}')
 
     loaders = dict()
     for key, my_configs in configs.items():
@@ -230,9 +224,3 @@ if __name__ == "__main__":
         # Store the model
         torch.save(calc, tmp / 'model.pt')
         mlflow_logger.log_artifact(tmp / 'model.pt')
-
-    # store the model for ensembling
-    ensemble_dir = Path('ensemble')
-    ensemble_dir.mkdir(exist_ok=True)
-    model = calc.models[0]
-    torch.save(model, ensemble_dir / f'model_{args.seed}.pt')
