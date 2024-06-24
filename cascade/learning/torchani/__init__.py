@@ -16,7 +16,7 @@ import torch
 from cascade.learning.base import BaseLearnableForcefield, State
 from cascade.learning.utils import estimate_atomic_energies
 
-__all__ = ['TorchANI']
+__all__ = ['TorchANI', 'ANIModelContents']
 
 ANIModelContents = tuple[AEVComputer, ANIModel, dict[str, float]]
 """Contents of the serialized form of a model:
