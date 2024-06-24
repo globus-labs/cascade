@@ -1,18 +1,48 @@
-"""Make a CP2K calculator ready to run a specific environment"""
+"""Utilities for employing ASE calculators"""
 from pathlib import Path
 from string import Template
+from hashlib import sha256
+import numpy as np
 
+from ase.calculators.calculator import Calculator, all_changes
 from ase.calculators.cp2k import CP2K
-from ase import units
+from ase import units, Atoms
 
 _file_dir = Path(__file__).parent / 'files'
+
+
+def create_run_hash(atoms: Atoms, **kwargs) -> str:
+    """Generate a unique has for a certain simulation
+
+    Args:
+        atoms: Atoms describing the start of the dynamics
+        kwargs: Any other keyword arguments used to describe the run
+    Returns:
+        A hash describing the run
+    """
+
+    # Update using the structure
+    hasher = sha256()
+    hasher.update(atoms.get_atomic_numbers().tobytes())
+    hasher.update(atoms.positions.tobytes())
+
+    # Add the optional arguments
+    options = sorted(kwargs.items())
+    for key, value in options:
+        hasher.update(key.encode())
+        hasher.update(str(value).encode())
+
+    return hasher.hexdigest()[-8:]
 
 
 def make_calculator(
         method: str,
         multiplicity: int = 0,
         command: str | None = None,
-        directory: str = 'run'
+        directory: str = 'run',
+        template_dir: str | Path | None = None,
+        set_pos_file: bool = False,
+        debug: bool = False
 ) -> CP2K:
     """Make a calculator ready to run with different configurations
 
@@ -28,6 +58,12 @@ def make_calculator(
         multiplicity: Multiplicity of the system
         command: Command used to launch CP2K. Defaults to whatever ASE autodetermines or ``cp2k_shell``
         directory: Path in which to write run file
+        template_dir: Path to the directory containing templates.
+            Default is to use the value of CASCADE_CP2K_TEMPLATE environment variable
+            or the template directory provided with cascade if the environment variable
+            has not been set.
+        set_pos_file: whether cp2k and ase communicate positions via a file on disk
+        debug: Whether to run the ase cp2k calculator in debug mode
     Returns:
         Calculator configured for target method
     """
@@ -66,5 +102,55 @@ def make_calculator(
                 max_scf=max_scf,
                 cutoff=cutoff,
                 potential_file=None,
-                set_pos_file=True,
+                set_pos_file=set_pos_file,
+                debug=debug,
                 **cp2k_opts)
+
+
+class EnsembleCalculator(Calculator):
+    """A single calculator which combines the results of many
+
+    The when run on atoms, ensemble average of energy and forces are stored in atoms.calc.results
+    Additionally, the forces from each ensemble member are stored in atoms.info['forces_ens']
+
+    Args:
+        calculators: the calculators to ensemble over
+    """
+    implemented_properties = ['energy', 'forces']
+
+    def __init__(self,
+                 calculators: list[Calculator],
+                 **kwargs):
+
+        Calculator.__init__(self, **kwargs)
+        self.calculators = calculators
+        self.num_calculators = len(calculators)
+        self.count = 0
+
+    def calculate(self,
+                  atoms: Atoms = None,
+                  properties=('energy', 'forces'),
+                  system_changes=all_changes):
+        # create arrays for energy and forces
+        results = {
+            'energy': np.zeros(self.num_calculators).copy(),
+            'forces': np.zeros((self.num_calculators, len(atoms), 3)).copy()
+        }
+
+        # compute and store energy and forces for each calculator
+        for i, calc in enumerate(self.calculators):
+            calc.calculate(atoms,
+                           properties=properties,
+                           system_changes=system_changes)
+
+            for k in results.keys():
+                results[k][i] = calc.results[k]
+
+        # store the ensemble forces in atoms.info
+        atoms.info['forces_ens'] = results['forces'].copy()
+
+        # average over the ensemble dimension for the mean forces
+        for k in 'energy', 'forces':
+            results[k] = results[k].mean(0)
+
+        self.results.update(results)
