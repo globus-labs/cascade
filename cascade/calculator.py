@@ -1,4 +1,4 @@
-"""Make a CP2K calculator ready to run a specific environment"""
+"""Utilities for employing ASE calculators"""
 from pathlib import Path
 from string import Template
 from hashlib import sha256
@@ -43,8 +43,7 @@ def make_calculator(
         command: str | None = None,
         directory: str = 'run',
         template_dir: str | Path | None = None,
-        set_pos_file: bool = True,
-        timeout: float | None = None,
+        set_pos_file: bool = False,
         debug: bool = False
 ) -> CP2K:
     """Make a calculator ready to run with different configurations
@@ -59,8 +58,7 @@ def make_calculator(
             or the template directory provided with cascade if the environment variable
             has not been set.
         set_pos_file: whether cp2k and ase communicate positions via a file on disk
-        timeout: ase/cp2k_shell communication timeout (in seconds)
-        debug: wether to run the ase cp2k calculator in debug mode
+        debug: Whether to run the ase cp2k calculator in debug mode
     Returns:
         Calculator configured for target method
     """
@@ -95,7 +93,6 @@ def make_calculator(
                 stress_tensor=True,
                 potential_file=None,
                 set_pos_file=set_pos_file,
-                timeout=timeout,
                 debug=debug,
                 **cp2k_opts)
 
