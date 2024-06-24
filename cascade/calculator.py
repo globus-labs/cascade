@@ -2,14 +2,37 @@
 from pathlib import Path
 from string import Template
 from hashlib import sha256
-import os
 import numpy as np
 
 from ase.calculators.calculator import Calculator, all_changes
 from ase.calculators.cp2k import CP2K
-from ase import units
+from ase import units, Atoms
 
 _file_dir = Path(__file__).parent / 'files'
+
+
+def create_run_hash(atoms: Atoms, **kwargs) -> str:
+    """Generate a unique has for a certain simulation
+
+    Args:
+        atoms: Atoms describing the start of the dynamics
+        kwargs: Any other keyword arguments used to describe the run
+    Returns:
+        A hash describing the run
+    """
+
+    # Update using the structure
+    hasher = sha256()
+    hasher.update(atoms.get_atomic_numbers().tobytes())
+    hasher.update(atoms.positions.tobytes())
+
+    # Add the optional arguments
+    options = sorted(kwargs.items())
+    for key, value in options:
+        hasher.update(key.encode())
+        hasher.update(str(value).encode())
+
+    return hasher.hexdigest()[-8:]
 
 
 def make_calculator(
