@@ -27,10 +27,13 @@ class ForceThresholdAuditor(BaseAuditor):
     def __init__(self,
                  threshold: float = 1, 
                  n_sample: int = 100):
-        """Determines the likelihood all calculations have error below the threshold
+        """Determines the likelihood all calculations have error below the 
+        threshold, based on ensemble variance
+
         Args:
             threshold: in units of force in the simulation
-            n_sample: number of samples to take when estimating the probability of error being less than the threshold
+            n_sample: number of samples to take when estimating the probability 
+                      of error being less than the threshold
         """
         self.threshold = threshold
         self.n_sample = n_sample
@@ -39,15 +42,20 @@ class ForceThresholdAuditor(BaseAuditor):
               atoms: list[Atoms], 
               n_audits: int,
               sort_audits: bool = False) -> tuple[float, list[int]]:
-        """Estimate the probability that any atom is off more than threshold and the frames with the higest UQ
+        """Estimate the probability that any atom is off more than threshold and 
+           the frames with the higest UQ
 
         Args:
-            atoms: list of ase atoms
+            atoms: list of ase atoms. Should have atoms.info['forces_ens']
+                   set by the cascade EnsembleCalculator
             n_audits: number of frames to return 
-            sort_audits: whether to return frames in decreasing UQ order. If false, uses argpartition which is linear time
+            sort_audits: whether to return frames in decreasing UQ order. 
+                         If false, uses argpartition which is linear time
         Returns: 
-            p_any: an estimate of the probability that the forces on any atom in any frame is above the threshold
-            audit_frames: a indices of the frames with the highest ensemble std, aggregated by max
+            p_any: an estimate of the probability that the forces on any atom in
+                   any frame is above the threshold
+            audit_frames: a indices of the frames with the highest ensemble std, 
+                          aggregated by max
         """
 
         force_preds = np.asarray([a.info['forces_ens'] for a in atoms])
