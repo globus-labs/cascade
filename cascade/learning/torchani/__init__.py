@@ -232,6 +232,10 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         trainer = Engine(train_step)
         trainer.run(train_loader, max_epochs=num_epochs)
 
+        # Ensure GPU memory is cleared
+        model.to('cpu')
+        aev_computer.to('cpu')
+
         return self.serialize_model((aev_computer, model, atomic_energies)), pd.DataFrame()
 
     def make_calculator(self, model_msg: bytes | ANIModelContents, device: str) -> Calculator:

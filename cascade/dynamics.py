@@ -12,6 +12,7 @@ from ase.optimize.optimize import Dynamics, Optimizer
 from cascade.learning.base import BaseLearnableForcefield, State
 
 
+# TODO (wardlt): Consider having the state of the `Dynamics` class stored here. Some dynamics classes (e.g., NPT) have state
 @dataclass
 class Progress:
     """The progress of an atomic state through a dynamics protocol"""
@@ -20,8 +21,8 @@ class Progress:
     """Current atomic structure"""
     name: str = field(default_factory=lambda: str(uuid4()))
     """Name assigned this trajectory. Defaults to a UUID"""
-    process: int = 0
-    """Current step process within the overall :class:`DynamicsProtocol`."""
+    phase: int = 0
+    """Current stage within the overall :class:`DynamicsProtocol`."""
     timestep: int = 0
     """Timestep within the current process"""
 
@@ -36,37 +37,44 @@ class Progress:
 
         self.atoms = new_atoms.copy()
         if finished_step:
-            self.process += 1
+            self.phase += 1
             self.timestep = 0
         else:
             self.timestep += steps_completed
 
 
-DynamicsStep = tuple[type[Dynamics], int | None, dict[str, Any], dict[str, Any], Optional[Callable[[Atoms], None]]]
-"""Definition of a step within a dynamics protocol:
+@dataclass
+class DynamicsStage:
+    driver: type[Dynamics]
+    """Which dynamics to run as an ASE Dynamics class"""
+    timesteps: int | None = None
+    """Maximum number of timesteps to run.
 
-1. Which dynamics to run. An ASE Dynamics class
-2. Maximum number of timesteps to run. Use `None` to run until convergence is reached
-3. Options to class, used when instantiating the dynamics
-4. Options for the run method
-5. Post-processing function applied after run is complete"""
+    Use ``None`` to run until :attr:`driver` reports the dynamics as converged"""
+    driver_kwargs: dict[str, Any] = field(default_factory=dict)
+    """Keyword arguments used to create the driver"""
+    run_kwargs: dict[str, Any] = field(default_factory=dict)
+    """Keyword arguments passed to the driver's run method"""
+    post_fun: Optional[Callable[[Atoms], None]] = None
+    """Post-processing function applied after run is complete. Modifies the input arguments"""
 
 
 class DynamicsProtocol:
     """A protocol for running several steps of dynamics calls together
 
     Args:
-        processes: List of dynamics to be run in sequential order
+        stages: List of dynamics to be run in sequential order
         scratch_dir: Directory in which to write temporary files
     """
 
-    processes: list[DynamicsStep]  # TODO (wardlt): Find another name besides "step" to describe this
-    """List of steps to run expressed"""
+    stages: list[DynamicsStage]
+    """List of dynamics processes to run sequentially"""
 
-    def __init__(self, processes: list[DynamicsStep], scratch_dir: Path | None = None):
-        self.processes = processes.copy()
+    def __init__(self, stages: list[DynamicsStage], scratch_dir: Path | None = None):
+        self.stages = stages.copy()
         self.scratch_dir = scratch_dir
 
+    # TODO (wardlt): We might need to run dynamics with a physics code, which will require changing the interface
     def run_dynamics(self,
                      start: Progress,
                      model_msg: bytes | State,
@@ -90,10 +98,10 @@ class DynamicsProtocol:
         """
 
         # Create a temporary directory in which to run the data
-        dyn_cls, dyn_steps, dyn_args, run_args, post_func = self.processes[start.process]  # Pick the current process
+        stage = self.stages[start.phase]  # Pick the current process
         with TemporaryDirectory(dir=self.scratch_dir, prefix='cascade-dyn_', suffix=f'_{start.name}') as tmp:
             tmp = Path(tmp)
-            dyn = dyn_cls(start.atoms, logfile=str(tmp / 'dyn.log'), **dyn_args)
+            dyn = stage.driver(start.atoms, logfile=str(tmp / 'dyn.log'), **stage.driver_kwargs)
 
             # Attach the calculator
             calc = learner.make_calculator(model_msg, device)
@@ -107,18 +115,18 @@ class DynamicsProtocol:
                 dyn.attach(traj, traj_freq)
 
                 # Run dynamics, then check if we have finished
-                converged = dyn.run(steps=max_timesteps, **run_args)
+                converged = dyn.run(steps=max_timesteps, **stage.run_kwargs)
                 total_timesteps = max_timesteps + start.timestep  # Total progress along this step
 
                 if converged and isinstance(dyn, Optimizer):  # Optimization is done if convergence is met
                     done = True
-                elif isinstance(dyn, Optimizer) and dyn_steps is not None:  # Optimization is also done if we've run out of timesteps
-                    done = total_timesteps >= dyn_steps
+                elif isinstance(dyn, Optimizer) and stage.timesteps is not None:  # Optimization is also done if we've run out of timesteps
+                    done = total_timesteps >= stage.timesteps
                 else:
-                    done = total_timesteps >= dyn_steps
+                    done = total_timesteps >= stage.timesteps
 
-                if done and post_func is not None:
-                    post_func(atoms)
+                if done and stage.post_fun is not None:
+                    stage.post_fun(atoms)
 
             # Read in the trajectory then append the current frame to it
             traj_atoms = read(traj_path, ':')

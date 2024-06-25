@@ -7,7 +7,7 @@ The :class:`~cascade.dynamics.DynamicsProtocol` class from Cascade propagates a 
 using the learned surrogate and returns copies of the system at many timesteps for use
 by the Auditing code.
 
-Create a Dynamics class by defining what happens in each step of a process as a tuple:
+Create a Dynamics class by defining what happens in each stage of a process as a :class:`~cascade.dynamics.DynamicsStage`:
 
 1. *Which type of dynamics*, as an ASE Dynamics class (e.g., an optimizer or molecular dynamics method)
 2. *Maximum number of timesteps*. Use ``None`` to run until convergence is reached
@@ -15,7 +15,7 @@ Create a Dynamics class by defining what happens in each step of a process as a 
 4. *Options for the run method*, such as the convergence threshold
 5. *Post-processing function applied after run is complete*, which modifies the Atoms object as the list step.
 
-A dynamics process could have multiple steps, such as an optimization followed by molecular dynamics
+A dynamics process could have multiple stages, such as an optimization followed by molecular dynamics
 under several different control conditions.
 
 .. note:: We need a better name than process for which type of dynamics it is running.
@@ -24,10 +24,10 @@ under several different control conditions.
 
     # Optimization then constant-energy molecular dynamics
     dyn_steps = [
-        (BFGS, 100, {}, {'fmax': 0.001}, partial(MaxwellBoltzmannDistribution, temperature_K=300)),
-        (VelocityVerlet, 100, {'timestep': 0.5}, {}, None)
+        DynamicsStage(BFGS, 100, {}, {'fmax': 0.001}, partial(MaxwellBoltzmannDistribution, temperature_K=300)),
+        DynamicsStage(VelocityVerlet, 100, {'timestep': 0.5}, {}, None)
     ]
-    dyn = DynamicsProtocol(processes=dyn_steps)
+    dyn = DynamicsProtocol(stages=dyn_steps)
 
 
 The :class:`~cascade.dynamics.Progress` of a single trajectory along the dynamics is defined by which process step it is running
