@@ -130,6 +130,7 @@ class DynamicsProtocol:
 
             # Read in the trajectory then append the current frame to it
             traj_atoms = read(traj_path, ':')
-            traj_atoms.append(atoms)
+            if traj_atoms[-1] != atoms:
+                traj_atoms.append(atoms)
 
             return done, traj_atoms

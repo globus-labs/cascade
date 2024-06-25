@@ -44,6 +44,8 @@ def test_dynamics(example_model, example_data):
     assert done, 'Dynamics did not converge'
     assert (np.abs(traj[-1].get_forces()) <= 0.001).all()
 
+    assert not np.isclose(traj[-1].positions, traj[-2].positions).all()
+
     # Update the state and then run the next step
     start.update(traj[-1], steps_completed=len(traj), finished_step=True)
     assert start.phase == 1  # Should be on to the next step
