@@ -10,7 +10,7 @@ def make_aev_computer(species: list[str]) -> AEVComputer:
     Args:
         species: List of species used for the model
     Returns:
-        Tool which computes the atomic environement of each atom
+        Tool which computes the atomic environment of each atom
     """
 
     # TODO (wardlt): Make these options adjustable
