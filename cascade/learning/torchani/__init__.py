@@ -113,7 +113,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
                  model_msg: bytes | ANIModelContents,
                  atoms: list[ase.Atoms],
                  batch_size: int = 64,
-                 device: str = 'cpu') -> (np.ndarray, list[np.ndarray]):
+                 device: str = 'cpu') -> tuple[np.ndarray, list[np.ndarray]]:
 
         # TODO (wardlt): Put model in "eval" mode, skip making the graph when computing gradients in `forward_batch` <- performance optimizations
 
