@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from collections import defaultdict
 from torch.utils.data import DataLoader
+from functools import partial
 
 from torchani import AEVComputer, ANIModel
 from torchani.aev import SpeciesAEV
@@ -12,6 +13,7 @@ from ignite.engine import Engine, Events
 from ignite.metrics import Loss, MeanAbsoluteError
 from ignite.contrib.handlers import MLflowLogger
 import torch
+
 
 from cascade.learning.base import BaseLearnableForcefield, State
 from cascade.learning.utils import estimate_atomic_energies
@@ -206,17 +208,6 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         loss_e = torch.nn.HuberLoss(reduction='none', delta=huber_e)
         loss_f = torch.nn.HuberLoss(reduction='none', delta=huber_f)
 
-        # set up MLFlow
-        mlflow_logger = MLflowLogger()
-        mlflow_logger.log_params({
-            'model': model.__class__.__name__,
-            "pytorch_version": torch.__version__,
-            #"ignite_version": ignite.__version__,
-            "cuda_version": torch.version.cuda,
-            "device_name": torch.cuda.get_device_name(0)
-        })
-
-
         def train_step(engine, batch):
             """Borrowed from the training step used inside MACE"""
             model.train()
@@ -237,10 +228,17 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
             loss.backward()
             opt.step()
             return loss.item()
+        
 
-        def _evaluate_model(engine: Engine | None = None, loader=valid_loader) -> pd.DataFrame:
-            """Evaluate current state of the model against all structures available for training"""
-            _output = defaultdict(list)
+        def evaluate_model(loader: DataLoader, 
+                           accumulator: list[dict[str, float]]) -> None:
+            """Evaluate the model against all data in loader, store in global list
+            
+            Args: 
+                loader: a pytorch data loader
+                acccumulator: a list in which to append results  
+            """
+            e_qm, e_ml, f_qm, f_ml = [], [], [],[]
             for batch in loader:
                 # Get the true results
                 batch_e = batch['energies'].cpu().numpy().squeeze()
@@ -249,44 +247,54 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
                 batch_e_pred, batch_f_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device)
                 batch_e_pred = batch_e_pred.detach().cpu().numpy()
 
-                _output['dft'].extend(batch_e)
-                _output['ml'].extend(batch_e_pred)
+                e_qm.extend(batch_e)
+                e_ml.extend(batch_e_pred)
 
                 # Compute the forces
-                _output['dft-forces'].extend(batch_f)
-                _output['ml-forces'].extend(batch_f_pred.detach().cpu().numpy())
+                f_qm.extend(batch_f)
+                f_ml.extend(batch_f_pred.detach().cpu().numpy())
 
-                # Compute the errors per atom
-                batch_n = (batch['species'] >= 0).sum(dim=1).cpu().numpy()
-                batch_e_error = ((batch_e - batch_e_pred) / batch_n).squeeze()
-                _output['energy_error_pa'].extend(batch_e_error)
+            # convert batch results into flat np arrays
+            e_qm, e_ml, f_qm, f_ml = map(lambda l: np.asarray(l).ravel(), 
+                                       (e_qm, e_ml, f_qm, f_ml))
+            
+            # compute and store metrics
+            result = {}
+            result['e_rmse'] = np.sqrt((e_qm - e_ml)**2).mean()
+            result['e_mae'] = np.abs(e_qm - e_ml).mean()
+            result['f_rmse'] = np.sqrt((f_qm - f_ml)**2).mean()
+            result['f_mae'] = np.abs(f_qm - f_ml).mean()
+            accumulator.append(result)
+            return 
 
-            _output = pd.DataFrame(_output)
-            _output['rmse'] = [np.power(x - y, 2).mean() for x, y in
-                                zip(_output['dft-forces'], _output['ml-forces'])]
-            eng_mae = _output['energy_error_pa'].abs().mean()
-            # logger.info(f'Evaluated model performance on {len(_output)} configurations. '
-            #             f'Force RMSE: {_output["rmse"].mean() * 1000:.2f} meV/Ang - Energy MAE: {eng_mae * 1000:.3f} meV/atom')
+        # TODO (wardlt): use early stopping
+        
 
-            if engine is not None:
-                mlflow_logger.log_metrics({
-                    'energy-mae': eng_mae,
-                    'force-rmse': _output["rmse"].mean()
-                }, step=engine.state.epoch)
+        # instantiate the trainer
+        trainer = Engine(train_step) 
 
-            _results = {'val_force_rmse': _output["rmse"].mean(), 
-                        'val_energy_mae': eng_mae}
-            results.append(_results)
-            return _output
-
-        # Run training
-        # TODO (wardlt): Track the learning, use early stopping
-        trainer = Engine(train_step)
-        results : list[dict[str, float]] = [] # gets appeneded to in _evaluate_model
-        trainer.add_event_handler(Events.EPOCH_COMPLETED, _evaluate_model)
+        # Set up model evaluators 
+        # TODO (miketynes): this could probably be a neat callable class
+        perf_train : list[dict[str, float]] = [] 
+        perf_val   : list[dict[str, float]] = []
+        evaluator_train = partial(evaluate_model,
+                                  loader=train_loader, 
+                                  accumulator=perf_train)
+        evaluator_val   = partial(evaluate_model,
+                                  loader=train_loader, 
+                                  accumulator=perf_val)
+        trainer.add_event_handler(Events.EPOCH_COMPLETED, evaluator_train)
+        trainer.add_event_handler(Events.EPOCH_COMPLETED, evaluator_val)
+        
+        # Run the training
         trainer.run(train_loader, max_epochs=num_epochs)
 
-        return self.serialize_model((aev_computer, model, atomic_energies)), pd.DataFrame.from_records(results)
+        # coalesce the training performance
+        perf_train, perf_val = map(pd.DataFrame.from_records, [perf_train, perf_val])
+        perf_train['split'] = 'train'
+        perf_val['split'] = 'val'
+        perf = pd.concat([perf_train, perf_val]).reset_index(names='iteration')
 
-
-
+        # serialize model
+        model_msg = self.serialize_model((aev_computer, model, atomic_energies)) 
+        return model_msg, perf 
