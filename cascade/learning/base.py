@@ -20,6 +20,7 @@ class BaseLearnableForcefield(Generic[State]):
     Using a Learnable Forcefield
     ----------------------------
 
+
     The learnable forcefield class defines a reduced interface to a surrogate model
     that computes the energies and forces of a system of atoms.
     The interfaces are designed to be simple to facilitate integration within a workflow
@@ -122,10 +123,10 @@ class BaseLearnableForcefield(Generic[State]):
               device: str = 'cpu',
               batch_size: int = 32,
               learning_rate: float = 1e-3,
-              huber_deltas: (float, float) = (0.5, 1),
+              huber_deltas: tuple[float, float] = (0.5, 1),
               force_weight: float = 0.9,
               reset_weights: bool = False,
-              **kwargs) -> (bytes, pd.DataFrame):
+              **kwargs) -> tuple[bytes, pd.DataFrame]:
         """Train a model
 
         Args:

@@ -2,12 +2,15 @@
 import ase
 import numpy as np
 import pandas as pd
+from collections import defaultdict
 from torch.utils.data import DataLoader
 
 from torchani import AEVComputer, ANIModel
 from torchani.aev import SpeciesAEV
 from torchani.data import collate_fn
-from ignite.engine import Engine
+from ignite.engine import Engine, Events
+from ignite.metrics import Loss, MeanAbsoluteError
+from ignite.contrib.handlers import MLflowLogger
 import torch
 
 from cascade.learning.base import BaseLearnableForcefield, State
@@ -159,10 +162,10 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
               device: str = 'cpu',
               batch_size: int = 32,
               learning_rate: float = 1e-3,
-              huber_deltas: (float, float) = (0.5, 1),
+              huber_deltas: tuple[float, float] = (0.5, 1),
               force_weight: float = 0.9,
               reset_weights: bool = False,
-              **kwargs) -> (bytes, pd.DataFrame):
+              **kwargs) -> tuple[bytes, pd.DataFrame]:
 
         # Unpack the model and move to device
         if isinstance(model_msg, bytes):
@@ -192,9 +195,9 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
                                   batch_size=batch_size,
                                   shuffle=True,
                                   drop_last=True)
-        # valid_loader = DataLoader([ase_to_ani(a, species) for a in valid_data],
-        #                           collate_fn=lambda x: collate_fn(x, my_collate_dict),
-        #                           batch_size=batch_size)  # TODO (wardlt): Actually use this
+        valid_loader = DataLoader([ase_to_ani(a, species) for a in valid_data],
+                                  collate_fn=lambda x: collate_fn(x, my_collate_dict),
+                                  batch_size=batch_size)  # TODO (wardlt): Actually use this
 
         # Prepare optimizer and loss functions
         opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -202,6 +205,17 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         huber_e, huber_f = huber_deltas
         loss_e = torch.nn.HuberLoss(reduction='none', delta=huber_e)
         loss_f = torch.nn.HuberLoss(reduction='none', delta=huber_f)
+
+        # set up MLFlow
+        mlflow_logger = MLflowLogger()
+        mlflow_logger.log_params({
+            'model': model.__class__.__name__,
+            "pytorch_version": torch.__version__,
+            #"ignite_version": ignite.__version__,
+            "cuda_version": torch.version.cuda,
+            "device_name": torch.cuda.get_device_name(0)
+        })
+
 
         def train_step(engine, batch):
             """Borrowed from the training step used inside MACE"""
@@ -224,9 +238,55 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
             opt.step()
             return loss.item()
 
+        def _evaluate_model(engine: Engine | None = None, loader=valid_loader) -> pd.DataFrame:
+            """Evaluate current state of the model against all structures available for training"""
+            _output = defaultdict(list)
+            for batch in loader:
+                # Get the true results
+                batch_e = batch['energies'].cpu().numpy().squeeze()
+                batch_f = batch['forces'].cpu().numpy()
+
+                batch_e_pred, batch_f_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device)
+                batch_e_pred = batch_e_pred.detach().cpu().numpy()
+
+                _output['dft'].extend(batch_e)
+                _output['ml'].extend(batch_e_pred)
+
+                # Compute the forces
+                _output['dft-forces'].extend(batch_f)
+                _output['ml-forces'].extend(batch_f_pred.detach().cpu().numpy())
+
+                # Compute the errors per atom
+                batch_n = (batch['species'] >= 0).sum(dim=1).cpu().numpy()
+                batch_e_error = ((batch_e - batch_e_pred) / batch_n).squeeze()
+                _output['energy_error_pa'].extend(batch_e_error)
+
+            _output = pd.DataFrame(_output)
+            _output['rmse'] = [np.power(x - y, 2).mean() for x, y in
+                                zip(_output['dft-forces'], _output['ml-forces'])]
+            eng_mae = _output['energy_error_pa'].abs().mean()
+            # logger.info(f'Evaluated model performance on {len(_output)} configurations. '
+            #             f'Force RMSE: {_output["rmse"].mean() * 1000:.2f} meV/Ang - Energy MAE: {eng_mae * 1000:.3f} meV/atom')
+
+            if engine is not None:
+                mlflow_logger.log_metrics({
+                    'energy-mae': eng_mae,
+                    'force-rmse': _output["rmse"].mean()
+                }, step=engine.state.epoch)
+
+            _results = {'val_force_rmse': _output["rmse"].mean(), 
+                        'val_energy_mae': eng_mae}
+            results.append(_results)
+            return _output
+
         # Run training
         # TODO (wardlt): Track the learning, use early stopping
         trainer = Engine(train_step)
+        results : list[dict[str, float]] = [] # gets appeneded to in _evaluate_model
+        trainer.add_event_handler(Events.EPOCH_COMPLETED, _evaluate_model)
         trainer.run(train_loader, max_epochs=num_epochs)
 
-        return self.serialize_model((aev_computer, model, atomic_energies)), pd.DataFrame()
+        return self.serialize_model((aev_computer, model, atomic_energies)), pd.DataFrame.from_records(results)
+
+
+
