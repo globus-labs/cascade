@@ -12,7 +12,7 @@ from ase.io import read
 from sklearn.model_selection import train_test_split
 from scipy.stats import linregress
 
-from cascade.learning.base import BaseLearnableForcefield, State
+from cascade.learning.base import BaseLearnableForcefield
 from cascade.calculator import EnsembleCalculator
 
 logger = logging.getLogger(__name__)
@@ -31,9 +31,11 @@ class SerialLearningCalculator(Calculator):
         A physics-based calculator used to provide training data for learnable
     learner: BaseLearnableForcefield
         A class used to train the forcefield and generate an updated calculator
-    models: tuple of State
+    models: list of State associated with learner
         One or more set of objects that define the architecture and weights of the
         surrogate model. These weights are used by the learner.
+    device: str
+        Device used for running the learned surrogates
     train_kwargs: dict
         Dictionary of parameters passed to the train function of the learner
     target_ferr: float
@@ -52,8 +54,9 @@ class SerialLearningCalculator(Calculator):
         'target_calc': None,
         'learner': None,
         'models': None,
+        'device': 'cpu',
         'train_kwargs': {'num_epochs': 8},
-        'target_ferr': 0.1,
+        'target_ferr': 0.1,  # TODO (wardlt): Make the error metric configurable
         'history_length': 8,
         'db_path': None
     }
@@ -98,14 +101,14 @@ class SerialLearningCalculator(Calculator):
         all_atoms = read(db_path, ':')
         logger.info(f'Loaded {len(all_atoms)} from {db_path} for retraining {len(self.parameters["models"])} models')
         if len(all_atoms) < 10:
-            logger.debug(f'Too few entries to retrain')
+            logger.debug('Too few entries to retrain')
             return
 
         # Train each model using a different, randomly-selected subset of the data
-        model_list = self.parameters['models']
+        model_list = self.parameters['models']  # Edit it in place
         for i, model_msg in enumerate(self.parameters['models']):
             train_atoms, valid_atoms = train_test_split(all_atoms, test_size=0.1)
-            new_model_msg, _ = self.learner.train(model_msg, train_atoms, valid_atoms, **self.parameters['train'])
+            new_model_msg, _ = self.learner.train(model_msg, train_atoms, valid_atoms, **self.parameters['train_kwargs'])
             model_list[i] = new_model_msg
             logger.debug(f'Finished training model {i}')
 
@@ -118,7 +121,7 @@ class SerialLearningCalculator(Calculator):
         if self.surrogate_calc is None:
             self.retrain_surrogate()
             self.surrogate_calc = EnsembleCalculator(
-                calculators=[self.learner.make_calculator(m) for m in self.parameters['models']]
+                calculators=[self.learner.make_calculator(m, self.parameters['device']) for m in self.parameters['models']]
             )
         self.surrogate_calc.calculate(atoms, properties, system_changes)
 
@@ -146,25 +149,33 @@ class SerialLearningCalculator(Calculator):
         db_atoms.calc = target_calc
         with connect(self.parameters['db_path']) as db:
             db.write(db_atoms)
+        surrogate_forces = self.surrogate_calc.results['forces']
         self.surrogate_calc = None
 
         # Update the alpha parameter, which relates skepticism and observed error
         #  See Section 3.2 from https://dl.acm.org/doi/abs/10.1145/3447818.3460370
-        actual_err = np.linalg.norm(target_calc.results['forces'] - self.surrogate_calc.results['forces'], axis=-1).max()
+        actual_err = np.linalg.norm(target_calc.results['forces'] - surrogate_forces, axis=-1).max()
         if self.error_history is None:
-            self.error_history = deque(maxlen=self.parameters['history_len'])
+            self.error_history = deque(maxlen=self.parameters['history_length'])
         self.error_history.append((skept_signal, actual_err))
 
-        if len(self.error_history) < self.parameters['history_len']:
-            logger.debug(f'Too few entries in training history. {len(self.error_history)} < {self.parameters["history_len"]}')
+        if len(self.error_history) < self.parameters['history_length']:
+            logger.debug(f'Too few entries in training history. {len(self.error_history)} < {self.parameters["history_length"]}')
             return
-        self.alpha = 1. / linregress(*zip(self.error_history))[0]  # Alpha is the reciprocal the slope of skepticism vs actual error
+        skept_signals, obs_errors = zip(*self.error_history)
+        self.alpha = linregress(obs_errors, skept_signals)[0]  # Alpha is the reciprocal the slope of skepticism vs actual error
+        if self.alpha < 0:
+            logger.warning(f'Alpha parameter was less than zero ({self.alpha:.2e}).'
+                           ' We reset it 1e-6, but the negative value suggests a problem with your skepticism metric.')
+            self.alpha = 1e-6
 
         # Update the threshold used to determine if the surrogate is usable
         if self.threshold is None:
-            # Initialize it to twice the expected threshold if skepticism and observed are truely related
-            self.threshold = 2 * self.parameters['fmax_target'] / self.alpha
+            # Use the initial estimate for alpha to set a conservative threshold
+            #  Following Eq. 1 of https://dl.acm.org/doi/abs/10.1145/3447818.3460370,
+            self.threshold = self.parameters['target_ferr'] / self.alpha
+            self.threshold /= 2
         else:
             # Update according to Eq. 3 of https://dl.acm.org/doi/abs/10.1145/3447818.3460370
             current_err = np.mean([e for _, e in self.error_history])
-            self.threshold -= (current_err - self.parameters['fmax_target']) / self.alpha
+            self.threshold -= (current_err - self.parameters['target_ferr']) / self.alpha
