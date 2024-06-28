@@ -61,7 +61,7 @@ def test_ensemble(trajectories):
     assert np.isclose(f_mean, f_ens).all()
 
     # assert we get the ensemble member forces and they also have the correct values
-    f_ens_members = np.asarray([a.info['forces_ens'] for a in t_ens])
+    f_ens_members = np.asarray([a.calc.results['forces_ens'] for a in t_ens])
     f_ens_lj1 = f_ens_members[:, 0, 0, 0]
     f_ens_lj2 = f_ens_members[:, 1, 0, 0]
     assert np.isclose(f_ens_lj1, f_lj1).all()

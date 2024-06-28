@@ -62,7 +62,7 @@ class ForceThresholdAuditor(BaseAuditor):
               n_audits: int,
               sort_audits: bool = False) -> tuple[float, list[int]]:
 
-        force_preds = np.asarray([a.info['forces_ens'] for a in atoms])
+        force_preds = np.asarray([a.calc.results['forces_ens'] for a in atoms])
 
         # flatten the predictions we have one dim for the ensemble and one for the rest
         # last dim is spatial (3)

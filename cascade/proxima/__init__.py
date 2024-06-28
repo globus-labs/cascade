@@ -127,7 +127,7 @@ class SerialLearningCalculator(Calculator):
 
         # Compute a skepticism signal for the ensemble model
         #  We use, for now, the maximum mean difference in force prediction for over all atoms.
-        forces_ens = atoms.info['forces_ens']
+        forces_ens = self.surrogate_calc.results['forces_ens']
         forces_diff = np.linalg.norm(forces_ens - self.surrogate_calc.results['forces'][None, :, :], axis=-1).mean(axis=0)  # Mean diff per atom
         skept_signal = forces_diff.max()
         logger.debug(f'Computed the skepticism signal for the model to be: {skept_signal:.2e}')

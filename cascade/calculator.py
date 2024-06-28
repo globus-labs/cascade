@@ -1,10 +1,11 @@
 """Utilities for employing ASE calculators"""
+from typing import List
 from pathlib import Path
 from string import Template
 from hashlib import sha256
 import numpy as np
 
-from ase.calculators.calculator import Calculator, all_changes
+from ase.calculators.calculator import Calculator, all_changes, all_properties
 from ase.calculators.cp2k import CP2K
 from ase import units, Atoms
 
@@ -110,49 +111,49 @@ def make_calculator(
 class EnsembleCalculator(Calculator):
     """A single calculator which combines the results of many
 
-    The when run on atoms, ensemble average of energy and forces are stored in atoms.calc.results
-    Additionally, the forces from each ensemble member are stored in atoms.info['forces_ens']
-    as a (num_calculators, num_atoms, 3) array
+
+    Stores the mean of all calculators as the standard property names,
+    and stores the values for each calculator in the :attr:`results`
+    as the name of the property with "_ens" appended (e.g., "forces_ens")
 
     Args:
         calculators: the calculators to ensemble over
     """
-    implemented_properties = ['energy', 'forces']
 
     def __init__(self,
                  calculators: list[Calculator],
                  **kwargs):
-
         Calculator.__init__(self, **kwargs)
         self.calculators = calculators
         self.num_calculators = len(calculators)
-        self.count = 0
+
+    @property
+    def implemented_properties(self) -> List[str]:
+        joint = set(self.calculators[0].implemented_properties)
+        for calc in self.calculators[1:]:
+            joint.intersection_update(calc.implemented_properties)
+
+        return list(joint)
 
     def calculate(self,
                   atoms: Atoms = None,
-                  properties=('energy', 'forces'),
+                  properties=all_properties,
                   system_changes=all_changes):
-        # TODO (wardlt): Include stresses
-        # create arrays for energy and forces
-        results = {
-            'energy': np.zeros(self.num_calculators).copy(),
-            'forces': np.zeros((self.num_calculators, len(atoms), 3)).copy()
-        }
 
-        # compute and store energy and forces for each calculator
-        for i, calc in enumerate(self.calculators):
-            calc.calculate(atoms,
-                           properties=properties,
-                           system_changes=system_changes)
+        # Run each of the subcalculators
+        for calc in self.calculators:
+            calc.calculate(atoms, properties=properties, system_changes=system_changes)
 
-            for k in results.keys():
-                results[k][i] = calc.results[k]
+        # Determine the intersection of the properties computed from all calculators
+        all_results = set(self.calculators[0].results.keys())
+        for calc in self.calculators[1:]:
+            all_results.intersection_update(calc.results.keys())
 
-        # store the ensemble forces in atoms.info
-        atoms.info['forces_ens'] = results['forces'].copy()
+        # Merge their results
+        results = {}
+        for key in all_results:
+            all_results = np.concatenate([np.expand_dims(calc.results[key], axis=0) for calc in self.calculators], axis=0)
+            results[f'{key}_ens'] = all_results
+            results[key] = all_results.mean(axis=0)
 
-        # average over the ensemble dimension for the mean forces
-        for k in 'energy', 'forces':
-            results[k] = results[k].mean(0)
-
-        self.results.update(results)
+        self.results = results
