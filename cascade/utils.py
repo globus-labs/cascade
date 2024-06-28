@@ -4,6 +4,7 @@ from copy import deepcopy
 import ase
 from ase import Atoms
 from ase.calculators.calculator import Calculator
+from ase.calculators.singlepoint import SinglePointCalculator
 
 
 # Taken from ExaMol
@@ -49,8 +50,12 @@ def canonicalize(atoms: Atoms) -> Atoms:
     Returns:
         Atoms object that has been serialized and deserialized
     """
-    fmt = 'extxyz'  # the ase.io format to write to and read from
-    return read_from_string(write_to_string(atoms, fmt), fmt)
+    # TODO (wardlt): Make it so the single-point calculator can hold unknown properties? (see discussion https://gitlab.com/ase/ase/-/issues/782)
+    if atoms.calc is not None:
+        old_calc = atoms.calc
+        atoms.calc = SinglePointCalculator(atoms)
+        atoms.calc.results = old_calc.results.copy()
+    return atoms
 
 
 def apply_calculator(
