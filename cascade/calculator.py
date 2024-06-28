@@ -112,6 +112,7 @@ class EnsembleCalculator(Calculator):
 
     The when run on atoms, ensemble average of energy and forces are stored in atoms.calc.results
     Additionally, the forces from each ensemble member are stored in atoms.info['forces_ens']
+    as a (num_calculators, num_atoms, 3) array
 
     Args:
         calculators: the calculators to ensemble over
@@ -131,6 +132,7 @@ class EnsembleCalculator(Calculator):
                   atoms: Atoms = None,
                   properties=('energy', 'forces'),
                   system_changes=all_changes):
+        # TODO (wardlt): Include stresses
         # create arrays for energy and forces
         results = {
             'energy': np.zeros(self.num_calculators).copy(),
