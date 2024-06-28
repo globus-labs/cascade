@@ -192,7 +192,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         pbc = torch.from_numpy(np.ones((3,), bool)).to(device)  # TODO (don't hard code to 3D)
         train_loader = DataLoader([ase_to_ani(a, species) for a in train_data],
                                   collate_fn=lambda x: collate_fn(x, my_collate_dict),
-                                  batch_size=batch_size,
+                                  batch_size=min(batch_size, len(train_data)),
                                   shuffle=True,
                                   drop_last=True)
         # valid_loader = DataLoader([ase_to_ani(a, species) for a in valid_data],
