@@ -1,7 +1,7 @@
 """ASE-compatible implementations of online learning strategy of
 `Zamora et al. <https://dl.acm.org/doi/abs/10.1145/3447818.3460370>`_, Proxima."""
 from collections import deque
-from typing import List, Optional
+from typing import List, Optional, Any
 from pathlib import Path
 import logging
 
@@ -10,7 +10,6 @@ from ase.calculators.calculator import Calculator, all_changes, all_properties
 from ase.db import connect
 from ase.io import read
 from sklearn.model_selection import train_test_split
-from scipy.stats import linregress
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.calculator import EnsembleCalculator
@@ -23,7 +22,7 @@ class SerialLearningCalculator(Calculator):
     being trained to emulate it.
 
     Determines when to switch between the physics and learnable calculator based
-    on a uncertainty metric from the learnable calculator.
+    on an uncertainty metric from the learnable calculator.
 
     Parameters for the calculator are:
 
@@ -182,3 +181,40 @@ class SerialLearningCalculator(Calculator):
             # Update according to Eq. 3 of https://dl.acm.org/doi/abs/10.1145/3447818.3460370
             current_err = np.mean([e for _, e in self.error_history])
             self.threshold -= (current_err - self.parameters['target_ferr']) / self.alpha
+
+    def get_state(self) -> dict[str, Any]:
+        """Get the state of the learner in a state that can be saved to disk using pickle
+
+        The state contains the current threshold control parameters, error history, and the latest models.
+
+        Returns:
+            Dictionary containing the state of the model(s)
+        """
+
+        output = {
+            'threshold': self.threshold,
+            'alpha': self.alpha,
+            'error_history': list(self.error_history),
+        }
+        if self.surrogate_calc is not None:
+            output['models'] = [self.learner.serialize_model(s) for s in self.parameters['models']]
+        return output
+
+    def set_state(self, state: dict[str, Any]):
+        """Set the state of learner using the state saved by :meth:`get_state`
+
+        Args:
+            state: State containing the threshold control system parameters and trained models, if available
+        """
+
+        # Set the state of the threshold
+        self.alpha = state['alpha']
+        self.threshold = state['threshold']
+        self.error_history.clear()
+        self.error_history.extend(state['error_history'])
+
+        # Remake the surrogate calculator, if available
+        if 'models' in state:
+            self.surrogate_calc = EnsembleCalculator(
+                calculators=[self.learner.make_calculator(m, self.parameters['device']) for m in state['models']]
+            )

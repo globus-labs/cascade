@@ -82,3 +82,15 @@ def test_proxima(starting_frame, simple_model, target_calc, tmpdir):
 
     calc.retrain_surrogate()
     assert original_model is not calc.parameters['models'][0], 'Model was not retrained'
+
+    # Make a call where the surrogate will run, so we can test updating the state
+    calc.threshold = 1e10
+    calc.get_forces(starting_frame)
+    assert calc.surrogate_calc is not None
+
+    # Pull the state and make sure it has the models in it as bytestrings
+    state = calc.get_state()
+    assert 'models' in state
+    assert isinstance(state['models'][0], bytes)
+
+    calc.set_state(state)
