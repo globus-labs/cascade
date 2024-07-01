@@ -5,7 +5,7 @@ from cascade.learning.torchani import TorchANI
 from cascade.learning.utils import estimate_atomic_energies
 
 
-def test_build(example_data):
+def build_model(example_data):
     """Build an example network"""
 
     ref_energies = estimate_atomic_energies(example_data)
@@ -20,7 +20,7 @@ def test_inference(example_data):
 
     # Make the model requirements
     ref_energies = estimate_atomic_energies(example_data)
-    aev, nn = test_build(example_data)
+    aev, nn = build_model(example_data)
 
     # Remove the claculator from the Atoms object (not needed for inference)
     for atoms in example_data:
@@ -32,13 +32,20 @@ def test_inference(example_data):
     for atoms, forces in zip(example_data, batch_forces):
         assert forces.shape == (len(atoms), 3)
 
+    # Test the calculator interface
+    calc = ani.make_calculator((aev, nn, ref_energies), 'cpu')
+    atoms = example_data[0]
+    atoms.calc = calc
+    assert np.isclose(atoms.get_potential_energy(), batch_energies[0]).all()
+    assert np.isclose(atoms.get_forces(), batch_forces[0]).all()
+
 
 def test_training(example_data):
     """Run example network on test data"""
 
     # Make the model requirements
     ref_energies = estimate_atomic_energies(example_data)
-    aev, nn = test_build(example_data)
+    aev, nn = build_model(example_data)
 
     # Get baseline predictions, train
     ani = TorchANI()
