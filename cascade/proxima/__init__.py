@@ -125,7 +125,7 @@ class SerialLearningCalculator(Calculator):
             )
         self.surrogate_calc.calculate(atoms, properties + ['forces'], system_changes)  # Make sure forces are computed too
 
-        # Compute a uncertainty metric for the ensemble model
+        # Compute an uncertainty metric for the ensemble model
         #  We use, for now, the maximum mean difference in force prediction for over all atoms.
         forces_ens = self.surrogate_calc.results['forces_ens']
         forces_diff = np.linalg.norm(forces_ens - self.surrogate_calc.results['forces'][None, :, :], axis=-1).mean(axis=0)  # Mean diff per atom
@@ -154,6 +154,7 @@ class SerialLearningCalculator(Calculator):
 
         # Update the alpha parameter, which relates uncertainty and observed error
         #  See Section 3.2 from https://dl.acm.org/doi/abs/10.1145/3447818.3460370
+        #  Main difference: We do not fit an intercept when estimating \alpha
         actual_err = np.linalg.norm(target_calc.results['forces'] - surrogate_forces, axis=-1).max()
         if self.error_history is None:
             self.error_history = deque(maxlen=self.parameters['history_length'])
@@ -163,11 +164,12 @@ class SerialLearningCalculator(Calculator):
             logger.debug(f'Too few entries in training history. {len(self.error_history)} < {self.parameters["history_length"]}')
             return
         uncert_metrics, obs_errors = zip(*self.error_history)
-        self.alpha = linregress(uncert_metrics, obs_errors)[0]  # Alpha relates the uncertainty metric to the observed error
+        many_alphas = np.true_divide(obs_errors, uncert_metrics)
+        self.alpha = np.percentile(many_alphas, 50)
         bad_alpha = self.alpha < 0
         if bad_alpha:
             logger.warning(f'Alpha parameter was less than zero ({self.alpha:.2e}).'
-                           ' We will not adjust the parameter until this condition changes')
+                           ' Will not adjust the threshold until this condition changes')
             return
 
         # Update the threshold used to determine if the surrogate is usable

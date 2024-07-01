@@ -139,7 +139,6 @@ class EnsembleCalculator(Calculator):
                   atoms: Atoms = None,
                   properties=all_properties,
                   system_changes=all_changes):
-
         # Run each of the subcalculators
         for calc in self.calculators:
             calc.calculate(atoms, properties=properties, system_changes=system_changes)
