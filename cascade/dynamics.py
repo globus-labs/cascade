@@ -24,9 +24,9 @@ class Progress:
     stage: int = 0
     """Current stage within the overall :class:`DynamicsProtocol`."""
     timestep: int = 0
-    """Timestep within the current process"""
+    """Timestep within the current stage"""
 
-    def update(self, new_atoms: Atoms, steps_completed: int, finished_step: bool):
+    def update(self, new_atoms: Atoms, steps_completed: int, finished_stage: bool):
         """Update the state of the current progress
 
         Args:
@@ -36,7 +36,7 @@ class Progress:
         """
 
         self.atoms = new_atoms.copy()
-        if finished_step:
+        if finished_stage:
             self.stage += 1
             self.timestep = 0
         else:
@@ -60,7 +60,7 @@ class DynamicsStage:
 
 
 class DynamicsProtocol:
-    """A protocol for running several steps of dynamics calls together
+    """A protocol for running several stages of dynamics calls together
 
     Args:
         stages: List of dynamics to be run in sequential order
@@ -116,7 +116,7 @@ class DynamicsProtocol:
 
                 # Run dynamics, then check if we have finished
                 converged = dyn.run(steps=max_timesteps, **stage.run_kwargs)
-                total_timesteps = max_timesteps + start.timestep  # Total progress along this step
+                total_timesteps = max_timesteps + start.timestep  # Total progress along this stage
 
                 if converged and isinstance(dyn, Optimizer):  # Optimization is done if convergence is met
                     done = True
