@@ -13,7 +13,7 @@ Create a Dynamics class by defining what happens in each stage of a process as a
 2. *Maximum number of timesteps*. Use ``None`` to run until convergence is reached
 3. *Options to Dynamics*, such as the temperature for molecular dynamics or time per timestep
 4. *Options for the run method*, such as the convergence threshold
-5. *Post-processing function applied after run is complete*, which modifies the Atoms object as the list step.
+5. *Post-processing function applied after run is complete*, which modifies the Atoms object as the list stage.
 
 A dynamics process could have multiple stages, such as an optimization followed by molecular dynamics
 under several different control conditions.
@@ -23,14 +23,14 @@ under several different control conditions.
 .. code-block:: python
 
     # Optimization then constant-energy molecular dynamics
-    dyn_steps = [
+    dyn_stages = [
         DynamicsStage(BFGS, 100, {}, {'fmax': 0.001}, partial(MaxwellBoltzmannDistribution, temperature_K=300)),
         DynamicsStage(VelocityVerlet, 100, {'timestep': 0.5}, {}, None)
     ]
-    dyn = DynamicsProtocol(stages=dyn_steps)
+    dyn = DynamicsProtocol(stages=dyn_stages)
 
 
-The :class:`~cascade.dynamics.Progress` of a single trajectory along the dynamics is defined by which process step it is running
+The :class:`~cascade.dynamics.Progress` of a single trajectory along the dynamics is defined by which stage it is running
 and how many timesteps it has completed along that process.
 
 Run the dynamics by passing the starting state, a surrogate model, and a maximum number of timestep to run.
@@ -48,5 +48,5 @@ continuing to propagate the dynamics.
 .. code-block:: python
 
     if audit(traj):
-        start.update(traj[-1], steps_completed=100, finished_step=done)
+        start.update(traj[-1], steps_completed=100, finished_stage=done)
     done, traj = dyn.run_dynamics(start, example_model, TorchANI(), 5)
