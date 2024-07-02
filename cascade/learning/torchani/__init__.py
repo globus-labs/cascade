@@ -2,7 +2,6 @@
 import ase
 import numpy as np
 import pandas as pd
-from collections import defaultdict
 from torch.utils.data import DataLoader
 from functools import partial
 
@@ -10,8 +9,7 @@ from torchani import AEVComputer, ANIModel
 from torchani.aev import SpeciesAEV
 from torchani.data import collate_fn
 from ignite.engine import Engine, Events
-from ignite.metrics import Loss, MeanAbsoluteError
-from ignite.contrib.handlers import MLflowLogger
+from ignite.handlers.early_stopping import EarlyStopping
 import torch
 
 
@@ -168,6 +166,21 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
               force_weight: float = 0.9,
               reset_weights: bool = False,
               **kwargs) -> tuple[bytes, pd.DataFrame]:
+        """Training method for a torchani model
+
+
+        Args:
+            model_msg: serialized aev computer, torchani model, and species 
+            train_data: atoms to train to
+            valid_data: atoms to validate against
+            num_epochs: number of training epochs
+            device: compute device for training (e.g. "cpu", "cuda:0")
+            batch_size: number of training points in a batch
+            learning_rate: traianing learning weight
+            huber_deltas: energy, force deltas in huber loss
+            force_weight: weight on force in loss 
+            reset_weights: whether to reinitialize the model weights
+        """
 
         # Unpack the model and move to device
         if isinstance(model_msg, bytes):
@@ -266,22 +279,20 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
             result['f_mae'] = np.abs(f_qm - f_ml).mean()
             accumulator.append(result)
             return 
-
-        # TODO (wardlt): use early stopping
-        
-
+     
         # instantiate the trainer
-        trainer = Engine(train_step) 
+        trainer = Engine(train_step)
 
         # Set up model evaluators 
-        # TODO (miketynes): this could probably be a neat callable class
+        # TODO (miketynes): make this more idiomatic pytorch ignite
+        # TODO (miketynes): add early stopping (probably depends on the above)
         perf_train : list[dict[str, float]] = [] 
         perf_val   : list[dict[str, float]] = []
         evaluator_train = partial(evaluate_model,
                                   loader=train_loader, 
                                   accumulator=perf_train)
         evaluator_val   = partial(evaluate_model,
-                                  loader=train_loader, 
+                                  loader=valid_loader, 
                                   accumulator=perf_val)
         trainer.add_event_handler(Events.EPOCH_COMPLETED, evaluator_train)
         trainer.add_event_handler(Events.EPOCH_COMPLETED, evaluator_val)
