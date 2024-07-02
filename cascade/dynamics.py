@@ -21,7 +21,7 @@ class Progress:
     """Current atomic structure"""
     name: str = field(default_factory=lambda: str(uuid4()))
     """Name assigned this trajectory. Defaults to a UUID"""
-    phase: int = 0
+    stage: int = 0
     """Current stage within the overall :class:`DynamicsProtocol`."""
     timestep: int = 0
     """Timestep within the current process"""
@@ -37,7 +37,7 @@ class Progress:
 
         self.atoms = new_atoms.copy()
         if finished_step:
-            self.phase += 1
+            self.stage += 1
             self.timestep = 0
         else:
             self.timestep += steps_completed
@@ -98,7 +98,7 @@ class DynamicsProtocol:
         """
 
         # Create a temporary directory in which to run the data
-        stage = self.stages[start.phase]  # Pick the current process
+        stage = self.stages[start.stage]  # Pick the current process
         with TemporaryDirectory(dir=self.scratch_dir, prefix='cascade-dyn_', suffix=f'_{start.name}') as tmp:
             tmp = Path(tmp)
             dyn = stage.driver(start.atoms, logfile=str(tmp / 'dyn.log'), **stage.driver_kwargs)
