@@ -37,6 +37,8 @@ class SerialLearningCalculator(Calculator):
         Device used for running the learned surrogates
     train_kwargs: dict
         Dictionary of parameters passed to the train function of the learner
+    train_freq: int
+        After how many new data points to retrain the surrogate model
     target_ferr: float
         Target maximum difference between the forces predicted by the target
         calculator and the learnable surrogate
@@ -55,6 +57,7 @@ class SerialLearningCalculator(Calculator):
         'models': None,
         'device': 'cpu',
         'train_kwargs': {'num_epochs': 8},
+        'train_freq': 1,
         'target_ferr': 0.1,  # TODO (wardlt): Make the error metric configurable
         'history_length': 8,
         'db_path': None
@@ -74,6 +77,9 @@ class SerialLearningCalculator(Calculator):
 
     used_surrogate: Optional[bool] = None
     """Whether the last invocation used the surrogate model"""
+
+    new_points: int = 0
+    """How many new points have been acquired since the last model update"""
 
     def set(self, **kwargs):
         # TODO (wardlt): Fix ASE such that it does not try to do a numpy comparison on everything
@@ -143,13 +149,17 @@ class SerialLearningCalculator(Calculator):
         target_calc.calculate(atoms, properties, system_changes)
         self.results = target_calc.results.copy()
 
-        # Increment the training set with this new result, then throw out the current model
+        # Increment the training set with this new result
         db_atoms = atoms.copy()
         db_atoms.calc = target_calc
         with connect(self.parameters['db_path']) as db:
             db.write(db_atoms)
+
+        # Reset the model if the training frequency has been reached
         surrogate_forces = self.surrogate_calc.results['forces']
-        self.surrogate_calc = None
+        self.new_points = (self.new_points + 1) % self.parameters['train_freq']
+        if self.new_points == 0:
+            self.surrogate_calc = None
 
         # Update the alpha parameter, which relates uncertainty and observed error
         #  See Section 3.2 from https://dl.acm.org/doi/abs/10.1145/3447818.3460370
@@ -165,11 +175,7 @@ class SerialLearningCalculator(Calculator):
         uncert_metrics, obs_errors = zip(*self.error_history)
         many_alphas = np.true_divide(obs_errors, uncert_metrics)
         self.alpha = np.percentile(many_alphas, 50)
-        bad_alpha = self.alpha < 0
-        if bad_alpha:
-            logger.warning(f'Alpha parameter was less than zero ({self.alpha:.2e}).'
-                           ' Will not adjust the threshold until this condition changes')
-            return
+        assert self.alpha >= 0
 
         # Update the threshold used to determine if the surrogate is usable
         if self.threshold is None:
@@ -181,11 +187,12 @@ class SerialLearningCalculator(Calculator):
             # Update according to Eq. 3 of https://dl.acm.org/doi/abs/10.1145/3447818.3460370
             current_err = np.mean([e for _, e in self.error_history])
             self.threshold -= (current_err - self.parameters['target_ferr']) / self.alpha
+            self.threshold = max(self.threshold, 0)  # Keep it at least zero (assuming UQ signals are nonnegative)
 
     def get_state(self) -> dict[str, Any]:
         """Get the state of the learner in a state that can be saved to disk using pickle
 
-        The state contains the current threshold control parameters, error history, and the latest models.
+        The state contains the current threshold control parameters, error history, retraining status, and the latest models.
 
         Returns:
             Dictionary containing the state of the model(s)
@@ -195,6 +202,7 @@ class SerialLearningCalculator(Calculator):
             'threshold': self.threshold,
             'alpha': self.alpha,
             'error_history': list(self.error_history),
+            'new_points': self.new_points
         }
         if self.surrogate_calc is not None:
             output['models'] = [self.learner.serialize_model(s) for s in self.parameters['models']]
@@ -210,6 +218,7 @@ class SerialLearningCalculator(Calculator):
         # Set the state of the threshold
         self.alpha = state['alpha']
         self.threshold = state['threshold']
+        self.new_points = state['new_points']
         self.error_history.clear()
         self.error_history.extend(state['error_history'])
 
