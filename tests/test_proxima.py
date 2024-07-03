@@ -1,5 +1,6 @@
 """Test the proxima calculator"""
 from pathlib import Path
+import pickle as pkl
 
 from ase.calculators.cp2k import CP2K
 from pytest import fixture
@@ -89,7 +90,7 @@ def test_proxima(starting_frame, simple_model, target_calc, tmpdir):
     assert calc.surrogate_calc is not None
 
     # Pull the state and make sure it has the models in it as bytestrings
-    state = calc.get_state()
+    state = pkl.loads(pkl.dumps(calc.get_state()))
     assert 'models' in state
     assert isinstance(state['models'][0], bytes)
 
