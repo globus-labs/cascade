@@ -21,12 +21,12 @@ class Progress:
     """Current atomic structure"""
     name: str = field(default_factory=lambda: str(uuid4()))
     """Name assigned this trajectory. Defaults to a UUID"""
-    phase: int = 0
+    stage: int = 0
     """Current stage within the overall :class:`DynamicsProtocol`."""
     timestep: int = 0
-    """Timestep within the current process"""
+    """Timestep within the current stage"""
 
-    def update(self, new_atoms: Atoms, steps_completed: int, finished_step: bool):
+    def update(self, new_atoms: Atoms, steps_completed: int, finished_stage: bool):
         """Update the state of the current progress
 
         Args:
@@ -36,8 +36,8 @@ class Progress:
         """
 
         self.atoms = new_atoms.copy()
-        if finished_step:
-            self.phase += 1
+        if finished_stage:
+            self.stage += 1
             self.timestep = 0
         else:
             self.timestep += steps_completed
@@ -60,7 +60,7 @@ class DynamicsStage:
 
 
 class DynamicsProtocol:
-    """A protocol for running several steps of dynamics calls together
+    """A protocol for running several stages of dynamics calls together
 
     Args:
         stages: List of dynamics to be run in sequential order
@@ -98,7 +98,7 @@ class DynamicsProtocol:
         """
 
         # Create a temporary directory in which to run the data
-        stage = self.stages[start.phase]  # Pick the current process
+        stage = self.stages[start.stage]  # Pick the current process
         with TemporaryDirectory(dir=self.scratch_dir, prefix='cascade-dyn_', suffix=f'_{start.name}') as tmp:
             tmp = Path(tmp)
             dyn = stage.driver(start.atoms, logfile=str(tmp / 'dyn.log'), **stage.driver_kwargs)
@@ -116,7 +116,7 @@ class DynamicsProtocol:
 
                 # Run dynamics, then check if we have finished
                 converged = dyn.run(steps=max_timesteps, **stage.run_kwargs)
-                total_timesteps = max_timesteps + start.timestep  # Total progress along this step
+                total_timesteps = max_timesteps + start.timestep  # Total progress along this stage
 
                 if converged and isinstance(dyn, Optimizer):  # Optimization is done if convergence is met
                     done = True

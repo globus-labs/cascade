@@ -47,8 +47,8 @@ def test_dynamics(example_model, example_data):
     assert not np.isclose(traj[-1].positions, traj[-2].positions).all()
 
     # Update the state and then run the next step
-    start.update(traj[-1], steps_completed=len(traj), finished_step=True)
-    assert start.phase == 1  # Should be on to the next step
+    start.update(traj[-1], steps_completed=len(traj), finished_stage=True)
+    assert start.stage == 1  # Should be on to the next step
     assert start.timestep == 0  # Should not have any advanced
     done, traj = dyn.run_dynamics(start, example_model, TorchANI(), 100, 10)
 
