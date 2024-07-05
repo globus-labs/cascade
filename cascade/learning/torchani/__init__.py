@@ -290,7 +290,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         perf_train['split'] = 'train'
         perf_val['split'] = 'val'
         perf = pd.concat([perf_train, perf_val]).reset_index(names='iteration')
-        
+
         # Ensure GPU memory is cleared
         model.to('cpu')
         aev_computer.to('cpu')
@@ -299,7 +299,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         model_msg = self.serialize_model((aev_computer, model, atomic_energies))
         return model_msg, perf
 
-      def make_calculator(self, model_msg: bytes | ANIModelContents, device: str) -> Calculator:
+    def make_calculator(self, model_msg: bytes | ANIModelContents, device: str) -> Calculator:
         # Unpack the model
         if isinstance(model_msg, bytes):
             model_msg = self.get_model(model_msg)
