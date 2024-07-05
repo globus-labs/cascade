@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 import torch.nn
 
+from cascade.calculator import EnsembleCalculator
+
 # TODO (wardlt): Break the hard-wire to PyTorch, maybe. I don't have a model yet which uses something else
 State = TypeVar('State')
 """Generic type for the state of a certain model"""
@@ -101,7 +103,7 @@ class BaseLearnableForcefield(Generic[State]):
                  model_msg: bytes | State,
                  atoms: list[ase.Atoms],
                  batch_size: int = 64,
-                 device: str = 'cpu') -> (np.ndarray, np.ndarray):
+                 device: str = 'cpu') -> (np.ndarray, list[np.ndarray]):
         """Run inference for a series of structures
 
         Args:
@@ -146,12 +148,16 @@ class BaseLearnableForcefield(Generic[State]):
         """
         raise NotImplementedError()
 
-    def make_calculator(self, model_msg: bytes) -> Calculator:
+    def make_calculator(self, model_msg: bytes | State, device: str) -> Calculator:
         """Make an ASE calculator form of the provided model
 
         Args:
             model_msg: Serialized form of the model
+            device: Device on which to run computations
         Returns:
             Model turned into a calculator
         """
+        raise NotImplementedError()
+
+    def make_ensemble_calculator(self, model_msgs: list[bytes | State], device: str) -> EnsembleCalculator:
         raise NotImplementedError()

@@ -1,11 +1,15 @@
 """Interface and glue code for to models built using `TorchANI <https://github.com/aiqm/torchani>_"""
 import ase
+from ase import units
 import numpy as np
 import pandas as pd
+from ase.calculators.calculator import Calculator
 from torch.utils.data import DataLoader
 from functools import partial
 
-from torchani import AEVComputer, ANIModel
+from torchani.nn import SpeciesEnergies, Sequential
+from torchani.ase import Calculator as ANICalculator
+from torchani import AEVComputer, ANIModel, EnergyShifter
 from torchani.aev import SpeciesAEV
 from torchani.data import collate_fn
 from ignite.engine import Engine, Events
@@ -14,7 +18,7 @@ import torch
 from cascade.learning.base import BaseLearnableForcefield, State
 from cascade.learning.utils import estimate_atomic_energies
 
-__all__ = ['TorchANI']
+__all__ = ['TorchANI', 'ANIModelContents']
 
 ANIModelContents = tuple[AEVComputer, ANIModel, dict[str, float]]
 """Contents of the serialized form of a model:
@@ -286,7 +290,41 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         perf_train['split'] = 'train'
         perf_val['split'] = 'val'
         perf = pd.concat([perf_train, perf_val]).reset_index(names='iteration')
+        
+        # Ensure GPU memory is cleared
+        model.to('cpu')
+        aev_computer.to('cpu')
 
         # serialize model
         model_msg = self.serialize_model((aev_computer, model, atomic_energies))
         return model_msg, perf
+
+      def make_calculator(self, model_msg: bytes | ANIModelContents, device: str) -> Calculator:
+        # Unpack the model
+        if isinstance(model_msg, bytes):
+            model_msg = self.get_model(model_msg)
+        aev_computer, model, atomic_energies = model_msg
+
+        # Make an output layer which re-adds the atomic energies and other which converts to Ha (TorchNANI
+        ref_energies = torch.tensor(list(atomic_energies.values()), dtype=torch.float32)
+        shifter = EnergyShifter(ref_energies)
+
+        class ToHartree(torch.nn.Module):
+            def forward(self, species_energies: SpeciesEnergies,
+                        cell: torch.Tensor | None = None,
+                        pbc: torch.Tensor | None = None) -> SpeciesEnergies:
+                species, energies = species_energies
+                return SpeciesEnergies(species, energies / units.Hartree)
+
+        to_hartree = ToHartree()
+        post_model = Sequential(
+            aev_computer,
+            model,
+            shifter,
+            to_hartree
+        )  # Use ANI's Sequential, which is fine with `cell` and `pbc` as inputs
+
+        # Assemble the calculator
+        species = list(atomic_energies.keys())
+        post_model.to(device)
+        return ANICalculator(species, post_model, overwrite=False)
