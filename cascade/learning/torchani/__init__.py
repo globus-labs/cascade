@@ -5,12 +5,14 @@ import numpy as np
 import pandas as pd
 from ase.calculators.calculator import Calculator
 from torch.utils.data import DataLoader
+from functools import partial
+
 from torchani.nn import SpeciesEnergies, Sequential
 from torchani.ase import Calculator as ANICalculator
 from torchani import AEVComputer, ANIModel, EnergyShifter
 from torchani.aev import SpeciesAEV
 from torchani.data import collate_fn
-from ignite.engine import Engine
+from ignite.engine import Engine, Events
 import torch
 
 from cascade.learning.base import BaseLearnableForcefield, State
@@ -111,7 +113,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
                  model_msg: bytes | ANIModelContents,
                  atoms: list[ase.Atoms],
                  batch_size: int = 64,
-                 device: str = 'cpu') -> (np.ndarray, list[np.ndarray]):
+                 device: str = 'cpu') -> tuple[np.ndarray, list[np.ndarray]]:
 
         # TODO (wardlt): Put model in "eval" mode, skip making the graph when computing gradients in `forward_batch` <- performance optimizations
 
@@ -162,11 +164,10 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
               device: str = 'cpu',
               batch_size: int = 32,
               learning_rate: float = 1e-3,
-              huber_deltas: (float, float) = (0.5, 1),
+              huber_deltas: tuple[float, float] = (0.5, 1),
               force_weight: float = 0.9,
               reset_weights: bool = False,
-              **kwargs) -> (bytes, pd.DataFrame):
-
+              **kwargs) -> tuple[bytes, pd.DataFrame]:
         # Unpack the model and move to device
         if isinstance(model_msg, bytes):
             model_msg = self.get_model(model_msg)
@@ -195,9 +196,9 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
                                   batch_size=min(batch_size, len(train_data)),
                                   shuffle=True,
                                   drop_last=True)
-        # valid_loader = DataLoader([ase_to_ani(a, species) for a in valid_data],
-        #                           collate_fn=lambda x: collate_fn(x, my_collate_dict),
-        #                           batch_size=batch_size)  # TODO (wardlt): Actually use this
+        valid_loader = DataLoader([ase_to_ani(a, species) for a in valid_data],
+                                  collate_fn=lambda x: collate_fn(x, my_collate_dict),
+                                  batch_size=batch_size)  # TODO (wardlt): Actually use this
 
         # Prepare optimizer and loss functions
         opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -227,16 +228,76 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
             opt.step()
             return loss.item()
 
-        # Run training
-        # TODO (wardlt): Track the learning, use early stopping
+        def evaluate_model(loader: DataLoader,
+                           accumulator: list[dict[str, float]]) -> None:
+            """Evaluate the model against all data in loader, store in global list
+
+            Args:
+                loader: a pytorch data loader
+                accumulator: a list in which to append results
+            """
+            e_qm, e_ml, f_qm, f_ml = [], [], [], []
+            for batch in loader:
+                # Get the true results
+                batch_e = batch['energies'].cpu().numpy().squeeze()
+                batch_f = batch['forces'].cpu().numpy()
+
+                batch_e_pred, batch_f_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device)
+                batch_e_pred = batch_e_pred.detach().cpu().numpy()
+
+                e_qm.extend(batch_e)
+                e_ml.extend(batch_e_pred)
+
+                # Compute the forces
+                f_qm.extend(batch_f)
+                f_ml.extend(batch_f_pred.detach().cpu().numpy())
+
+            # convert batch results into flat np arrays
+            e_qm, e_ml, f_qm, f_ml = map(lambda a: np.asarray(a).ravel(),
+                                         (e_qm, e_ml, f_qm, f_ml))
+
+            # compute and store metrics
+            result = {}
+            result['e_rmse'] = np.sqrt((e_qm - e_ml) ** 2).mean()
+            result['e_mae'] = np.abs(e_qm - e_ml).mean()
+            result['f_rmse'] = np.sqrt((f_qm - f_ml) ** 2).mean()
+            result['f_mae'] = np.abs(f_qm - f_ml).mean()
+            accumulator.append(result)
+            return
+
+        # instantiate the trainer
         trainer = Engine(train_step)
+
+        # Set up model evaluators
+        # TODO (miketynes): make this more idiomatic pytorch ignite
+        # TODO (miketynes): add early stopping (probably depends on the above)
+        perf_train: list[dict[str, float]] = []
+        perf_val: list[dict[str, float]] = []
+        evaluator_train = partial(evaluate_model,
+                                  loader=train_loader,
+                                  accumulator=perf_train)
+        evaluator_val = partial(evaluate_model,
+                                loader=valid_loader,
+                                accumulator=perf_val)
+        trainer.add_event_handler(Events.EPOCH_COMPLETED, evaluator_train)
+        trainer.add_event_handler(Events.EPOCH_COMPLETED, evaluator_val)
+
+        # Run the training
         trainer.run(train_loader, max_epochs=num_epochs)
+
+        # coalesce the training performance
+        perf_train, perf_val = map(pd.DataFrame.from_records, [perf_train, perf_val])
+        perf_train['split'] = 'train'
+        perf_val['split'] = 'val'
+        perf = pd.concat([perf_train, perf_val]).reset_index(names='iteration')
 
         # Ensure GPU memory is cleared
         model.to('cpu')
         aev_computer.to('cpu')
 
-        return self.serialize_model((aev_computer, model, atomic_energies)), pd.DataFrame()
+        # serialize model
+        model_msg = self.serialize_model((aev_computer, model, atomic_energies))
+        return model_msg, perf
 
     def make_calculator(self, model_msg: bytes | ANIModelContents, device: str) -> Calculator:
         # Unpack the model
