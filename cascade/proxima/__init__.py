@@ -173,7 +173,7 @@ class SerialLearningCalculator(Calculator):
             logger.debug(f'Too few entries in training history. {len(self.error_history)} < {self.parameters["history_length"]}')
             return
         uncert_metrics, obs_errors = zip(*self.error_history)
-        many_alphas = np.true_divide(obs_errors, uncert_metrics)
+        many_alphas = np.true_divide(obs_errors, uncert_metrics)  # Alpha's units: error / UQ
         self.alpha = np.percentile(many_alphas, 50)
         assert self.alpha >= 0
 
@@ -181,8 +181,8 @@ class SerialLearningCalculator(Calculator):
         if self.threshold is None:
             # Use the initial estimate for alpha to set a conservative threshold
             #  Following Eq. 1 of https://dl.acm.org/doi/abs/10.1145/3447818.3460370,
-            self.threshold = self.parameters['target_ferr'] / self.alpha
-            self.threshold *= 2  # Make the threshold even higher than we initially estimate
+            self.threshold = self.parameters['target_ferr'] / self.alpha  # Units: error / (error / UQ) -> UQ
+            self.threshold /= 2  # Make the threshold even stricter than we estimate
         else:
             # Update according to Eq. 3 of https://dl.acm.org/doi/abs/10.1145/3447818.3460370
             current_err = np.mean([e for _, e in self.error_history])
@@ -219,7 +219,7 @@ class SerialLearningCalculator(Calculator):
         self.alpha = state['alpha']
         self.threshold = state['threshold']
         self.new_points = state['new_points']
-        self.error_history.clear()
+        self.error_history = deque(maxlen=self.parameters['history_length'])
         self.error_history.extend(state['error_history'])
 
         # Remake the surrogate calculator, if available
