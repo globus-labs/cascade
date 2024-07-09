@@ -217,7 +217,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
 
             # Compute the losses
             # TODO (wardlt): Add stresses
-            batch_e = batch['energies'].to(device).squeeze()
+            batch_e = batch['energies'].to(device)[:, 0]
             batch_f = batch['forces'].to(device)
             batch_n = (batch['species'] >= 0).sum(dim=1, dtype=batch_e.dtype).to(device)
 
@@ -239,7 +239,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
             e_qm, e_ml, f_qm, f_ml = [], [], [], []
             for batch in loader:
                 # Get the true results
-                batch_e = batch['energies'].cpu().numpy().squeeze()
+                batch_e = batch['energies'].cpu().numpy()[:, 0]  # Make it a 1D array
                 batch_f = batch['forces'].cpu().numpy()
 
                 batch_e_pred, batch_f_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device)
