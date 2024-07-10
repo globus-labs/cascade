@@ -57,3 +57,25 @@ def test_training(example_data):
     assert not np.isclose(new_e, orig_e).all()
     for new, orig in zip(new_f, orig_f):
         assert not np.isclose(new, orig).all()
+
+
+def test_scale_energy(example_data):
+    # Make the model requirements
+    ref_energies = estimate_atomic_energies(example_data)
+    aev, nn = build_model(example_data)
+
+    # Get baseline predictions, ensure results don't change if we reset, train, or scale energies
+    ani = TorchANI()
+    orig_e, orig_f = ani.evaluate((aev, nn, ref_energies), example_data)
+    model_msg, _ = ani.train((aev, nn, ref_energies), example_data, example_data, 0, batch_size=2, reset_weights=False, scale_energies=False)
+
+    new_e, new_f = ani.evaluate((aev, nn, ref_energies), example_data)
+    assert np.isclose(new_e, orig_e).all()
+
+    # Make sure the energy scale change puts the variance within 10% of the true
+    model_msg, _ = ani.train((aev, nn, ref_energies), example_data, example_data, 0, batch_size=2, reset_weights=True, scale_energies=True)
+    scaled_e, scaled_f = ani.evaluate((aev, nn, ref_energies), example_data)
+
+    num_a = np.array([len(a) for a in example_data])
+    assert np.allclose(num_a, num_a[0])
+    assert np.isclose(scaled_e.std(), orig_e.std(), rtol=0.1)

@@ -106,6 +106,53 @@ def forward_batch(batch: dict[str, torch.Tensor],
     return batch_e_pred, batch_f_pred
 
 
+def adjust_energy_scale(aev_computer: AEVComputer,
+                        model: ANIModel,
+                        loader: DataLoader,
+                        atom_energies: np.ndarray,
+                        device: str | torch.device = 'cpu') -> float:
+    """Adjust the last layer of an ANIModel such that its standard deviation matches that of the training data
+
+    Args:
+        aev_computer: Tool which computes atomic environments
+        model: Model to be adjusted
+        loader: Data loader
+        atom_energies: Reference energy for each specie
+        device: Device on which to perform inference
+    Returns:
+        Scale factor
+    """
+
+    # Iterate over the dataset to get the actual and observed standard deviation of atomic energies
+    pbc = torch.from_numpy(np.ones((3,), bool)).to(device)  # TODO (don't hard code to 3D)
+    true_energies = []
+    pred_energies = []
+    for batch in loader:
+        # Get the actual energies and predicted energies for the system
+        batch_e_pred, _ = forward_batch(batch, aev_computer, model, atom_energies, pbc, device=device)
+        batch_e = batch['energies'][:, 0].cpu().numpy()
+
+        # Get the energy per atom w/o the reference energy
+        batch_o = atom_energies[batch['species'].numpy()].sum(axis=1)
+        batch_n = (batch['species'] >= 0).sum(dim=1, dtype=batch_e_pred.dtype).cpu().numpy()
+
+        pred_energies.extend((batch_e_pred.detach().cpu().numpy() - batch_o) / batch_n)
+        true_energies.extend((batch_e - batch_o) / batch_n)
+
+    # Get the ratio in standard deviations
+    true_std = np.std(true_energies)
+    pred_std = np.std(pred_energies)
+    factor = true_std / pred_std
+
+    # Update the last layer of each network
+    with torch.no_grad():
+        for m in model.values():
+            last_linear = m[-1]
+            assert isinstance(last_linear, torch.nn.Linear), f'Last layer is not linear. It is {type(last_linear)}'
+            last_linear.weight *= factor
+    return factor
+
+
 class TorchANI(BaseLearnableForcefield[ANIModelContents]):
     """Interface to the high-dimensional neural networks implemented by `TorchANI <https://github.com/aiqm/torchani>`_"""
 
@@ -167,6 +214,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
               huber_deltas: tuple[float, float] = (0.5, 1),
               force_weight: float = 0.9,
               reset_weights: bool = False,
+              scale_energies: bool = True,
               **kwargs) -> tuple[bytes, pd.DataFrame]:
         # Unpack the model and move to device
         if isinstance(model_msg, bytes):
@@ -199,6 +247,10 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         valid_loader = DataLoader([ase_to_ani(a, species) for a in valid_data],
                                   collate_fn=lambda x: collate_fn(x, my_collate_dict),
                                   batch_size=batch_size)  # TODO (wardlt): Actually use this
+
+        # Adjust output layers to match data distribution
+        if scale_energies:
+            adjust_energy_scale(aev_computer, model, train_loader, ref_energies, device)
 
         # Prepare optimizer and loss functions
         opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
