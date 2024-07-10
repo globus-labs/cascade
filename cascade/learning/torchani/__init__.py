@@ -165,7 +165,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
               batch_size: int = 32,
               learning_rate: float = 1e-3,
               huber_deltas: tuple[float, float] = (0.5, 1),
-              force_weight: float = 0.9,
+              force_weight: float = 10,
               reset_weights: bool = False,
               **kwargs) -> tuple[bytes, pd.DataFrame]:
         # Unpack the model and move to device
