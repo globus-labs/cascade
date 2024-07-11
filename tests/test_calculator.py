@@ -1,18 +1,7 @@
 from ase.calculators.lj import LennardJones
-from ase.build import molecule
-from ase import Atoms
-from pytest import fixture, mark
+from pytest import mark
 
 from cascade.calculator import make_calculator, EnsembleCalculator
-
-
-@fixture()
-def example_cell() -> Atoms:
-    """Single water in a box"""
-    water = molecule('H2O')
-    water.cell = [4.] * 3
-    water.pbc = True
-    return water
 
 
 @mark.parametrize('method', ['blyp', 'pm6', 'b97m'])

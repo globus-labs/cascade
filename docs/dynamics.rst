@@ -18,8 +18,6 @@ Create a Dynamics class by defining what happens in each stage of a process as a
 A dynamics process could have multiple stages, such as an optimization followed by molecular dynamics
 under several different control conditions.
 
-.. note:: We need a better name than process for which type of dynamics it is running.
-
 .. code-block:: python
 
     # Optimization then constant-energy molecular dynamics

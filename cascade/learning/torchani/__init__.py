@@ -165,7 +165,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
               batch_size: int = 32,
               learning_rate: float = 1e-3,
               huber_deltas: tuple[float, float] = (0.5, 1),
-              force_weight: float = 0.9,
+              force_weight: float = 10,
               reset_weights: bool = False,
               **kwargs) -> tuple[bytes, pd.DataFrame]:
         # Unpack the model and move to device
@@ -193,7 +193,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         pbc = torch.from_numpy(np.ones((3,), bool)).to(device)  # TODO (don't hard code to 3D)
         train_loader = DataLoader([ase_to_ani(a, species) for a in train_data],
                                   collate_fn=lambda x: collate_fn(x, my_collate_dict),
-                                  batch_size=batch_size,
+                                  batch_size=min(batch_size, len(train_data)),
                                   shuffle=True,
                                   drop_last=True)
         valid_loader = DataLoader([ase_to_ani(a, species) for a in valid_data],
@@ -217,7 +217,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
 
             # Compute the losses
             # TODO (wardlt): Add stresses
-            batch_e = batch['energies'].to(device).squeeze()
+            batch_e = batch['energies'].to(device)[:, 0]
             batch_f = batch['forces'].to(device)
             batch_n = (batch['species'] >= 0).sum(dim=1, dtype=batch_e.dtype).to(device)
 
@@ -239,7 +239,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
             e_qm, e_ml, f_qm, f_ml = [], [], [], []
             for batch in loader:
                 # Get the true results
-                batch_e = batch['energies'].cpu().numpy().squeeze()
+                batch_e = batch['energies'].cpu().numpy()[:, 0]  # Make it a 1D array
                 batch_f = batch['forces'].cpu().numpy()
 
                 batch_e_pred, batch_f_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device)
@@ -249,12 +249,11 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
                 e_ml.extend(batch_e_pred)
 
                 # Compute the forces
-                f_qm.extend(batch_f)
-                f_ml.extend(batch_f_pred.detach().cpu().numpy())
+                f_qm.extend(batch_f.ravel())
+                f_ml.extend(batch_f_pred.detach().cpu().numpy().ravel())
 
             # convert batch results into flat np arrays
-            e_qm, e_ml, f_qm, f_ml = map(lambda a: np.asarray(a).ravel(),
-                                         (e_qm, e_ml, f_qm, f_ml))
+            e_qm, e_ml, f_qm, f_ml = map(lambda a: np.asarray(a), (e_qm, e_ml, f_qm, f_ml))
 
             # compute and store metrics
             result = {}
