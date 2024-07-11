@@ -249,12 +249,11 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
                 e_ml.extend(batch_e_pred)
 
                 # Compute the forces
-                f_qm.extend(batch_f)
-                f_ml.extend(batch_f_pred.detach().cpu().numpy())
+                f_qm.extend(batch_f.ravel())
+                f_ml.extend(batch_f_pred.detach().cpu().numpy().ravel())
 
             # convert batch results into flat np arrays
-            e_qm, e_ml, f_qm, f_ml = map(lambda a: np.asarray(a).ravel(),
-                                         (e_qm, e_ml, f_qm, f_ml))
+            e_qm, e_ml, f_qm, f_ml = map(lambda a: np.asarray(a), (e_qm, e_ml, f_qm, f_ml))
 
             # compute and store metrics
             result = {}
