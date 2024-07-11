@@ -51,11 +51,12 @@ def canonicalize(atoms: Atoms) -> Atoms:
         Atoms object that has been serialized and deserialized
     """
     # TODO (wardlt): Make it so the single-point calculator can hold unknown properties? (see discussion https://gitlab.com/ase/ase/-/issues/782)
+    out_atoms = atoms.copy()
     if atoms.calc is not None:
         old_calc = atoms.calc
-        atoms.calc = SinglePointCalculator(atoms)
-        atoms.calc.results = old_calc.results.copy()
-    return atoms
+        out_atoms.calc = SinglePointCalculator(atoms)
+        out_atoms.calc.results = old_calc.results.copy()
+    return out_atoms
 
 
 def apply_calculator(

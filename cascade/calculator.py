@@ -111,6 +111,7 @@ def make_calculator(
 class EnsembleCalculator(Calculator):
     """A single calculator which combines the results of many
 
+
     Stores the mean of all calculators as the standard property names,
     and stores the values for each calculator in the :attr:`results`
     as the name of the property with "_ens" appended (e.g., "forces_ens")
@@ -122,7 +123,6 @@ class EnsembleCalculator(Calculator):
     def __init__(self,
                  calculators: list[Calculator],
                  **kwargs):
-
         Calculator.__init__(self, **kwargs)
         self.calculators = calculators
         self.num_calculators = len(calculators)
@@ -139,7 +139,6 @@ class EnsembleCalculator(Calculator):
                   atoms: Atoms = None,
                   properties=all_properties,
                   system_changes=all_changes):
-
         # Run each of the subcalculators
         for calc in self.calculators:
             calc.calculate(atoms, properties=properties, system_changes=system_changes)

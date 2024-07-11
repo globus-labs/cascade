@@ -77,7 +77,7 @@ class BaseLearnableForcefield(Generic[State]):
         """
         self.scratch_dir = scratch_dir
 
-    def serialize_model(self, state: State) -> bytes:
+    def serialize_model(self, state: State | bytes) -> bytes:
         """Serialize the state of a model into a byte string
 
         Args:
@@ -85,9 +85,11 @@ class BaseLearnableForcefield(Generic[State]):
         Returns:
             Form ready for transmission to a compute node
         """
-        b = BytesIO()
-        torch.save(state, b)
-        return b.getvalue()
+        if not isinstance(state, bytes):
+            b = BytesIO()
+            torch.save(state, b)
+            return b.getvalue()
+        return state
 
     def get_model(self, model_msg: bytes) -> State:
         """Load a model from the provided message and place on the CPU memory
