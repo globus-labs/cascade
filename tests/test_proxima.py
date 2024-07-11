@@ -94,4 +94,6 @@ def test_proxima(starting_frame, simple_model, target_calc, tmpdir):
     assert 'models' in state
     assert isinstance(state['models'][0], bytes)
 
+    calc.threshold = None
     calc.set_state(state)
+    assert calc.threshold is not None

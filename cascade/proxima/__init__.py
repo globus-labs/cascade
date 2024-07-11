@@ -9,7 +9,6 @@ import numpy as np
 from ase.calculators.calculator import Calculator, all_changes, all_properties
 from ase.db import connect
 from ase.io import read
-from sklearn.model_selection import train_test_split
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.calculator import EnsembleCalculator
@@ -106,13 +105,18 @@ class SerialLearningCalculator(Calculator):
         all_atoms = read(db_path, ':')
         logger.info(f'Loaded {len(all_atoms)} from {db_path} for retraining {len(self.parameters["models"])} models')
         if len(all_atoms) < 10:
-            logger.debug('Too few entries to retrain')
+            logger.info('Too few entries to retrain. Skipping')
             return
 
         # Train each model using a different, randomly-selected subset of the data
         model_list = self.parameters['models']  # Edit it in place
         for i, model_msg in enumerate(self.parameters['models']):
-            train_atoms, valid_atoms = train_test_split(all_atoms, test_size=0.1)
+            # Assign splits such that the same entries do not switch between train/validation as test grows
+            rng = np.random.RandomState(i)
+            is_train = rng.uniform(0, 1, size=(len(all_atoms),)) > 0.1  # TODO (wardlt): Make this configurable
+            train_atoms = [all_atoms[i] for i in np.where(is_train)[0]]
+            valid_atoms = [all_atoms[i] for i in np.where(np.logical_not(is_train))[0]]
+
             new_model_msg, _ = self.learner.train(model_msg, train_atoms, valid_atoms, **self.parameters['train_kwargs'])
             model_list[i] = new_model_msg
             logger.debug(f'Finished training model {i}')
@@ -174,7 +178,7 @@ class SerialLearningCalculator(Calculator):
             return
         uncert_metrics, obs_errors = zip(*self.error_history)
         many_alphas = np.true_divide(obs_errors, uncert_metrics)  # Alpha's units: error / UQ
-        self.alpha = np.percentile(many_alphas, 50)
+        self.alpha = np.mean(many_alphas)
         assert self.alpha >= 0
 
         # Update the threshold used to determine if the surrogate is usable
@@ -182,7 +186,7 @@ class SerialLearningCalculator(Calculator):
             # Use the initial estimate for alpha to set a conservative threshold
             #  Following Eq. 1 of https://dl.acm.org/doi/abs/10.1145/3447818.3460370,
             self.threshold = self.parameters['target_ferr'] / self.alpha  # Units: error / (error / UQ) -> UQ
-            self.threshold /= 2  # Make the threshold even stricter than we estimate
+            self.threshold /= 2  # Make the threshold even stricter than we estimate TODO (wardlt): Make this adjustable
         else:
             # Update according to Eq. 3 of https://dl.acm.org/doi/abs/10.1145/3447818.3460370
             current_err = np.mean([e for _, e in self.error_history])
@@ -227,3 +231,11 @@ class SerialLearningCalculator(Calculator):
             self.surrogate_calc = EnsembleCalculator(
                 calculators=[self.learner.make_calculator(m, self.parameters['device']) for m in state['models']]
             )
+
+    def todict(self, skip_default=True):
+        # Never skip defaults because testing for equality between current and default breaks for our data types
+        output = super().todict(False)
+
+        # The models don't json serialize, so let's skip them
+        output.pop('models')
+        return output
