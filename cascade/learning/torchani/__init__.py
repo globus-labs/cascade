@@ -169,10 +169,13 @@ def adjust_energy_scale(aev_computer: AEVComputer,
         pred_energies.extend((batch_e_pred.detach().cpu().numpy() - batch_o) / batch_n)
         true_energies.extend((batch_e - batch_o) / batch_n)
 
-    # Get the ratio in standard deviations
+    # Get the ratio in standard deviations and the sign
     true_std = np.std(true_energies)
     pred_std = np.std(pred_energies)
     factor = true_std / pred_std
+    r = np.corrcoef(true_energies, pred_energies)[0, 1]
+    if r < 0:
+        factor *= -1
 
     # Update the last layer of each network to match the new scaling
     with torch.no_grad():
