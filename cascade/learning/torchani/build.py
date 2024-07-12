@@ -1,5 +1,4 @@
 """Tools for building a new TorchANI architecture"""
-
 from torchani import AEVComputer, ANIModel
 import torch
 
