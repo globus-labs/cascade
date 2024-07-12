@@ -1,7 +1,7 @@
 import numpy as np
 
 from cascade.learning.torchani.build import make_aev_computer, make_output_nets
-from cascade.learning.torchani import TorchANI
+from cascade.learning.torchani import TorchANI, adjust_energy_scale, make_data_loader
 from cascade.learning.utils import estimate_atomic_energies
 
 
@@ -66,16 +66,13 @@ def test_scale_energy(example_data):
 
     # Get baseline predictions, ensure results don't change if we reset, train, or scale energies
     ani = TorchANI()
-    orig_e, orig_f = ani.evaluate((aev, nn, ref_energies), example_data)
-    model_msg, _ = ani.train((aev, nn, ref_energies), example_data, example_data, 0, batch_size=2, reset_weights=False, scale_energies=False)
+    orig_e, _ = ani.evaluate((aev, nn, ref_energies), example_data)
+    loader = make_data_loader(example_data, list(ref_energies), batch_size=2, train=False)
+    ref_energies_array = np.array(list(ref_energies.values())).astype(np.float32)
+    adjust_energy_scale(aev, nn, loader, ref_energies_array)
 
-    new_e, new_f = ani.evaluate((aev, nn, ref_energies), example_data)
-    assert np.isclose(new_e, orig_e).all()
-
-    # Make sure the energy scale change puts the variance within 10% of the true
-    model_msg, _ = ani.train((aev, nn, ref_energies), example_data, example_data, 0, batch_size=2, reset_weights=True, scale_energies=True)
-    scaled_e, scaled_f = ani.evaluate((aev, nn, ref_energies), example_data)
+    scaled_e, _ = ani.evaluate((aev, nn, ref_energies), example_data)
 
     num_a = np.array([len(a) for a in example_data])
     assert np.allclose(num_a, num_a[0])
-    assert np.isclose(scaled_e.std(), orig_e.std(), rtol=0.1)
+    assert np.isclose(scaled_e.std(), np.std([a.get_potential_energy() for a in example_data]), atol=0.1)

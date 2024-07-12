@@ -49,7 +49,7 @@ def ase_to_ani(atoms: ase.Atoms, species: list[str]) -> dict[str, torch.Tensor]:
 
     # An entry _must_ have the species and coordinates
     output = {
-        'species': torch.from_numpy(np.array(([species.index(s) for s in atoms.symbols]))),
+        'species': torch.from_numpy(np.array([species.index(s) for s in atoms.symbols])),
         'coordinates': torch.from_numpy(atoms.positions).float(),
         'cells': torch.from_numpy(atoms.cell.array).float()
     }
@@ -62,12 +62,38 @@ def ase_to_ani(atoms: ase.Atoms, species: list[str]) -> dict[str, torch.Tensor]:
     return output
 
 
+def make_data_loader(data: list[ase.Atoms],
+                     species: list[str],
+                     batch_size: int,
+                     train: bool,
+                     **kwargs) -> DataLoader:
+    """Make a data loader based on a list of Atoms
+
+    Args:
+        data: Data to use for the loader
+        species: Map of chemical species to index in network
+        batch_size: Batch size to use for the loader
+        train: Whether this is a loader for training data. If so, sets ``shuffle`` and ``drop_last`` to True.
+        kwargs: Passed to the ``DataLoader`` constructor
+    """
+    # Append training settings if set to train
+    if train:
+        kwargs['shuffle'] = True
+        kwargs['drop_last'] = True
+
+    return DataLoader([ase_to_ani(a, species) for a in data],
+                      collate_fn=lambda x: collate_fn(x, my_collate_dict),
+                      batch_size=max(min(batch_size, len(data)), 1),
+                      **kwargs)
+
+
 def forward_batch(batch: dict[str, torch.Tensor],
                   aev_computer: AEVComputer,
                   nn: ANIModel,
                   atom_energies: np.ndarray,
                   pbc: torch.Tensor,
-                  device: str = 'cpu') -> tuple[torch.Tensor, torch.Tensor]:
+                  forces: bool = True,
+                  device: str = 'cpu') -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the forward step on a batch of entries
 
     Args:
@@ -76,6 +102,7 @@ def forward_batch(batch: dict[str, torch.Tensor],
         nn: Model which maps atomic environments to energies
         atom_energies: Array holding the reference energy for each species
         pbc: Periodic boundary conditions used by all members of the batch
+        forces: Whether to compute forces
         device: Device on which to run computations
     Returns:
         - Energies for each member
@@ -83,7 +110,7 @@ def forward_batch(batch: dict[str, torch.Tensor],
     """
     # Move the data to the device
     batch_z = batch['species'].to(device)
-    batch_x = batch['coordinates'].float().to(device).requires_grad_(True)
+    batch_x = batch['coordinates'].float().to(device).requires_grad_(forces)
     batch_c = batch['cells'].float().to(device)
 
     # Compute the energy offset per member (run on the CPU because it's fast)
@@ -102,15 +129,18 @@ def forward_batch(batch: dict[str, torch.Tensor],
     # Get the energies for each member
     _, batch_e_pred = nn(batch_a)
     batch_e_pred = batch_e_pred + batch_o
-    batch_f_pred = -torch.autograd.grad(batch_e_pred.sum(), batch_x, create_graph=True)[0]
-    return batch_e_pred, batch_f_pred
+    if forces:
+        batch_f_pred = -torch.autograd.grad(batch_e_pred.sum(), batch_x, create_graph=True)[0]
+        return batch_e_pred, batch_f_pred
+    else:
+        return batch_e_pred, None
 
 
 def adjust_energy_scale(aev_computer: AEVComputer,
                         model: ANIModel,
                         loader: DataLoader,
                         atom_energies: np.ndarray,
-                        device: str | torch.device = 'cpu') -> float:
+                        device: str | torch.device = 'cpu') -> tuple[float, float]:
     """Adjust the last layer of an ANIModel such that its standard deviation matches that of the training data
 
     Args:
@@ -120,7 +150,7 @@ def adjust_energy_scale(aev_computer: AEVComputer,
         atom_energies: Reference energy for each specie
         device: Device on which to perform inference
     Returns:
-        Scale factor
+        Scale and shift factors
     """
 
     # Iterate over the dataset to get the actual and observed standard deviation of atomic energies
@@ -129,7 +159,7 @@ def adjust_energy_scale(aev_computer: AEVComputer,
     pred_energies = []
     for batch in loader:
         # Get the actual energies and predicted energies for the system
-        batch_e_pred, _ = forward_batch(batch, aev_computer, model, atom_energies, pbc, device=device)
+        batch_e_pred, _ = forward_batch(batch, aev_computer, model, atom_energies, pbc, forces=False, device=device)
         batch_e = batch['energies'][:, 0].cpu().numpy()
 
         # Get the energy per atom w/o the reference energy
@@ -144,13 +174,34 @@ def adjust_energy_scale(aev_computer: AEVComputer,
     pred_std = np.std(pred_energies)
     factor = true_std / pred_std
 
-    # Update the last layer of each network
+    # Update the last layer of each network to match the new scaling
     with torch.no_grad():
         for m in model.values():
             last_linear = m[-1]
             assert isinstance(last_linear, torch.nn.Linear), f'Last layer is not linear. It is {type(last_linear)}'
+            assert last_linear.out_features == 1, f'Expected last layer to have one output. Found {last_linear.out_features}'
             last_linear.weight *= factor
-    return factor
+
+    # Recompute the energies given the new shift factor
+    pred_energies = []
+    for batch in loader:
+        batch_e_pred, _ = forward_batch(batch, aev_computer, model, atom_energies, pbc, forces=False, device=device)
+        batch_o = atom_energies[batch['species'].numpy()].sum(axis=1)
+        batch_n = (batch['species'] >= 0).sum(dim=1, dtype=batch_e_pred.dtype).cpu().numpy()
+        pred_energies.extend((batch_e_pred.detach().cpu().numpy() - batch_o) / batch_n)
+
+    # Get the shift for the mean
+    true_mean = np.mean(true_energies)
+    pred_mean = np.mean(pred_energies)
+    shift = pred_mean - true_mean
+
+    # Update the last layer of each network to match the new scaling
+    with torch.no_grad():
+        for m in model.values():
+            last_linear = m[-1]
+            last_linear.bias -= shift
+
+    return factor, shift
 
 
 class TorchANI(BaseLearnableForcefield[ANIModelContents]):
@@ -171,25 +222,19 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         model.to(device)
         aev_computer.to(device)
 
-        # Convert data into PyTorch format
-        species = list(atomic_energies.keys())
-        atoms_ani = [ase_to_ani(a, species) for a in atoms]
-
         # Unpack the reference energies as a float32 array
+        species = list(atomic_energies.keys())
         ref_energies = np.array([atomic_energies[s] for s in species]).astype(np.float32)
 
         # Build the data loader
-        loader = DataLoader(atoms_ani,
-                            collate_fn=lambda x: collate_fn(x, my_collate_dict),
-                            batch_size=batch_size,
-                            shuffle=False)
+        loader = make_data_loader(atoms, species, batch_size, train=False)
 
         # Run inference on all data
         energies = []
         forces = []
         pbc = torch.from_numpy(np.ones((3,), bool)).to(device)  # TODO (don't hard code to 3D)
         for batch in loader:
-            batch_e_pred, batch_f_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device)
+            batch_e_pred, batch_f_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device=device)
             energies.extend(batch_e_pred.detach().cpu().numpy())  # Energies are the same regardless of size of input
 
             # The shape of the force array differs depending on size
@@ -239,14 +284,8 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
 
         # Build the data loader
         pbc = torch.from_numpy(np.ones((3,), bool)).to(device)  # TODO (don't hard code to 3D)
-        train_loader = DataLoader([ase_to_ani(a, species) for a in train_data],
-                                  collate_fn=lambda x: collate_fn(x, my_collate_dict),
-                                  batch_size=min(batch_size, len(train_data)),
-                                  shuffle=True,
-                                  drop_last=True)
-        valid_loader = DataLoader([ase_to_ani(a, species) for a in valid_data],
-                                  collate_fn=lambda x: collate_fn(x, my_collate_dict),
-                                  batch_size=batch_size)  # TODO (wardlt): Actually use this
+        train_loader = make_data_loader(train_data, species, batch_size, train=True)
+        valid_loader = make_data_loader(valid_data, species, batch_size, train=False)
 
         # Adjust output layers to match data distribution
         if scale_energies:
@@ -294,7 +333,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
                 batch_e = batch['energies'].cpu().numpy()[:, 0]  # Make it a 1D array
                 batch_f = batch['forces'].cpu().numpy()
 
-                batch_e_pred, batch_f_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device)
+                batch_e_pred, batch_f_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device=device)
                 batch_e_pred = batch_e_pred.detach().cpu().numpy()
 
                 e_qm.extend(batch_e)
