@@ -1,19 +1,20 @@
 """Interface and glue code for to models built using `TorchANI <https://github.com/aiqm/torchani>_"""
+from functools import partial
+import copy
+
 import ase
 from ase import units
 import numpy as np
 import pandas as pd
 from ase.calculators.calculator import Calculator
+import torch
 from torch.utils.data import DataLoader
-from functools import partial
-
 from torchani.nn import SpeciesEnergies, Sequential
 from torchani.ase import Calculator as ANICalculator
 from torchani import AEVComputer, ANIModel, EnergyShifter
 from torchani.aev import SpeciesAEV
 from torchani.data import collate_fn
 from ignite.engine import Engine, Events
-import torch
 
 from cascade.learning.base import BaseLearnableForcefield, State
 from cascade.learning.utils import estimate_atomic_energies
@@ -397,6 +398,10 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         if isinstance(model_msg, bytes):
             model_msg = self.get_model(model_msg)
         aev_computer, model, atomic_energies = model_msg
+
+        # Make a copy of the model because torchANI makes it untrainable
+        model.to('cpu')
+        model = copy.deepcopy(model)
 
         # Make an output layer which re-adds the atomic energies and other which converts to Ha (TorchNANI
         ref_energies = torch.tensor(list(atomic_energies.values()), dtype=torch.float32)

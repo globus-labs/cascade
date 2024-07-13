@@ -34,6 +34,7 @@ def test_inference(example_data):
 
     # Test the calculator interface
     calc = ani.make_calculator((aev, nn, ref_energies), 'cpu')
+    assert next(nn.parameters()).requires_grad
     atoms = example_data[0]
     atoms.calc = calc
     assert np.isclose(atoms.get_potential_energy(), batch_energies[0]).all()
