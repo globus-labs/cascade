@@ -237,6 +237,7 @@ class SerialLearningCalculator(Calculator):
 
         # Remake the surrogate calculator, if available
         if 'models' in state:
+            self.parameters['models'] = state['models']
             self.surrogate_calc = EnsembleCalculator(
                 calculators=[self.learner.make_calculator(m, self.parameters['device']) for m in state['models']]
             )
