@@ -28,12 +28,15 @@ if __name__ == "__main__":
     # Get the user configuration
     parser = ArgumentParser()
 
+    parser.add_argument('--file', default=None, help='Path to JSON file with options. Will overwrite any provided by command line.')
+
     group = parser.add_argument_group(title="Dynamics Problem", description="Define the physics problem being modeled")
     group.add_argument('--starting-strc', help='Path to the starting structure')
     group.add_argument('--temperature', type=float, help='Temperature of the dynamics. Units: K')
     group.add_argument('--timestep', type=float, default=1, help='Timestep length. Units: fs')
     group.add_argument('--calculator', default='blyp', help='Name of the method to use for the target function')
     group.add_argument('--steps', type=int, default=128, help='Number of dynamics steps to run')
+    group.add_argument('--seed', type=int, default=1, help='Random seed used to start dynamics')
 
     group = parser.add_argument_group(title="Learner Details", description="Configure the surrogate model")
     group.add_argument('--initial-data', nargs='*', default=(), help='Path to data files (e.g., ASE .traj and .db) containing initial training data')
@@ -47,15 +50,20 @@ if __name__ == "__main__":
     group.add_argument('--target-error', type=float, default=0.3, help='Target maximum force error to achieve with controller')
     group.add_argument('--error-history', type=int, default=8, help='Number of past timesteps to use to inform controller')
     group.add_argument('--retrain-freq', type=int, default=8, help='How frequently to retrain the evaluator')
+    group.add_argument('--min-target-frac', type=float, default=0.05, help='Minimum fraction of evaluations to use DFT')
 
     args = parser.parse_args()
+    if args.file is not None:
+        with open(args.file) as fp:
+            args.__dict__.update(json.load(fp))
 
     # Read in the starting structure
     strc_path = Path(args.starting_strc)
     strc_name = strc_path.with_suffix('').name
 
     # Create the run directory
-    params_hash = sha256(json.dumps(args.__dict__).encode()).hexdigest()[-8:]
+    _skip_keys = ('steps', 'training-device', 'file')
+    params_hash = sha256(json.dumps([(k, v) for k, v in args.__dict__.items() if k not in _skip_keys]).encode()).hexdigest()[-8:]
     run_name = f'{strc_name}-temp={args.temperature}-method={args.calculator}-{params_hash}'
     run_dir = Path('runs') / run_name
     run_dir.mkdir(exist_ok=True, parents=True)
@@ -103,9 +111,11 @@ if __name__ == "__main__":
     if traj_path.exists() and len(Trajectory(traj_path)) > 0:
         atoms = io.read(traj_path, -1)
         main_logger.info(f'Loaded last structure from {traj_path}')
+        start_frame = len(io.read(traj_path, ':'))
     else:
-        MaxwellBoltzmannDistribution(atoms, temperature_K=args.temperature)
+        MaxwellBoltzmannDistribution(atoms, temperature_K=args.temperature, rng=np.random.RandomState(args.seed))
         main_logger.info(f'Initialized velocities to T={args.temperature}')
+        start_frame = 0
 
     # Set up the proxima calculator
     calc_dir = Path('cp2k-run') / params_hash
@@ -186,4 +196,4 @@ if __name__ == "__main__":
 
     # Run dynamics
     with md_logger:
-        npt.run(args.steps)
+        npt.run(args.steps - start_frame)
