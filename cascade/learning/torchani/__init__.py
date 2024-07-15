@@ -34,7 +34,9 @@ my_collate_dict = {
     'coordinates': 0.0,
     'forces': 0.0,
     'energies': 0.0,
-    'cells': 0.0
+    'cells': 0.0,
+    'volumes': 0.0,
+    'stresses': 0.0
 }
 
 
@@ -52,7 +54,8 @@ def ase_to_ani(atoms: ase.Atoms, species: list[str]) -> dict[str, torch.Tensor]:
     output = {
         'species': torch.from_numpy(np.array([species.index(s) for s in atoms.symbols])),
         'coordinates': torch.from_numpy(atoms.positions).float(),
-        'cells': torch.from_numpy(atoms.cell.array).float()
+        'cells': torch.from_numpy(atoms.cell.array).float(),
+        'volumes': torch.from_numpy(np.array(atoms.get_volume())).float()
     }
 
     if atoms.calc is not None:
@@ -60,6 +63,8 @@ def ase_to_ani(atoms: ase.Atoms, species: list[str]) -> dict[str, torch.Tensor]:
             output['energies'] = torch.from_numpy(np.atleast_1d(atoms.get_potential_energy())).float()
         if 'forces' in atoms.calc.results:
             output['forces'] = torch.from_numpy(atoms.get_forces()).float()
+        if 'stress' in atoms.calc.results:
+            output['stresses'] = torch.from_numpy(atoms.get_stress(voigt=False)).float()
     return output
 
 
@@ -94,7 +99,9 @@ def forward_batch(batch: dict[str, torch.Tensor],
                   atom_energies: np.ndarray,
                   pbc: torch.Tensor,
                   forces: bool = True,
-                  device: str = 'cpu') -> tuple[torch.Tensor, torch.Tensor | None]:
+                  stresses: bool = True,
+                  train: bool = True,
+                  device: str = 'cpu') -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Run the forward step on a batch of entries
 
     Args:
@@ -104,15 +111,27 @@ def forward_batch(batch: dict[str, torch.Tensor],
         atom_energies: Array holding the reference energy for each species
         pbc: Periodic boundary conditions used by all members of the batch
         forces: Whether to compute forces
+        stresses: Whether to compute stresses
+        train: Whether we are in training mode
         device: Device on which to run computations
     Returns:
         - Energies for each member
-        - Forces for each member
+        - Forces for each member, if ``forces``
+        - Stresses for each member, if ``stresses``
     """
+
     # Move the data to the device
     batch_z = batch['species'].to(device)
     batch_x = batch['coordinates'].float().to(device).requires_grad_(forces)
     batch_c = batch['cells'].float().to(device)
+
+    # Prepare for stress calculation
+    scaling = None
+    if stresses:
+        scaling = torch.eye(3, requires_grad=True, dtype=batch_x.dtype, device=device)
+        scaling = torch.tile(scaling[None, :, :], (batch_z.shape[0], 1, 1))
+        batch_c = torch.matmul(batch_c, scaling)
+        batch_x = torch.matmul(batch_x, scaling)
 
     # Compute the energy offset per member (run on the CPU because it's fast)
     batch_o = atom_energies[batch['species'].numpy()].sum(axis=1)
@@ -130,11 +149,19 @@ def forward_batch(batch: dict[str, torch.Tensor],
     # Get the energies for each member
     _, batch_e_pred = nn(batch_a)
     batch_e_pred = batch_e_pred + batch_o
+
+    # Compute forces
+    batch_f_pred = None
     if forces:
-        batch_f_pred = -torch.autograd.grad(batch_e_pred.sum(), batch_x, create_graph=True)[0]
-        return batch_e_pred, batch_f_pred
-    else:
-        return batch_e_pred, None
+        batch_f_pred = -torch.autograd.grad(batch_e_pred.sum(), batch_x, create_graph=train or stresses)[0]
+
+    # Compute stresses
+    batch_s_pred = None
+    if stresses:
+        batch_v = batch['volumes'].float().to(device)
+        batch_s_pred = torch.autograd.grad(batch_e_pred.sum(), scaling, create_graph=train)[0] / batch_v[:, None, None]
+
+    return batch_e_pred, batch_f_pred, batch_s_pred
 
 
 def adjust_energy_scale(aev_computer: AEVComputer,
@@ -160,7 +187,7 @@ def adjust_energy_scale(aev_computer: AEVComputer,
     pred_energies = []
     for batch in loader:
         # Get the actual energies and predicted energies for the system
-        batch_e_pred, _ = forward_batch(batch, aev_computer, model, atom_energies, pbc, forces=False, device=device)
+        batch_e_pred, _, _ = forward_batch(batch, aev_computer, model, atom_energies, pbc, forces=False, stresses=False, train=False, device=device)
         batch_e = batch['energies'][:, 0].cpu().numpy()
 
         # Get the energy per atom w/o the reference energy
@@ -189,7 +216,7 @@ def adjust_energy_scale(aev_computer: AEVComputer,
     # Recompute the energies given the new shift factor
     pred_energies = []
     for batch in loader:
-        batch_e_pred, _ = forward_batch(batch, aev_computer, model, atom_energies, pbc, forces=False, device=device)
+        batch_e_pred, _, _ = forward_batch(batch, aev_computer, model, atom_energies, pbc, forces=False, stresses=False, train=False, device=device)
         batch_o = atom_energies[batch['species'].numpy()].sum(axis=1)
         batch_n = (batch['species'] >= 0).sum(dim=1, dtype=batch_e_pred.dtype).cpu().numpy()
         pred_energies.extend((batch_e_pred.detach().cpu().numpy() - batch_o) / batch_n)
@@ -238,7 +265,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         forces = []
         pbc = torch.from_numpy(np.ones((3,), bool)).to(device)  # TODO (don't hard code to 3D)
         for batch in loader:
-            batch_e_pred, batch_f_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device=device)
+            batch_e_pred, batch_f_pred, _ = forward_batch(batch, aev_computer, model, ref_energies, pbc, stresses=False, train=False, device=device)
             energies.extend(batch_e_pred.detach().cpu().numpy())  # Energies are the same regardless of size of input
 
             # The shape of the force array differs depending on size
@@ -260,8 +287,9 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
               device: str = 'cpu',
               batch_size: int = 32,
               learning_rate: float = 1e-3,
-              huber_deltas: tuple[float, float] = (0.5, 1),
+              huber_deltas: tuple[float, float, float] = (0.5, 1, 1),
               force_weight: float = 10,
+              stress_weight: float = 100,
               reset_weights: bool = False,
               scale_energies: bool = True,
               **kwargs) -> tuple[bytes, pd.DataFrame]:
@@ -298,9 +326,10 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         # Prepare optimizer and loss functions
         opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-        huber_e, huber_f = huber_deltas
+        huber_e, huber_f, huber_s = huber_deltas
         loss_e = torch.nn.HuberLoss(reduction='none', delta=huber_e)
         loss_f = torch.nn.HuberLoss(reduction='none', delta=huber_f)
+        loss_s = torch.nn.HuberLoss(reduction='none', delta=huber_s)
 
         def train_step(engine, batch):
             """Borrowed from the training step used inside MACE"""
@@ -308,17 +337,18 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
             opt.zero_grad()
 
             # Run the forward step
-            batch_e_pred, batch_f_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device=device)
+            batch_e_pred, batch_f_pred, batch_s_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device=device)
 
             # Compute the losses
-            # TODO (wardlt): Add stresses
             batch_e = batch['energies'].to(device)[:, 0]
             batch_f = batch['forces'].to(device)
+            batch_s = batch['stresses'].to(device)
             batch_n = (batch['species'] >= 0).sum(dim=1, dtype=batch_e.dtype).to(device)
 
             energy_loss = (loss_e(batch_e_pred, batch_e) / batch_n.sqrt()).mean()
             force_loss = (loss_f(batch_f_pred, batch_f).sum(dim=(1, 2)) / batch_n).mean()
-            loss = energy_loss + force_weight * force_loss
+            stress_loss = (loss_s(batch_s_pred, batch_s).sum(dim=(1, 2))).mean()
+            loss = energy_loss + force_weight * force_loss + stress_weight * stress_loss
             loss.backward()
             opt.step()
             return loss.item()
@@ -331,31 +361,32 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
                 loader: a pytorch data loader
                 accumulator: a list in which to append results
             """
-            e_qm, e_ml, f_qm, f_ml = [], [], [], []
+            e_qm, e_ml, f_qm, f_ml, s_qm, s_ml = [], [], [], [], [], []
             for batch in loader:
                 # Get the true results
                 batch_e = batch['energies'].cpu().numpy()[:, 0]  # Make it a 1D array
                 batch_f = batch['forces'].cpu().numpy()
+                batch_s = batch['stresses'].cpu().numpy()
 
-                batch_e_pred, batch_f_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device=device)
-                batch_e_pred = batch_e_pred.detach().cpu().numpy()
+                batch_e_pred, batch_f_pred, batch_s_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, device=device)
+                batch_e_pred = batch_e_pred
 
                 e_qm.extend(batch_e)
-                e_ml.extend(batch_e_pred)
-
-                # Compute the forces
+                e_ml.extend(batch_e_pred.detach().cpu().numpy())
                 f_qm.extend(batch_f.ravel())
                 f_ml.extend(batch_f_pred.detach().cpu().numpy().ravel())
+                s_qm.extend(batch_s.ravel())
+                s_ml.extend(batch_s_pred.detach().cpu().numpy().ravel())
 
             # convert batch results into flat np arrays
             e_qm, e_ml, f_qm, f_ml = map(lambda a: np.asarray(a), (e_qm, e_ml, f_qm, f_ml))
 
             # compute and store metrics
             result = {}
-            result['e_rmse'] = np.sqrt((e_qm - e_ml) ** 2).mean()
-            result['e_mae'] = np.abs(e_qm - e_ml).mean()
-            result['f_rmse'] = np.sqrt((f_qm - f_ml) ** 2).mean()
-            result['f_mae'] = np.abs(f_qm - f_ml).mean()
+            for tag, qm, ml in [('e', e_qm, e_ml), ('f', f_qm, f_ml), ('s', s_qm, s_ml)]:
+                diff = np.subtract(qm, ml)
+                result[f'{tag}_rmse'] = np.sqrt(np.power(diff, 2)).mean()
+                result[f'{tag}_mae'] = np.abs(diff).mean()
             accumulator.append(result)
             return
 
@@ -381,9 +412,9 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
 
         # coalesce the training performance
         perf_train, perf_val = map(pd.DataFrame.from_records, [perf_train, perf_val])
-        perf_train['split'] = 'train'
-        perf_val['split'] = 'val'
-        perf = pd.concat([perf_train, perf_val]).reset_index(names='iteration')
+        perf_train.rename(columns=lambda x: f'{x}_train', inplace=True)
+        perf_val.rename(columns=lambda x: f'{x}_valid', inplace=True)
+        perf = pd.concat([perf_train, perf_val], axis=1).reset_index(names='iteration')
 
         # Ensure GPU memory is cleared
         model.to('cpu')

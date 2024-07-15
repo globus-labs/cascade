@@ -22,7 +22,7 @@ def test_inference(example_data):
     ref_energies = estimate_atomic_energies(example_data)
     aev, nn = build_model(example_data)
 
-    # Remove the claculator from the Atoms object (not needed for inference)
+    # Remove the calculator from the Atoms object (not needed for inference)
     for atoms in example_data:
         atoms.calc = None
 
@@ -51,7 +51,8 @@ def test_training(example_data):
     # Get baseline predictions, train
     ani = TorchANI()
     orig_e, orig_f = ani.evaluate((aev, nn, ref_energies), example_data)
-    model_msg, _ = ani.train((aev, nn, ref_energies), example_data, example_data, 2, batch_size=2)
+    model_msg, log = ani.train((aev, nn, ref_energies), example_data, example_data, 2, batch_size=2)
+    assert len(log) == 2
 
     # Make sure the predictions change
     new_e, new_f = ani.evaluate((aev, nn, ref_energies), example_data)
