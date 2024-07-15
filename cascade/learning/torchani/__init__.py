@@ -242,7 +242,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
                  model_msg: bytes | ANIModelContents,
                  atoms: list[ase.Atoms],
                  batch_size: int = 64,
-                 device: str = 'cpu') -> tuple[np.ndarray, list[np.ndarray]]:
+                 device: str = 'cpu') -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
 
         # TODO (wardlt): Put model in "eval" mode, skip making the graph when computing gradients in `forward_batch` <- performance optimizations
 
@@ -263,10 +263,12 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         # Run inference on all data
         energies = []
         forces = []
+        stresses = []
         pbc = torch.from_numpy(np.ones((3,), bool)).to(device)  # TODO (don't hard code to 3D)
         for batch in loader:
-            batch_e_pred, batch_f_pred, _ = forward_batch(batch, aev_computer, model, ref_energies, pbc, stresses=False, train=False, device=device)
-            energies.extend(batch_e_pred.detach().cpu().numpy())  # Energies are the same regardless of size of input
+            batch_e_pred, batch_f_pred, batch_s_pred = forward_batch(batch, aev_computer, model, ref_energies, pbc, stresses=True, train=False, device=device)
+            energies.extend(batch_e_pred.detach().cpu().numpy())  # Energies and stress are the same regardless of size of input
+            stresses.extend(batch_s_pred.detach().cpu().numpy())
 
             # The shape of the force array differs depending on size
             batch_n = (batch['species'] >= 0).sum(dim=1).cpu().numpy()  # Number of real atoms per batch
@@ -277,7 +279,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
         model.to('cpu')
         aev_computer.to('cpu')
 
-        return np.array(energies), list(forces)
+        return np.array(energies), list(forces), np.array(stresses)
 
     def train(self,
               model_msg: bytes | State,

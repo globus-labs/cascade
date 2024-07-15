@@ -105,7 +105,7 @@ class BaseLearnableForcefield(Generic[State]):
                  model_msg: bytes | State,
                  atoms: list[ase.Atoms],
                  batch_size: int = 64,
-                 device: str = 'cpu') -> (np.ndarray, list[np.ndarray]):
+                 device: str = 'cpu') -> (np.ndarray, list[np.ndarray], np.ndarray):
         """Run inference for a series of structures
 
         Args:
@@ -114,8 +114,9 @@ class BaseLearnableForcefield(Generic[State]):
             batch_size: Number of molecules to evaluate per batch
             device: Device on which to run the computation
         Returns:
-            - Energies for each inference. (N,) array of floats, where N is the number of structures
-            - Forces for each inference. List of N arrays of (n, 3), where n is the number of atoms in each structure
+            - Energy for each structure. (N,) array of floats, where N is the number of structures
+            - Forces for each structure. List of N arrays of (n, 3), where n is the number of atoms in each structure
+            - Stresses for each structure. (N, 3, 3) array, where each row a stress tensor.
         """
         raise NotImplementedError()
 

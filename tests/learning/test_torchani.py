@@ -27,10 +27,11 @@ def test_inference(example_data):
         atoms.calc = None
 
     ani = TorchANI()
-    batch_energies, batch_forces = ani.evaluate((aev, nn, ref_energies), example_data)
+    batch_energies, batch_forces, batch_stresses = ani.evaluate((aev, nn, ref_energies), example_data)
     assert batch_energies.shape == (2,)
     for atoms, forces in zip(example_data, batch_forces):
         assert forces.shape == (len(atoms), 3)
+    assert batch_stresses.shape == (2, 3, 3)
 
     # Test the calculator interface
     calc = ani.make_calculator((aev, nn, ref_energies), 'cpu')
@@ -39,6 +40,7 @@ def test_inference(example_data):
     atoms.calc = calc
     assert np.isclose(atoms.get_potential_energy(), batch_energies[0]).all()
     assert np.isclose(atoms.get_forces(), batch_forces[0]).all()
+    assert np.isclose(atoms.get_stress(voigt=False), batch_stresses[0]).all()
 
 
 def test_training(example_data):
@@ -50,12 +52,12 @@ def test_training(example_data):
 
     # Get baseline predictions, train
     ani = TorchANI()
-    orig_e, orig_f = ani.evaluate((aev, nn, ref_energies), example_data)
+    orig_e, orig_f, orig_s = ani.evaluate((aev, nn, ref_energies), example_data)
     model_msg, log = ani.train((aev, nn, ref_energies), example_data, example_data, 2, batch_size=2)
     assert len(log) == 2
 
     # Make sure the predictions change
-    new_e, new_f = ani.evaluate((aev, nn, ref_energies), example_data)
+    new_e, new_f, new_s = ani.evaluate((aev, nn, ref_energies), example_data)
     assert not np.isclose(new_e, orig_e).all()
     for new, orig in zip(new_f, orig_f):
         assert not np.isclose(new, orig).all()
@@ -68,12 +70,12 @@ def test_scale_energy(example_data):
 
     # Get baseline predictions, ensure results don't change if we reset, train, or scale energies
     ani = TorchANI()
-    orig_e, _ = ani.evaluate((aev, nn, ref_energies), example_data)
+    orig_e, _, _ = ani.evaluate((aev, nn, ref_energies), example_data)
     loader = make_data_loader(example_data, list(ref_energies), batch_size=2, train=False)
     ref_energies_array = np.array(list(ref_energies.values())).astype(np.float32)
     adjust_energy_scale(aev, nn, loader, ref_energies_array)
 
-    scaled_e, _ = ani.evaluate((aev, nn, ref_energies), example_data)
+    scaled_e, _, _ = ani.evaluate((aev, nn, ref_energies), example_data)
 
     num_a = np.array([len(a) for a in example_data])
     assert np.allclose(num_a, num_a[0])
