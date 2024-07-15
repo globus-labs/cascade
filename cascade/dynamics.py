@@ -32,7 +32,7 @@ class Progress:
         Args:
             new_atoms: Current structure
             steps_completed: Number of steps completed since the last progress update
-            finished_step: Whether the structure has finished a step within the overall protocol
+            finished_stage: Whether the structure has finished a step within the overall protocol
         """
 
         self.atoms = new_atoms.copy()

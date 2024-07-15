@@ -3,9 +3,11 @@
 from collections import deque
 from typing import List, Optional, Any
 from pathlib import Path
+from random import random
 import logging
 
 import numpy as np
+import pandas as pd
 from ase.calculators.calculator import Calculator, all_changes, all_properties
 from ase.db import connect
 from ase.io import read
@@ -45,6 +47,10 @@ class SerialLearningCalculator(Calculator):
         The number of previous observations of the error between target and surrogate
         function to use when establishing a link between uncertainty metric
         and the maximum observed error
+    min_target_fraction: float
+        Minimum fraction of timesteps to run the target function.
+        This value is used as the probability of running the target function
+        even if it need not be used based on the UQ metric.
     db_path: Path or str
         Database in which to store the results of running the target calculator,
         which are used to train the surrogate model
@@ -58,25 +64,23 @@ class SerialLearningCalculator(Calculator):
         'train_kwargs': {'num_epochs': 8},
         'train_freq': 1,
         'target_ferr': 0.1,  # TODO (wardlt): Make the error metric configurable
+        'min_target_fraction': 0.,
         'history_length': 8,
         'db_path': None
     }
 
+    train_logs: Optional[List[pd.DataFrame]] = None
+    """Logs from the most recent model training"""
     surrogate_calc: Optional[EnsembleCalculator] = None
     """Cache for the surrogate calculator"""
-
     error_history: Optional[deque[tuple[float, float]]] = None
     """History of pairs of the uncertainty metric and observed error"""
-
     alpha: Optional[float] = None
     """Coefficient which relates distrust metric and observed error"""
-
     threshold: Optional[float] = None
     """Current threshold for the uncertainty metric beyond which the target calculator will be used"""
-
     used_surrogate: Optional[bool] = None
     """Whether the last invocation used the surrogate model"""
-
     new_points: int = 0
     """How many new points have been acquired since the last model update"""
 
@@ -110,6 +114,7 @@ class SerialLearningCalculator(Calculator):
 
         # Train each model using a different, randomly-selected subset of the data
         model_list = self.parameters['models']  # Edit it in place
+        self.train_logs = []
         for i, model_msg in enumerate(self.parameters['models']):
             # Assign splits such that the same entries do not switch between train/validation as test grows
             rng = np.random.RandomState(i)
@@ -117,8 +122,9 @@ class SerialLearningCalculator(Calculator):
             train_atoms = [all_atoms[i] for i in np.where(is_train)[0]]
             valid_atoms = [all_atoms[i] for i in np.where(np.logical_not(is_train))[0]]
 
-            new_model_msg, _ = self.learner.train(model_msg, train_atoms, valid_atoms, **self.parameters['train_kwargs'])
+            new_model_msg, log = self.learner.train(model_msg, train_atoms, valid_atoms, **self.parameters['train_kwargs'])
             model_list[i] = new_model_msg
+            self.train_logs.append(log)
             logger.debug(f'Finished training model {i}')
 
     def calculate(
@@ -142,7 +148,8 @@ class SerialLearningCalculator(Calculator):
         logger.debug(f'Computed the uncertainty metric for the model to be: {unc_metric:.2e}')
 
         # Use the result from the surrogate
-        self.used_surrogate = self.threshold is not None and unc_metric < self.threshold
+        uq_small_enough = self.threshold is not None and unc_metric < self.threshold
+        self.used_surrogate = uq_small_enough and (random() > self.parameters['min_target_fraction'])
         if self.used_surrogate:
             logger.debug(f'The uncertainty metric is low enough ({unc_metric:.2e} < {self.threshold:.2e}). Using the surrogate result.')
             self.results = self.surrogate_calc.results.copy()
@@ -206,7 +213,8 @@ class SerialLearningCalculator(Calculator):
             'threshold': self.threshold,
             'alpha': self.alpha,
             'error_history': list(self.error_history),
-            'new_points': self.new_points
+            'new_points': self.new_points,
+            'train_logs': self.train_logs,
         }
         if self.surrogate_calc is not None:
             output['models'] = [self.learner.serialize_model(s) for s in self.parameters['models']]
@@ -225,9 +233,11 @@ class SerialLearningCalculator(Calculator):
         self.new_points = state['new_points']
         self.error_history = deque(maxlen=self.parameters['history_length'])
         self.error_history.extend(state['error_history'])
+        self.train_logs = state['train_logs']
 
         # Remake the surrogate calculator, if available
         if 'models' in state:
+            self.parameters['models'] = state['models']
             self.surrogate_calc = EnsembleCalculator(
                 calculators=[self.learner.make_calculator(m, self.parameters['device']) for m in state['models']]
             )
