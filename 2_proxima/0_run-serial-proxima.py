@@ -134,6 +134,7 @@ if __name__ == "__main__":
         train_freq=args.retrain_freq,
         target_ferr=args.target_error,
         history_length=args.error_history,
+        min_target_fraction=args.min_target_frac,
         db_path=db_path,
     )
 
