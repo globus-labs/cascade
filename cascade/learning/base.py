@@ -105,7 +105,7 @@ class BaseLearnableForcefield(Generic[State]):
                  model_msg: bytes | State,
                  atoms: list[ase.Atoms],
                  batch_size: int = 64,
-                 device: str = 'cpu') -> (np.ndarray, list[np.ndarray]):
+                 device: str = 'cpu') -> (np.ndarray, list[np.ndarray], np.ndarray):
         """Run inference for a series of structures
 
         Args:
@@ -114,8 +114,9 @@ class BaseLearnableForcefield(Generic[State]):
             batch_size: Number of molecules to evaluate per batch
             device: Device on which to run the computation
         Returns:
-            - Energies for each inference. (N,) array of floats, where N is the number of structures
-            - Forces for each inference. List of N arrays of (n, 3), where n is the number of atoms in each structure
+            - Energy for each structure. (N,) array of floats, where N is the number of structures
+            - Forces for each structure. List of N arrays of (n, 3), where n is the number of atoms in each structure
+            - Stresses for each structure. (N, 3, 3) array, where each row a stress tensor.
         """
         raise NotImplementedError()
 
@@ -127,8 +128,9 @@ class BaseLearnableForcefield(Generic[State]):
               device: str = 'cpu',
               batch_size: int = 32,
               learning_rate: float = 1e-3,
-              huber_deltas: tuple[float, float] = (0.5, 1),
-              force_weight: float = 0.9,
+              huber_deltas: tuple[float, float, float] = (0.5, 1, 1),
+              force_weight: float = 10,
+              stress_weight: float = 100,
               reset_weights: bool = False,
               **kwargs) -> tuple[bytes, pd.DataFrame]:
         """Train a model
@@ -142,7 +144,8 @@ class BaseLearnableForcefield(Generic[State]):
             batch_size: Batch size during training
             learning_rate: Initial learning rate for optimizer
             huber_deltas: Delta parameters for the loss functions for energy and force
-            force_weight: Amount of weight to use for the energy part of the loss function
+            force_weight: Amount of weight to use for the force part of the loss function
+            stress_weight: Amount of weight to use for the stress part of the loss function
             reset_weights: Whether to reset the weights before training
         Returns:
             - model: Retrained model
