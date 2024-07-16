@@ -4,6 +4,8 @@ from pathlib import Path
 from string import Template
 from hashlib import sha256
 import numpy as np
+import yaml
+import os
 
 from ase.calculators.calculator import Calculator, all_changes, all_properties
 from ase.calculators.cp2k import CP2K
