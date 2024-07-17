@@ -4,6 +4,8 @@ from pathlib import Path
 from string import Template
 from hashlib import sha256
 import numpy as np
+import yaml
+import os
 
 from ase.calculators.calculator import Calculator, all_changes, all_properties
 from ase.calculators.cp2k import CP2K
@@ -68,43 +70,36 @@ def make_calculator(
     Returns:
         Calculator configured for target method
     """
+    # Default to the environment variable
+    if template_dir is None:
+        template_dir = Path(os.environ.get('CASCADE_CP2K_TEMPLATE', _file_dir))
 
-    # Get the input file and cutoff energy
-    input_file = _file_dir / f'cp2k-{method}-template.inp'
-    cutoff = {
-        'b97m': 800 * units.Ry,
-        'blyp': 500 * units.Ry
-    }.get(method, None)
-    max_scf = {'b97m': 32}.get(method, 128)
+    # Load the presets file
+    with (template_dir / 'presets.yml').open() as fp:
+        presets = yaml.safe_load(fp)
+    if method not in presets:
+        raise ValueError(f'"{method}" not in presets file')
+    kwargs = presets[method]
+    if kwargs.get('cutoff') is not None:
+        kwargs['cutoff'] *= units.Ry
+    kwargs.pop('description')
 
-    # Get the basis set and potential type
-    basis_set = {
-        'blyp': 'DZVP-MOLOPT-SR-GTH',
-        'b97m': 'DZVP-MOLOPT-SR-GTH',
-    }.get(method)
-    potential = {
-        'blyp': 'GTH-PBE',
-        'b97m': 'GTH-BLYP'
-    }.get(method)
-
-    inp = Template(input_file.read_text()).substitute(mult=multiplicity)  # No changes as of it
+    # Get the input file and replace any templated arguments
+    input_file = template_dir / f'cp2k-{method}-template.inp'
+    inp = Template(input_file.read_text()).substitute(mult=multiplicity)
 
     cp2k_opts = dict(
         xc=None,
         inp=inp,
-        basis_set=basis_set,
-        pseudo_potential=potential,
         poisson_solver=None,
+        **kwargs
     )
     if command is not None:
         cp2k_opts['command'] = command
     return CP2K(directory=directory,
                 stress_tensor=True,
-                max_scf=max_scf,
-                cutoff=cutoff,
                 potential_file=None,
                 set_pos_file=set_pos_file,
-                debug=debug,
                 **cp2k_opts)
 
 
