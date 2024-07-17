@@ -99,7 +99,7 @@ def make_calculator(
     return CP2K(directory=directory,
                 stress_tensor=True,
                 potential_file=None,
-                set_pos_file=True,
+                set_pos_file=set_pos_file,
                 **cp2k_opts)
 
 
