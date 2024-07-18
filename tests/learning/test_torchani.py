@@ -80,3 +80,19 @@ def test_scale_energy(example_data):
     num_a = np.array([len(a) for a in example_data])
     assert np.allclose(num_a, num_a[0])
     assert np.isclose(scaled_e.std(), np.std([a.get_potential_energy() for a in example_data]), atol=0.1)
+
+
+def test_multi_size_batches(example_si_data):
+    """Test that inference with multiple sizes of cell does not change the answer"""
+
+    ref_energies = estimate_atomic_energies(example_si_data)
+    aev, nn = build_model(example_si_data)
+
+    ani = TorchANI()
+    single_e, single_f, single_s = ani.evaluate((aev, nn, ref_energies), example_si_data, batch_size=1)
+    all_e, all_f, all_s = ani.evaluate((aev, nn, ref_energies), example_si_data, batch_size=1)
+
+    assert np.allclose(single_e, all_e)
+    assert np.allclose(single_s, all_s)
+    for s, a in zip(single_f, all_f):
+        assert np.allclose(s, a)
