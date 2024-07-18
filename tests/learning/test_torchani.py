@@ -63,23 +63,22 @@ def test_training(example_data):
         assert not np.isclose(new, orig).all()
 
 
-def test_scale_energy(example_data):
+def test_scale_energy(example_si_data):
     # Make the model requirements
-    ref_energies = estimate_atomic_energies(example_data)
-    aev, nn = build_model(example_data)
+    ref_energies = estimate_atomic_energies(example_si_data)
+    aev, nn = build_model(example_si_data)
 
     # Get baseline predictions, ensure results don't change if we reset, train, or scale energies
     ani = TorchANI()
-    orig_e, _, _ = ani.evaluate((aev, nn, ref_energies), example_data)
-    loader = make_data_loader(example_data, list(ref_energies), batch_size=2, train=False)
+    orig_e, _, _ = ani.evaluate((aev, nn, ref_energies), example_si_data)
+    loader = make_data_loader(example_si_data, list(ref_energies), batch_size=2, train=False)
     ref_energies_array = np.array(list(ref_energies.values())).astype(np.float32)
     adjust_energy_scale(aev, nn, loader, ref_energies_array)
 
-    scaled_e, _, _ = ani.evaluate((aev, nn, ref_energies), example_data)
+    scaled_e, _, _ = ani.evaluate((aev, nn, ref_energies), example_si_data)
 
-    num_a = np.array([len(a) for a in example_data])
-    assert np.allclose(num_a, num_a[0])
-    assert np.isclose(scaled_e.std(), np.std([a.get_potential_energy() for a in example_data]), atol=0.1)
+    assert np.isclose(np.std([e / len(a) for e, a in zip(scaled_e, example_si_data)]),
+                      np.std([a.get_potential_energy() / len(a) for a in example_si_data]), atol=0.1)
 
 
 def test_multi_size_batches(example_si_data):
@@ -90,9 +89,9 @@ def test_multi_size_batches(example_si_data):
 
     ani = TorchANI()
     single_e, single_f, single_s = ani.evaluate((aev, nn, ref_energies), example_si_data, batch_size=1)
-    all_e, all_f, all_s = ani.evaluate((aev, nn, ref_energies), example_si_data, batch_size=1)
+    all_e, all_f, all_s = ani.evaluate((aev, nn, ref_energies), example_si_data, batch_size=16)
 
     assert np.allclose(single_e, all_e)
     assert np.allclose(single_s, all_s)
     for s, a in zip(single_f, all_f):
-        assert np.allclose(s, a)
+        assert np.allclose(s, a, atol=1e-3), np.abs(s - a).max()
