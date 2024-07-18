@@ -134,7 +134,8 @@ def forward_batch(batch: dict[str, torch.Tensor],
         batch_x = torch.matmul(batch_x, scaling)
 
     # Compute the energy offset per member (run on the CPU because it's fast)
-    batch_o = atom_energies[batch['species'].numpy()].sum(axis=1)
+    species = batch['species'].numpy()
+    batch_o = atom_energies[batch['species'].numpy()].sum(axis=1, where=(species >= 0))
     batch_o = torch.from_numpy(batch_o).to(device)
 
     # Compute the AEVs individually because TorchANI assumes all entries have the same cell size
@@ -191,10 +192,12 @@ def adjust_energy_scale(aev_computer: AEVComputer,
         batch_e = batch['energies'][:, 0].cpu().numpy()
 
         # Get the energy per atom w/o the reference energy
-        batch_o = atom_energies[batch['species'].numpy()].sum(axis=1)
-        batch_n = (batch['species'] >= 0).sum(dim=1, dtype=batch_e_pred.dtype).cpu().numpy()
+        species = batch['species'].numpy()
+        batch_o = atom_energies[species].sum(axis=1, where=species >= 0)
+        batch_n = (species >= 0).sum(axis=1, dtype=batch_e.dtype)
+        batch_e_pred = batch_e_pred.detach().cpu().numpy()
 
-        pred_energies.extend((batch_e_pred.detach().cpu().numpy() - batch_o) / batch_n)
+        pred_energies.extend((batch_e_pred - batch_o) / batch_n)
         true_energies.extend((batch_e - batch_o) / batch_n)
 
     # Get the ratio in standard deviations and the sign
@@ -217,8 +220,9 @@ def adjust_energy_scale(aev_computer: AEVComputer,
     pred_energies = []
     for batch in loader:
         batch_e_pred, _, _ = forward_batch(batch, aev_computer, model, atom_energies, pbc, forces=False, stresses=False, train=False, device=device)
-        batch_o = atom_energies[batch['species'].numpy()].sum(axis=1)
-        batch_n = (batch['species'] >= 0).sum(dim=1, dtype=batch_e_pred.dtype).cpu().numpy()
+        species = batch['species'].numpy()
+        batch_o = atom_energies[batch['species'].numpy()].sum(axis=1, where=species >= 0)
+        batch_n = (species >= 0).sum(axis=1, dtype=batch_o.dtype)
         pred_energies.extend((batch_e_pred.detach().cpu().numpy() - batch_o) / batch_n)
 
     # Get the shift for the mean
