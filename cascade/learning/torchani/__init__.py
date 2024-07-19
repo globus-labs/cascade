@@ -2,15 +2,13 @@
 from functools import partial
 import copy
 
-import ase
-from ase import units
+from ase import units, Atoms
 import numpy as np
 import pandas as pd
 from ase.calculators.calculator import Calculator
 import torch
 from torch.utils.data import DataLoader
 from torchani.nn import SpeciesEnergies, Sequential
-from torchani.ase import Calculator as ANICalculator
 from torchani import AEVComputer, ANIModel, EnergyShifter
 from torchani.aev import SpeciesAEV
 from torchani.data import collate_fn
@@ -18,6 +16,7 @@ from ignite.engine import Engine, Events
 
 from cascade.learning.base import BaseLearnableForcefield, State
 from cascade.learning.utils import estimate_atomic_energies
+from cascade.learning.torchani.ase import Calculator as ANICalculator
 
 __all__ = ['TorchANI', 'ANIModelContents']
 
@@ -40,7 +39,7 @@ my_collate_dict = {
 }
 
 
-def ase_to_ani(atoms: ase.Atoms, species: list[str]) -> dict[str, torch.Tensor]:
+def ase_to_ani(atoms: Atoms, species: list[str]) -> dict[str, torch.Tensor]:
     """Make an ANI-format dictionary from an ASE Atoms object
 
     Args:
@@ -68,7 +67,7 @@ def ase_to_ani(atoms: ase.Atoms, species: list[str]) -> dict[str, torch.Tensor]:
     return output
 
 
-def make_data_loader(data: list[ase.Atoms],
+def make_data_loader(data: list[Atoms],
                      species: list[str],
                      batch_size: int,
                      train: bool,
@@ -244,7 +243,7 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
 
     def evaluate(self,
                  model_msg: bytes | ANIModelContents,
-                 atoms: list[ase.Atoms],
+                 atoms: list[Atoms],
                  batch_size: int = 64,
                  device: str = 'cpu') -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
 
@@ -287,8 +286,8 @@ class TorchANI(BaseLearnableForcefield[ANIModelContents]):
 
     def train(self,
               model_msg: bytes | State,
-              train_data: list[ase.Atoms],
-              valid_data: list[ase.Atoms],
+              train_data: list[Atoms],
+              valid_data: list[Atoms],
               num_epochs: int,
               device: str = 'cpu',
               batch_size: int = 32,
