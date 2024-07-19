@@ -6,6 +6,7 @@
 """
 
 # TODO (wardlt): TorchANI is in a code freeze as they refactor, so I'm copying my alterations over to here
+#  They are originally from https://github.com/aiqm/torchani/blob/17204c6dccf6210753bc8c0ca4c92278b60719c9/torchani/ase.py
 
 import torch
 from ase.calculators.calculator import all_properties
