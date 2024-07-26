@@ -3,27 +3,52 @@ from torchani import AEVComputer, ANIModel
 import torch
 
 
-def make_aev_computer(species: list[str]) -> AEVComputer:
+def make_aev_computer(
+        species: list[str],
+        radial_cutoff: float = 5.2,
+        angular_cutoff: float = 3.5,
+        radial_eta: float = 16.,
+        angular_eta: float = 8.,
+        zeta: float = 32.,
+        num_radial_terms: int = 16,
+        num_angular_dist_terms: int = 4,
+        num_angular_angl_terms: int = 8,
+        angular_start: float = 0.9,
+        radial_start: float = 0.9
+) -> AEVComputer:
     """Make the environment computer
+
+    Defaults are the parameters used in ANI-1x.
+    Creates an evenly-spaced set of radial and angular terms using :meth:`~torchani.aev.AEVComputer.cover_linearly`.
 
     Args:
         species: List of species used for the model
+        radial_cutoff: Maximum distance of radial terms in atomic environment (Units: A)
+        angular_cutoff: Maximum distance of angular terms in atomic environment (Units: A)
+        radial_eta: Inverse width of angular terms (Units: A)
+        angular_eta: Inverse spatial width of angular terms (Units: A)
+        zeta: Inverse angular width of angular terms
+        num_radial_terms: Number of radial terms
+        num_angular_dist_terms: Number of radial divisions in angular terms
+        num_angular_angl_terms: Number of angular divisions in angular terms
+        angular_start: Minimum distance for angular terms
+        radial_start: Minimum distance for radial terms
     Returns:
         Tool which computes the atomic environment of each atom
     """
-
-    # TODO (wardlt): Make these options adjustable
-    Rcr = 5.2000e+00
-    Rca = 3.5000e+00
-    EtaR = torch.tensor([1.6000000e+01])
-    ShfR = torch.tensor(
-        [9.0000000e-01, 1.1687500e+00, 1.4375000e+00, 1.7062500e+00, 1.9750000e+00, 2.2437500e+00, 2.5125000e+00, 2.7812500e+00, 3.0500000e+00, 3.3187500e+00,
-         3.5875000e+00, 3.8562500e+00, 4.1250000e+00, 4.3937500e+00, 4.6625000e+00, 4.9312500e+00])
-    Zeta = torch.tensor([3.2000000e+01])
-    ShfZ = torch.tensor([1.9634954e-01, 5.8904862e-01, 9.8174770e-01, 1.3744468e+00, 1.7671459e+00, 2.1598449e+00, 2.5525440e+00, 2.9452431e+00])
-    EtaA = torch.tensor([8.0000000e+00])
-    ShfA = torch.tensor([9.0000000e-01, 1.5500000e+00, 2.2000000e+00, 2.8500000e+00])
-    return AEVComputer(Rcr, Rca, EtaR, ShfR, EtaA, Zeta, ShfA, ShfZ, len(species))
+    return AEVComputer.cover_linearly(
+        radial_cutoff=radial_cutoff,
+        angular_cutoff=angular_cutoff,
+        radial_eta=radial_eta,
+        angular_eta=angular_eta,
+        zeta=zeta,
+        radial_dist_divisions=num_radial_terms,
+        angular_dist_divisions=num_angular_dist_terms,
+        angle_sections=num_angular_angl_terms,
+        angular_start=angular_start,
+        radial_start=radial_start,
+        num_species=len(species)
+    )
 
 
 def make_output_nets(species: list[str],
