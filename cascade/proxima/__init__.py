@@ -10,7 +10,6 @@ import numpy as np
 import pandas as pd
 from ase.calculators.calculator import Calculator, all_changes, all_properties
 from ase.db import connect
-from ase.io import read
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.calculator import EnsembleCalculator
@@ -40,6 +39,12 @@ class SerialLearningCalculator(Calculator):
         Dictionary of parameters passed to the train function of the learner
     train_freq: int
         After how many new data points to retrain the surrogate model
+    train_max_size: int, optional
+        Maximum size of training set to use when updating model. Set to ``None`` to use all data
+    train_recency_bias: float
+        Bias towards selecting newer points if using only a subset of the available training data.
+        Weights will be assigned to each point in a geometric series such that the most recent
+        point is ``train_recency_bias`` times more likely to be selected than the least recent.
     target_ferr: float
         Target maximum difference between the forces predicted by the target
         calculator and the learnable surrogate
@@ -63,6 +68,8 @@ class SerialLearningCalculator(Calculator):
         'device': 'cpu',
         'train_kwargs': {'num_epochs': 8},
         'train_freq': 1,
+        'train_max_size': None,
+        'train_recency_bias': 1.,
         'target_ferr': 0.1,  # TODO (wardlt): Make the error metric configurable
         'min_target_fraction': 0.,
         'history_length': 8,
@@ -106,7 +113,11 @@ class SerialLearningCalculator(Calculator):
             logger.debug(f'No data at {db_path} yet')
             return
 
-        all_atoms = read(db_path, ':')
+        # Retrieve the data such that the oldest training entry is first
+        with connect(db_path) as db:
+            all_atoms = [a for a in db.select('', sort='-age')]
+            assert len(all_atoms) < 2 or all_atoms[0].ctime < all_atoms[1].ctime, 'Logan got the sort order backwards'
+            all_atoms = [a.toatoms() for a in all_atoms]
         logger.info(f'Loaded {len(all_atoms)} from {db_path} for retraining {len(self.parameters["models"])} models')
         if len(all_atoms) < 10:
             logger.info('Too few entries to retrain. Skipping')
@@ -119,9 +130,24 @@ class SerialLearningCalculator(Calculator):
             # Assign splits such that the same entries do not switch between train/validation as test grows
             rng = np.random.RandomState(i)
             is_train = rng.uniform(0, 1, size=(len(all_atoms),)) > 0.1  # TODO (wardlt): Make this configurable
-            train_atoms = [all_atoms[i] for i in np.where(is_train)[0]]
+            train_atoms = [all_atoms[i] for i in np.where(is_train)[0]]  # Where preserves sort
             valid_atoms = [all_atoms[i] for i in np.where(np.logical_not(is_train))[0]]
 
+            # Downselect training set if it is larger than the fixed maximum
+            train_max_size = self.parameters['train_max_size']
+            if train_max_size is not None and len(train_atoms) > train_max_size:
+                valid_size = train_max_size * len(valid_atoms) // len(train_atoms)  # Decrease the validation size proportionally
+
+                train_weights = np.geomspace(1, self.parameters['train_recency_bias'], len(train_atoms))
+                train_ids = rng.choice(len(train_atoms), size=(train_max_size,), p=train_weights / train_weights.sum(), replace=False)
+                train_atoms = [train_atoms[i] for i in train_ids]
+
+                if valid_size > 0:
+                    valid_weights = np.geomspace(1, self.parameters['train_recency_bias'], len(valid_atoms))
+                    valid_ids = rng.choice(len(valid_atoms), size=(valid_size,), p=valid_weights / valid_weights.sum(), replace=False)
+                    valid_atoms = [valid_atoms[i] for i in valid_ids]
+
+            logger.debug(f'Training model {i} on {len(train_atoms)} atoms and validating on {len(valid_atoms)}')
             new_model_msg, log = self.learner.train(model_msg, train_atoms, valid_atoms, **self.parameters['train_kwargs'])
             model_list[i] = new_model_msg
             self.train_logs.append(log)
