@@ -186,7 +186,7 @@ if __name__ == "__main__":
     atoms.calc = learning_calc
     npt = NPTBerendsen(atoms,
                        timestep=args.timestep * units.fs,
-                       temperature_K=300,
+                       temperature_K=args.temperature,
                        pressure_au=0,
                        compressibility_au=5e-5 / units.bar)  # Close to the compressibility of water
     md_logger = MDLogger(np, atoms, str(md_log_path), stress=True)
