@@ -90,6 +90,12 @@ class SerialLearningCalculator(Calculator):
     """Whether the last invocation used the surrogate model"""
     new_points: int = 0
     """How many new points have been acquired since the last model update"""
+    total_invocations: int = 0
+    """Total number of calls to the calculator"""
+    target_invocations: int = 0
+    """Total number of calls to the target calculator"""
+    model_version: int = 0
+    """How many times the model has been retrained"""
 
     def set(self, **kwargs):
         # TODO (wardlt): Fix ASE such that it does not try to do a numpy comparison on everything
@@ -152,6 +158,7 @@ class SerialLearningCalculator(Calculator):
             model_list[i] = new_model_msg
             self.train_logs.append(log)
             logger.debug(f'Finished training model {i}')
+        self.model_version += 1
 
     def calculate(
             self, atoms=None, properties=all_properties, system_changes=all_changes
@@ -176,6 +183,7 @@ class SerialLearningCalculator(Calculator):
         # Use the result from the surrogate
         uq_small_enough = self.threshold is not None and unc_metric < self.threshold
         self.used_surrogate = uq_small_enough and (random() > self.parameters['min_target_fraction'])
+        self.total_invocations += 1
         if self.used_surrogate:
             logger.debug(f'The uncertainty metric is low enough ({unc_metric:.2e} < {self.threshold:.2e}). Using the surrogate result.')
             self.results = self.surrogate_calc.results.copy()
@@ -184,6 +192,7 @@ class SerialLearningCalculator(Calculator):
         # If not, run the target calculator and use that result
         target_calc: Calculator = self.parameters['target_calc']
         target_calc.calculate(atoms, properties, system_changes)
+        self.target_invocations += 1
         self.results = target_calc.results.copy()
 
         # Increment the training set with this new result
@@ -241,6 +250,9 @@ class SerialLearningCalculator(Calculator):
             'error_history': list(self.error_history),
             'new_points': self.new_points,
             'train_logs': self.train_logs,
+            'total_invocations': self.total_invocations,
+            'target_invocations': self.target_invocations,
+            'model_version': self.model_version
         }
         if self.surrogate_calc is not None:
             output['models'] = [self.learner.serialize_model(s) for s in self.parameters['models']]
@@ -260,6 +272,9 @@ class SerialLearningCalculator(Calculator):
         self.error_history = deque(maxlen=self.parameters['history_length'])
         self.error_history.extend(state['error_history'])
         self.train_logs = state['train_logs']
+        self.total_invocations = state['total_invocations']
+        self.target_invocations = state['target_invocations']
+        self.model_version = state['model_version']
 
         # Remake the surrogate calculator, if available
         if 'models' in state:

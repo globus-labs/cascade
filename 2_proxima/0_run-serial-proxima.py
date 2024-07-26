@@ -184,6 +184,9 @@ if __name__ == "__main__":
                 'proxima_threshold': learning_calc.threshold,
                 'last_uncer': float(last_uncer),
                 'last_error': float(last_error),
+                'total_invocations': learning_calc.total_invocations,
+                'target_invocations': learning_calc.target_invocations,
+                'model_version': learning_calc.model_version
             }), file=fp)
 
 

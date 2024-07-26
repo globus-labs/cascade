@@ -56,6 +56,7 @@ def test_proxima(starting_frame, simple_proxima):
     assert not simple_proxima.used_surrogate
     assert len(simple_proxima.error_history) == 1
     assert simple_proxima.parameters['db_path'].is_file()
+    assert simple_proxima.target_invocations == simple_proxima.total_invocations == 1
 
     # Run enough calculations to determine a threshold
     for i in range(simple_proxima.parameters['history_length'] - 1):
@@ -118,3 +119,4 @@ def test_max_size(starting_frame, simple_proxima, target_calc, caplog):
     with caplog.at_level(logging.DEBUG, logger='cascade.proxima'):
         simple_proxima.retrain_surrogate()
     assert '8 atoms and validating on 1' in caplog.messages[-2]
+    assert simple_proxima.model_version == 1
