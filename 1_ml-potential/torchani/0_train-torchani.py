@@ -37,6 +37,14 @@ if __name__ == "__main__":
     group.add_argument('--hidden-layers', default=2, help='Number of hidden layers in the output network', type=int)
     group.add_argument('--hidden-units', default=128, help='Number of units in the first hidden layer of output networks', type=int)
     group.add_argument('--hidden-decay', default=0.8, help='Decrease in number of units between hidden layers', type=float)
+    group.add_argument('--radial-cutoff', default=5.2, help='Maximum distance of radial terms', type=float)
+    group.add_argument('--angular-cutoff', default=3.5, help='Maximum distance of angular terms', type=float)
+    group.add_argument('--radial-eta', default=16, help='Width parameter of radial terms', type=float)
+    group.add_argument('--angular-eta', default=8, help='Width parameter of angular terms', type=float)
+    group.add_argument('--angular-zeta', default=8, help='Angular width parameter of angular terms', type=float)
+    group.add_argument('--num-radial-terms', default=16, help='Number of radial terms', type=int)
+    group.add_argument('--num-angular-dist-terms', default=4, help='Number of radial steps of angular terms', type=int)
+    group.add_argument('--num-angular-angl-terms', default=8, help='Number of radial steps of angular terms', type=int)
     args = parser.parse_args()
 
     # Load the training data
@@ -104,7 +112,17 @@ if __name__ == "__main__":
     atom_energies = dict((s, 0) for s in species)  # Guess zero to start
     logger.info(f'Found {len(species)} species: {", ".join(species)}')
 
-    aev_computer = build.make_aev_computer(species)
+    aev_computer = build.make_aev_computer(
+        radial_cutoff=args.radial_cutoff,
+        angular_cutoff=args.angular_cutoff,
+        radial_eta=args.radial_eta,
+        angular_eta=args.angular_eta,
+        zeta=args.angular_zeta,
+        num_radial_terms=args.num_radial_terms,
+        num_angular_dist_terms=args.num_angular_dist_terms,
+        num_angular_angl_terms=args.num_angular_angl_terms,
+        species=species
+    )
     aev_computer.to('cuda')
     aev_length = aev_computer.aev_length
     logger.info(f'Made an AEV computer which produces {aev_length} features')
