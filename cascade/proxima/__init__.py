@@ -210,7 +210,7 @@ class SerialLearningCalculator(Calculator):
             logger.debug(f'Too few entries in training history. {len(self.error_history)} < {self.parameters["history_length"]}')
             return
         uncert_metrics, obs_errors = zip(*self.error_history)
-        many_alphas = np.true_divide(obs_errors, uncert_metrics)  # Alpha's units: error / UQ
+        many_alphas = np.true_divide(obs_errors, np.clip(uncert_metrics, 1e-6, a_max=np.inf))  # Alpha's units: error / UQ
         self.alpha = np.mean(many_alphas)
         assert self.alpha >= 0
 
