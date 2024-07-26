@@ -44,6 +44,8 @@ if __name__ == "__main__":
     group.add_argument('--online-training', action='store_true', help='Whether to restart training from the same weights each time')
     group.add_argument('--training-epochs', type=int, default=32, help='Number of epochs per training event')
     group.add_argument('--training-batch-size', type=int, default=32, help='Which device to use for training models')
+    group.add_argument('--training-max-size', type=int, default=None, help='Maximum training set size to use when updating models')
+    group.add_argument('--training-recency-bias', type=float, default=1., help='Factor by which to favor recent data when reducing training set size')
     group.add_argument('--training-device', default='cuda', help='Which device to use for training models')
 
     group = parser.add_argument_group(title='Proxima', description="Settings for learning on the fly")
@@ -132,6 +134,8 @@ if __name__ == "__main__":
             'reset_weights': not args.online_training,
             'device': args.training_device},  # Configuration for the training routines
         train_freq=args.retrain_freq,
+        train_max_size=args.training_max_size,
+        train_recency_bias=args.training_recency_bias,
         target_ferr=args.target_error,
         history_length=args.error_history,
         min_target_fraction=args.min_target_frac,
