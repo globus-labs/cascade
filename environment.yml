@@ -26,6 +26,7 @@ dependencies:
       - torch
       - mlflow
       - pytorch-ignite
+      - python-git-info
       - tqdm
       - papermill
       - -e .
