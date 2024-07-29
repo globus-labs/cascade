@@ -39,6 +39,7 @@ if __name__ == "__main__":
     group.add_argument('--seed', type=int, default=1, help='Random seed used to start dynamics')
 
     group = parser.add_argument_group(title="Learner Details", description="Configure the surrogate model")
+    group.add_argument('--initial-model', help='Path to initial model in message format. Code will generate a network with default settings if none provided')
     group.add_argument('--initial-data', nargs='*', default=(), help='Path to data files (e.g., ASE .traj and .db) containing initial training data')
     group.add_argument('--ensemble-size', type=int, default=2, help='Number of models to train on different data segments')
     group.add_argument('--online-training', action='store_true', help='Whether to restart training from the same weights each time')
@@ -102,11 +103,17 @@ if __name__ == "__main__":
     learner = TorchANI()
 
     atoms = io.read(strc_path)
-    species = list(set(atoms.symbols))
-    aev = make_aev_computer(species)
+    if args.initial_model is None:
+        species = list(set(atoms.symbols))
+        aev = make_aev_computer(species)
 
-    models = [(aev, make_output_nets(species, aev), dict((s, 0.) for s in species))
-              for i in range(args.ensemble_size)]
+        models = [(aev, make_output_nets(species, aev), dict((s, 0.) for s in species))
+                  for i in range(args.ensemble_size)]
+        logger.info('Created new default TorchANI networks')
+    else:
+        model = Path(args.initial_model).read_bytes()
+        models = [model] * args.ensemble_size
+        logger.info(f'Loaded a model from {args.initial_model}')
 
     # Get either the last step from the traj, or thermalize the starting structure
     traj_path = run_dir / 'md.traj'
@@ -177,6 +184,9 @@ if __name__ == "__main__":
                 'proxima_threshold': learning_calc.threshold,
                 'last_uncer': float(last_uncer),
                 'last_error': float(last_error),
+                'total_invocations': learning_calc.total_invocations,
+                'target_invocations': learning_calc.target_invocations,
+                'model_version': learning_calc.model_version
             }), file=fp)
 
 
