@@ -178,7 +178,7 @@ if __name__ == "__main__":
 
     # Store the model, predictions, and ground truth
     logger.info('Saving model and results')
-    torch.save(model_msg, run_dir / 'model.pt')
+    (run_dir / 'model.pt').write_bytes(model_msg)
     train_log.to_csv(run_dir / 'log.csv', index=False)
     with open(run_dir / 'performance.json', 'w') as fp:
         json.dump(performance, fp, indent=2)

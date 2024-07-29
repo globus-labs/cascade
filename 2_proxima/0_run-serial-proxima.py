@@ -2,6 +2,7 @@
 from argparse import ArgumentParser
 from hashlib import sha256
 from pathlib import Path
+from datetime import datetime
 from time import perf_counter
 import pickle as pkl
 import logging
@@ -10,17 +11,19 @@ import sys
 
 import numpy as np
 from ase.io import Trajectory
+from ase.md.npt import NPT
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase import units, io
 from ase.db import connect
 from ase.md import MDLogger
-from ase.md.nptberendsen import NPTBerendsen
+from gitinfo import get_git_info
 
 from cascade.proxima import SerialLearningCalculator
 from cascade.calculator import make_calculator
 from cascade.learning.torchani import TorchANI
 from cascade.learning.torchani.build import make_output_nets, make_aev_computer
 from cascade.utils import canonicalize
+import cascade
 
 main_logger = logging.getLogger('main')
 
@@ -72,7 +75,11 @@ if __name__ == "__main__":
     run_dir.mkdir(exist_ok=True, parents=True)
 
     with (run_dir / 'params.json').open('w') as fp:
-        json.dump(args.__dict__, fp, indent=2)
+        params = args.__dict__.copy()
+        params['cascade_commit'] = get_git_info(Path(cascade.__file__).parent)['commit']
+        params['my_commit'] = get_git_info()['commit']
+        params['start_time'] = datetime.now().isoformat()
+        json.dump(params, fp, indent=2)
 
     # Create the logging
     handlers = [logging.FileHandler(run_dir / 'runtime.log'),
@@ -195,14 +202,17 @@ if __name__ == "__main__":
             can_atoms = canonicalize(atoms)
             traj.write(can_atoms)
 
+
     # Prepare the dynamics
     md_log_path = run_dir / 'md.log'
     atoms.calc = learning_calc
-    npt = NPTBerendsen(atoms,
-                       timestep=args.timestep * units.fs,
-                       temperature_K=args.temperature,
-                       pressure_au=0,
-                       compressibility_au=5e-5 / units.bar)  # Close to the compressibility of water
+    npt = NPT(atoms,
+              timestep=args.timestep * units.fs,
+              temperature_K=args.temperature,
+              ttime=25 * units.fs,
+              externalstress=0.,
+              pfactor=75 * units.fs * 100 * units.GPa,
+              mask=np.diag([1, 1, 1]))
     md_logger = MDLogger(np, atoms, str(md_log_path), stress=True)
     npt.attach(_log_proxima)
     npt.attach(_save_state)
