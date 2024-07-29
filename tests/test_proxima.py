@@ -1,7 +1,9 @@
 """Test the proxima calculator"""
-import logging
+from collections import deque
 from pathlib import Path
+from math import isclose
 import pickle as pkl
+import logging
 
 from ase.calculators.cp2k import CP2K
 from pytest import fixture
@@ -13,6 +15,9 @@ from cascade.calculator import make_calculator
 from cascade.learning.torchani import ANIModelContents, TorchANI
 from cascade.learning.torchani.build import make_aev_computer, make_output_nets
 from cascade.proxima import SerialLearningCalculator
+from cascade.utils import canonicalize
+
+_initial_calcs: list[Atoms] = []  # Used if we want the database pre-populated
 
 
 @fixture()
@@ -33,7 +38,7 @@ def simple_model(starting_frame) -> tuple[list[ANIModelContents], TorchANI]:
 
 @fixture()
 def target_calc() -> CP2K:
-    return make_calculator('blyp')
+    yield make_calculator('blyp')
 
 
 @fixture()
@@ -48,6 +53,25 @@ def simple_proxima(simple_model, target_calc, tmpdir):
         db_path=tmpdir / 'data.db',
         target_ferr=1e-12,  # Should be unachievable
     )
+
+
+@fixture()
+def initialized_db(simple_proxima, target_calc, starting_frame):
+    """Initialize the database"""
+    # Compute a set of initial calcs if required
+    global _initial_calcs
+    if len(_initial_calcs) == 0:
+        for i in range(12):
+            new_frame = starting_frame.copy()
+            new_frame.calc = target_calc
+            new_frame.rattle(0.01, seed=i)
+            new_frame.get_forces()
+            _initial_calcs.append(canonicalize(new_frame))
+
+    with connect(simple_proxima.parameters['db_path']) as db:
+        for new_frame in _initial_calcs:
+            db.write(new_frame)
+        assert len(db) == 12
 
 
 def test_proxima(starting_frame, simple_proxima):
@@ -103,20 +127,24 @@ def test_proxima(starting_frame, simple_proxima):
     assert simple_proxima.threshold is not None
 
 
-def test_max_size(starting_frame, simple_proxima, target_calc, caplog):
-    # Insert 16 random calculations into the db
-    with connect(simple_proxima.parameters['db_path']) as db:
-        for i in range(12):
-            new_frame = starting_frame.copy()
-            new_frame.calc = target_calc
-            new_frame.rattle(0.01, seed=i)
-            new_frame.get_forces()
-            db.write(new_frame)
-        assert len(db) == 12
-
+def test_max_size(starting_frame, simple_proxima, target_calc, initialized_db, caplog):
     # Make the maximum training size 8, then verify that only 8 frames are taken for training
     simple_proxima.parameters['train_max_size'] = 8
     with caplog.at_level(logging.DEBUG, logger='cascade.proxima'):
         simple_proxima.retrain_surrogate()
     assert '8 atoms and validating on 1' in caplog.messages[-2]
     assert simple_proxima.model_version == 1
+
+
+def test_pretrained_threshold(starting_frame, simple_proxima, target_calc):
+    # Duplicate the model to simulate a pre-trained model
+    model = simple_proxima.parameters['models'][0]
+    simple_proxima.parameters['models'] = [model] * 2
+
+    # Fake the history
+    simple_proxima.error_history = deque([(0, 1) for _ in range(simple_proxima.parameters['history_length'])])
+
+    # Run a single calculation with the starting frame to trigger updating the threshold
+    assert simple_proxima.threshold is None and simple_proxima.alpha is None
+    simple_proxima.get_forces(starting_frame)
+    assert isclose(simple_proxima.threshold, 0., abs_tol=1e-12) and simple_proxima.alpha is None  # It sets to zero if all UQs are the same

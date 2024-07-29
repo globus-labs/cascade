@@ -219,6 +219,14 @@ class SerialLearningCalculator(Calculator):
             logger.debug(f'Too few entries in training history. {len(self.error_history)} < {self.parameters["history_length"]}')
             return
         uncert_metrics, obs_errors = zip(*self.error_history)
+
+        # Special case: uncertainty metrics are all zero. Happens when using the same pre-trained weights for whole ensemble.
+        all_zero = np.allclose(uncert_metrics, 0.)
+        if all_zero:
+            logger.debug('All uncertainty metrics are zero. Setting threshold to zero')
+            self.threshold = 0.
+            return
+
         many_alphas = np.true_divide(obs_errors, np.clip(uncert_metrics, 1e-6, a_max=np.inf))  # Alpha's units: error / UQ
         self.alpha = np.mean(many_alphas)
         assert self.alpha >= 0
