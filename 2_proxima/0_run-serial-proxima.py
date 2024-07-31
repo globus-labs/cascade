@@ -225,3 +225,5 @@ if __name__ == "__main__":
     # Run dynamics
     with md_logger:
         npt.run(args.steps - start_frame)
+
+    logger.info('Done!')
