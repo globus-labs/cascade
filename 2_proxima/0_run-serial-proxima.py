@@ -39,7 +39,7 @@ if __name__ == "__main__":
     group.add_argument('--timestep', type=float, default=1, help='Timestep length. Units: fs')
     group.add_argument('--calculator', default='blyp', help='Name of the method to use for the target function')
     group.add_argument('--npt-temp-tau', default=25, type=float, help='Characteristic time for temperature controller in NPT. Units: fs')
-    group.add_argument('--npt-temp-tau', default=75, type=float,
+    group.add_argument('--npt-stress-tau', default=75, type=float,
                        help='Characteristic time for pressure controller in NPT, assuming a bulk modulus of 100 GPa. Units: fs')
     group.add_argument('--steps', type=int, default=128, help='Number of dynamics steps to run')
     group.add_argument('--seed', type=int, default=1, help='Random seed used to start dynamics')
