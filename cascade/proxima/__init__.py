@@ -24,6 +24,10 @@ class SerialLearningCalculator(Calculator):
     Determines when to switch between the physics and learnable calculator based
     on an uncertainty metric from the learnable calculator.
 
+    Switching can be applied smoothly, that is by taking a mixture of physics-
+    and surrogate-derived quantities that moves slowly toward full surrogate
+    utilization over time. This is controleld by the parameters n_blending_steps
+
     Parameters for the calculator are:
 
     target_calc: BaseCalculator
@@ -116,6 +120,11 @@ class SerialLearningCalculator(Calculator):
     @property
     def learner(self) -> BaseLearnableForcefield:
         return self.parameters['learner']
+    
+    @classmethod
+    def smoothing_function(x): 
+        """Smoothing used for blending surrogate with physics"""
+        return 0.5*(np.cos(np.pi*x)) + 1
 
     def retrain_surrogate(self):
         """Retrain the surrogate models using the currently-available data"""
@@ -212,7 +221,7 @@ class SerialLearningCalculator(Calculator):
 
         if self.used_surrogate and blend_with_target:
             # return a blend if appropriate
-            lambda_target = blend_with_target / self.n_blend_steps
+            lambda_target = self.smoothing_function(blend_with_target / self.n_blend_steps)
             results_target = target_calc.results.copy()
             results_surrogate = self.surrogate_calc.results.copy()
             self.results = {}
