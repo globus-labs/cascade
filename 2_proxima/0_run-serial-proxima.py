@@ -38,6 +38,9 @@ if __name__ == "__main__":
     group.add_argument('--temperature', type=float, help='Temperature of the dynamics. Units: K')
     group.add_argument('--timestep', type=float, default=1, help='Timestep length. Units: fs')
     group.add_argument('--calculator', default='blyp', help='Name of the method to use for the target function')
+    group.add_argument('--npt-temp-tau', default=25, type=float, help='Characteristic time for temperature controller in NPT. Units: fs')
+    group.add_argument('--npt-stress-tau', default=75, type=float,
+                       help='Characteristic time for pressure controller in NPT, assuming a bulk modulus of 100 GPa. Units: fs')
     group.add_argument('--steps', type=int, default=128, help='Number of dynamics steps to run')
     group.add_argument('--seed', type=int, default=1, help='Random seed used to start dynamics')
 
@@ -209,9 +212,9 @@ if __name__ == "__main__":
     npt = NPT(atoms,
               timestep=args.timestep * units.fs,
               temperature_K=args.temperature,
-              ttime=25 * units.fs,
+              ttime=args.npt_temp_tau * units.fs,
               externalstress=0.,
-              pfactor=75 * units.fs * 100 * units.GPa,
+              pfactor=(args.npt_stress_tau * units.fs) ** 2 * 100 * units.GPa,
               mask=np.diag([1, 1, 1]))
     md_logger = MDLogger(np, atoms, str(md_log_path), stress=True)
     npt.attach(_log_proxima)
@@ -222,3 +225,5 @@ if __name__ == "__main__":
     # Run dynamics
     with md_logger:
         npt.run(args.steps - start_frame)
+
+    logger.info('Done!')
