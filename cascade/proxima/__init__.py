@@ -25,8 +25,9 @@ class SerialLearningCalculator(Calculator):
     on an uncertainty metric from the learnable calculator.
 
     Switching can be applied smoothly, that is by taking a mixture of physics-
-    and surrogate-derived quantities that moves slowly toward full surrogate
-    utilization over time. This is controleld by the parameters n_blending_steps
+    and surrogate-derived quantities that moves slowly between full surrogate
+    and full physics utilization over time. The rate of this smoothing is
+    controleld by the parameters n_blending_steps
 
     Parameters for the calculator are:
 
@@ -103,8 +104,9 @@ class SerialLearningCalculator(Calculator):
     """Total number of calls to the calculator"""
     target_invocations: int = 0
     """Total number of calls to the target calculator"""
-    seq_surrogate_invocations = 0
-    """Number of surrogate invocations in a row (resets once threshold exceeded)"""
+    blending_step = 0
+    """Ranges from 0 to n_blending_steps, corresponding to
+    full surrogate and full physics, respectively"""
     model_version: int = 0
     """How many times the model has been retrained"""
 
@@ -201,15 +203,13 @@ class SerialLearningCalculator(Calculator):
         self.used_surrogate = uq_small_enough and (random() > self.parameters['min_target_fraction'])
         self.total_invocations += 1
         
-        # Track blending parameters for surrogate/target
-        blend_with_target = self.n_blend_steps - self.seq_surrogate_invocations
-        if self.used_surrogate:
-            self.seq_surrogate_invocations += 1
-        else: 
-            self.seq_surrogate_invocations = 0
+        # Track blending parameters for surrogate/targe
+        increment = +1 if self.used_surrogate else -1
+        self.blending_step = np.clip(self.blending_step + increment, 0, self.n_blending_steps)
+        lambda_target = self.smoothing_function((self.n_blending_steps - self.blending_step) / self.n_blend_steps)
         
         # Case: fully use the surrogate
-        if self.used_surrogate and not blend_with_target:
+        if self.used_surrogate and self.blending_step == self.n_blending_steps:
             logger.debug(f'The uncertainty metric is low enough ({unc_metric:.2e} < {self.threshold:.2e}). Using the surrogate result.')
             self.results = self.surrogate_calc.results.copy()
             return
@@ -219,11 +219,10 @@ class SerialLearningCalculator(Calculator):
         target_calc.calculate(atoms, properties, system_changes)
         self.target_invocations += 1
 
-        if self.used_surrogate and blend_with_target:
+        if self.blending_step > 0:
             # return a blend if appropriate
-            lambda_target = self.smoothing_function(blend_with_target / self.n_blend_steps)
-            results_target = target_calc.results.copy()
-            results_surrogate = self.surrogate_calc.results.copy()
+            results_target = target_calc.results
+            results_surrogate = self.surrogate_calc.results
             self.results = {}
             for k in results_surrogate.keys(): 
                 if k in results_target.keys(): 
