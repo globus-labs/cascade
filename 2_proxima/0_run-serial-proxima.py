@@ -12,10 +12,11 @@ import sys
 import numpy as np
 from ase.io import Trajectory
 from ase.md.npt import NPT
+from ase.md.bussi import Bussi
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase import units, io
 from ase.db import connect
-from ase.md import MDLogger
+from ase.md import MDLogger, VelocityVerlet
 from gitinfo import get_git_info
 
 from cascade.proxima import SerialLearningCalculator
@@ -38,8 +39,10 @@ if __name__ == "__main__":
     group.add_argument('--temperature', type=float, help='Temperature of the dynamics. Units: K')
     group.add_argument('--timestep', type=float, default=1, help='Timestep length. Units: fs')
     group.add_argument('--calculator', default='blyp', help='Name of the method to use for the target function')
-    group.add_argument('--npt-temp-tau', default=25, type=float, help='Characteristic time for temperature controller in NPT. Units: fs')
-    group.add_argument('--npt-stress-tau', default=75, type=float,
+    group.add_argument('--ensemble', choices=('npt', 'nvt', 'nve'), default='nvt',
+                       help='Which type of dynamics to run.')
+    group.add_argument('--temp-tau', default=25, type=float, help='Characteristic time for temperature controller in NPT/NVT. Units: fs')
+    group.add_argument('--stress-tau', default=75, type=float,
                        help='Characteristic time for pressure controller in NPT, assuming a bulk modulus of 100 GPa. Units: fs')
     group.add_argument('--steps', type=int, default=128, help='Number of dynamics steps to run')
     group.add_argument('--seed', type=int, default=1, help='Random seed used to start dynamics')
@@ -48,7 +51,7 @@ if __name__ == "__main__":
     group.add_argument('--initial-model', help='Path to initial model in message format. Code will generate a network with default settings if none provided')
     group.add_argument('--initial-data', nargs='*', default=(), help='Path to data files (e.g., ASE .traj and .db) containing initial training data')
     group.add_argument('--ensemble-size', type=int, default=2, help='Number of models to train on different data segments')
-    group.add_argument('--online-training', action='store_true', help='Whether to restart training from the same weights each time')
+    group.add_argument('--online-training', action='store_true', help='Whether to use the weights from the last training step as starting for the next')
     group.add_argument('--training-epochs', type=int, default=32, help='Number of epochs per training event')
     group.add_argument('--training-batch-size', type=int, default=32, help='Which device to use for training models')
     group.add_argument('--training-max-size', type=int, default=None, help='Maximum training set size to use when updating models')
@@ -209,21 +212,33 @@ if __name__ == "__main__":
     # Prepare the dynamics
     md_log_path = run_dir / 'md.log'
     atoms.calc = learning_calc
-    npt = NPT(atoms,
-              timestep=args.timestep * units.fs,
-              temperature_K=args.temperature,
-              ttime=args.npt_temp_tau * units.fs,
-              externalstress=0.,
-              pfactor=(args.npt_stress_tau * units.fs) ** 2 * 100 * units.GPa,
-              mask=np.diag([1, 1, 1]))
+    if args.ensemble == 'nve':
+        dynamics = VelocityVerlet(atoms, timestep=args.timestep * units.fs)
+        logger.info('Running NVE dynamics')
+    elif args.ensemble == 'nvt':
+        dynamics = Bussi(atoms,
+                         timestep=args.timestep * units.fs,
+                         temperature_K=args.temperature,
+                         taut=args.temp_tau * units.fs,
+                         rng=np.random.RandomState(args.seed))
+        logger.info(f'Running NVT dynamics at T={args.temperature}')
+    elif args.ensemble == 'npt':
+        dynamics = NPT(atoms,
+                       timestep=args.timestep * units.fs,
+                       temperature_K=args.temperature,
+                       ttime=args.temp_tau * units.fs,
+                       externalstress=0.,
+                       pfactor=(args.stress_tau * units.fs) ** 2 * 100 * units.GPa,
+                       mask=np.diag([1, 1, 1]))
+        logger.info(f'Running NVT dynamics at T={args.temperature}')
     md_logger = MDLogger(np, atoms, str(md_log_path), stress=True)
-    npt.attach(_log_proxima)
-    npt.attach(_save_state)
-    npt.attach(md_logger)
-    npt.attach(_write_to_traj)
+    dynamics.attach(_log_proxima)
+    dynamics.attach(_save_state)
+    dynamics.attach(md_logger)
+    dynamics.attach(_write_to_traj)
 
     # Run dynamics
     with md_logger:
-        npt.run(args.steps - start_frame)
+        dynamics.run(args.steps - start_frame)
 
     logger.info('Done!')
