@@ -1,6 +1,6 @@
 # Presets should define at least:
 #  description - Human-readable description of the parameter set
-#  cutoff - Cutoff energy corresponding to smallest gridpoints (in eV)
+#  cutoff - Cutoff energy corresponding to smallest gridpoints (in Ry
 #  basis_set - Name of the default basis set to use
 #  pseudo_potential - Name of the default potential to use
 
@@ -16,6 +16,12 @@ b97m:
         The `B97M-rV <http://xlink.rsc.org/?DOI=C6SC04711D>`_ metaGGA functional
     cutoff: 800
     basis_set: DZVP-MOLOPT-SR-GTH
+    pseudo_potential: GTH-BLYP
+lda:
+    description: |
+        LDA (PZ) with a small basis set and cutoff energy
+    cutoff: 250
+    basis_set: SZV-MOLOPT-SR-GTH
     pseudo_potential: GTH-BLYP
 pm6:
     description: Not yet used
