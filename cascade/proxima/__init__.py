@@ -33,7 +33,7 @@ class SerialLearningCalculator(Calculator):
 
     target_calc: BaseCalculator
         A physics-based calculator used to provide training data for learnable
-    learner: BaseLearnableForcefield
+    learner: BaseLearnableForcefieldf
         A class used to train the forcefield and generate an updated calculator
     models: list of State associated with learner
         One or more set of objects that define the architecture and weights of the
@@ -104,9 +104,11 @@ class SerialLearningCalculator(Calculator):
     """Total number of calls to the calculator"""
     target_invocations: int = 0
     """Total number of calls to the target calculator"""
-    blending_step = 0
+    blending_step: int = 0
     """Ranges from 0 to n_blending_steps, corresponding to
     full surrogate and full physics, respectively"""
+    lambda_target: float = 0.
+    """Ranges from 0-1, describing mixture between surrogate and physics"""
     model_version: int = 0
     """How many times the model has been retrained"""
 
@@ -123,10 +125,10 @@ class SerialLearningCalculator(Calculator):
     def learner(self) -> BaseLearnableForcefield:
         return self.parameters['learner']
     
-    @classmethod
+    @staticmethod
     def smoothing_function(x): 
         """Smoothing used for blending surrogate with physics"""
-        return 0.5*(np.cos(np.pi*x)) + 1
+        return 0.5*((np.cos(np.pi*x)) + 1)
 
     def retrain_surrogate(self):
         """Retrain the surrogate models using the currently-available data"""
@@ -205,11 +207,11 @@ class SerialLearningCalculator(Calculator):
         
         # Track blending parameters for surrogate/targe
         increment = +1 if self.used_surrogate else -1
-        self.blending_step = np.clip(self.blending_step + increment, 0, self.n_blending_steps)
-        lambda_target = self.smoothing_function((self.n_blending_steps - self.blending_step) / self.n_blend_steps)
+        self.blending_step = np.clip(self.blending_step + increment, 0, self.parameters['n_blending_steps'])
+        self.lambda_target = self.smoothing_function((self.parameters['n_blending_steps'] - self.blending_step) / self.parameters['n_blending_steps'])
         
         # Case: fully use the surrogate
-        if self.used_surrogate and self.blending_step == self.n_blending_steps:
+        if self.used_surrogate and self.blending_step == self.parameters['n_blending_steps']:
             logger.debug(f'The uncertainty metric is low enough ({unc_metric:.2e} < {self.threshold:.2e}). Using the surrogate result.')
             self.results = self.surrogate_calc.results.copy()
             return
@@ -226,7 +228,7 @@ class SerialLearningCalculator(Calculator):
             self.results = {}
             for k in results_surrogate.keys(): 
                 if k in results_target.keys(): 
-                    self.results[k] = lambda_target * results_target[k] + (1-lambda_target)*results_surrogate[k]
+                    self.results[k] = self.lambda_target * results_target[k] + (1-self.lambda_target)*results_surrogate[k]
                 else: 
                     # the surrogate may have some extra results which we store
                     self.results[k] = results_surrogate[k]
@@ -294,6 +296,7 @@ class SerialLearningCalculator(Calculator):
         output = {
             'threshold': self.threshold,
             'alpha': self.alpha,
+            'blending_step': int(self.blending_step), # not sure if necessary...
             'error_history': list(self.error_history),
             'new_points': self.new_points,
             'train_logs': self.train_logs,
@@ -314,6 +317,7 @@ class SerialLearningCalculator(Calculator):
 
         # Set the state of the threshold
         self.alpha = state['alpha']
+        self.blending_step = state['blending_step']
         self.threshold = state['threshold']
         self.new_points = state['new_points']
         self.error_history = deque(maxlen=self.parameters['history_length'])
