@@ -1,0 +1,35 @@
+&FORCE_EVAL
+   &DFT
+      CHARGE 0  ! Species should be charged balanced
+      UKS F
+      MULTIPLICITY $mult ! Unpaired electrons for the metal ion and surrounding ligands
+
+      &QS
+        METHOD GPW
+      &END QS
+
+      &SCF
+         ADDED_MOS 60
+         &SMEAR
+             WINDOW_SIZE [eV] 0.3
+         &END SMEAR
+         &MIXING
+            METHOD BROYDEN_MIXING
+            ALPHA 0.4
+            NMIXING 16
+         &END MIXING
+      &END SCF
+      &XC
+         &XC_FUNCTIONAL
+            &LDA_X
+            &END LDA_X
+            &LDA_C_PZ
+            &END LDA_C_PZ
+         &END XC_FUNCTIONAL
+      &END XC
+      &MGRID
+         NGRIDS 5
+         REL_CUTOFF [Ry] 60
+      &END MGRID
+   &END DFT
+&END FORCE_EVAL

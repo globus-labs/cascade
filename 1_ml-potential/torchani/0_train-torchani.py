@@ -89,7 +89,7 @@ if __name__ == "__main__":
     })
 
     run_hash = sha256(json.dumps(params).encode()).hexdigest()[-8:]
-    run_dir = Path('runs') / f'{datetime.now().isoformat(timespec='seconds').replace(":", "").replace("-", "")}-{run_hash}'
+    run_dir = Path('runs') / f'{datetime.now().isoformat(timespec="seconds").replace(":", "").replace("-", "")}-{run_hash}'
     run_dir.mkdir(parents=True)
 
     # Make a logger
