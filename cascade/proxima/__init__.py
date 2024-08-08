@@ -107,7 +107,7 @@ class SerialLearningCalculator(Calculator):
     """Total number of calls to the calculator"""
     target_invocations: int = 0
     """Total number of calls to the target calculator"""
-    blending_step: int = 0
+    blending_step: np.int64 = np.int_(0)
     """Ranges from 0 to n_blending_steps, corresponding to
     full surrogate and full physics, respectively"""
     lambda_target: float = 1.
@@ -210,7 +210,7 @@ class SerialLearningCalculator(Calculator):
 
         # Track blending parameters for surrogate/target
         increment = +1 if self.used_surrogate else -1
-        self.blending_step = min(max(self.blending_step + increment, 0), self.parameters['n_blending_steps'])  # clip
+        self.blending_step = np.clip(self.blending_step + increment, 0, self.parameters['n_blending_steps'])
         self.lambda_target = self.smoothing_function(self.blending_step / self.parameters['n_blending_steps'])
 
         # Case: fully use the surrogate
@@ -299,7 +299,7 @@ class SerialLearningCalculator(Calculator):
         output = {
             'threshold': self.threshold,
             'alpha': self.alpha,
-            'blending_step': self.blending_step,
+            'blending_step': int(self.blending_step),
             'error_history': list(self.error_history),
             'new_points': self.new_points,
             'train_logs': self.train_logs,
