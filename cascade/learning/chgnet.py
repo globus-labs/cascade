@@ -1,9 +1,6 @@
 """Training based on the `"ChargeNet" neural network <https://doi.org/10.1038/s42256-023-00716-3>`_"""
 import ase
 import numpy as np
-import pandas as pd
-import torch
-from chgnet.data.dataset import StructureData, get_loader
 
 from chgnet.model import CHGNet
 from pymatgen.io.ase import AseAtomsAdaptor
@@ -36,4 +33,3 @@ class CHGNetInterface(BaseLearnableForcefield[CHGNet]):
         forces = [r['f'][:len(a), :] for a, r in zip(atoms, preds)]
         stress = np.array([r['s'] for r in preds])
         return energies, forces, stress
-
