@@ -170,16 +170,13 @@ if __name__ == "__main__":
             learning_calc.set_state(pkl.load(fp))
         main_logger.info(f'Read model state from {state_path}')
 
-
     # Make functions which will track and store state of proxima
     def _save_state():
         with state_path.open('wb') as fs:
             pkl.dump(learning_calc.get_state(), fs)
 
-
     proxima_log_path = run_dir / 'proxima-log.json'
     start_time = perf_counter()
-
 
     def _log_proxima():
         global start_time
@@ -206,12 +203,10 @@ if __name__ == "__main__":
                 'model_version': learning_calc.model_version
             }), file=fp)
 
-
     def _write_to_traj():
         with Trajectory(traj_path, mode='a') as traj:
             can_atoms = canonicalize(atoms)
             traj.write(can_atoms)
-
 
     # Prepare the dynamics
     md_log_path = run_dir / 'md.log'
