@@ -43,3 +43,6 @@ ani = [
     'ignite',
     'h5py'
 ]
+chgnet = [
+    'chgnet',
+]

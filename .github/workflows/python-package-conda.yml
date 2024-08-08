@@ -24,7 +24,7 @@ jobs:
         mamba-version: "*"
     - name: Install test dependencies
       run: |
-        pip install -e .[test,ani]
+        pip install -e .[test,ani,chgnet]
     - name: Add quantum chemistry tools (Linux)
       run: |
            if [ "$RUNNER_OS" == "Linux" ]; then

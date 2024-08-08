@@ -91,7 +91,7 @@ class BaseLearnableForcefield(Generic[State]):
             return b.getvalue()
         return state
 
-    def get_model(self, model_msg: bytes) -> State:
+    def get_model(self, model_msg: bytes | State) -> State:
         """Load a model from the provided message and place on the CPU memory
 
         Args:
@@ -99,7 +99,9 @@ class BaseLearnableForcefield(Generic[State]):
         Returns:
             The model ready for use in a function
         """
-        return torch.load(BytesIO(model_msg), map_location='cpu')
+        if isinstance(model_msg, bytes):
+            return torch.load(BytesIO(model_msg), map_location='cpu')
+        return model_msg
 
     def evaluate(self,
                  model_msg: bytes | State,
