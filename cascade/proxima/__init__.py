@@ -35,7 +35,7 @@ class SerialLearningCalculator(Calculator):
 
     target_calc: BaseCalculator
         A physics-based calculator used to provide training data for learnable
-    learner: BaseLearnableForcefieldf
+    learner: BaseLearnableForcefield
         A class used to train the forcefield and generate an updated calculator
     models: list of State associated with learner
         One or more set of objects that define the architecture and weights of the
