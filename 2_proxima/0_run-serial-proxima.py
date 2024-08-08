@@ -63,7 +63,7 @@ if __name__ == "__main__":
     group.add_argument('--error-history', type=int, default=8, help='Number of past timesteps to use to inform controller')
     group.add_argument('--retrain-freq', type=int, default=8, help='How frequently to retrain the evaluator')
     group.add_argument('--min-target-frac', type=float, default=0.05, help='Minimum fraction of evaluations to use DFT')
-    group.add_argument('--n_blending_steps', type=int, default=0, help='How many steps to smoothly blend surrogate and DFT forces')
+    group.add_argument('--n-blending-steps', type=int, default=0, help='How many steps to smoothly blend surrogate and DFT forces')
 
     args = parser.parse_args()
     if args.file is not None:
