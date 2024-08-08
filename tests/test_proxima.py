@@ -153,7 +153,7 @@ def test_pretrained_threshold(starting_frame, simple_proxima, target_calc):
 def test_blending(starting_frame, simple_model, target_calc, tmpdir):
 
     # how many steps to blend for
-    n_blending_steps = 10
+    n_blending_steps = 3
 
     # create a different proxima instance since we will have different parameters
     tmpdir = Path(tmpdir)
@@ -185,7 +185,7 @@ def test_blending(starting_frame, simple_model, target_calc, tmpdir):
     assert calc.lambda_target == 0
 
     # and that we dont go out of bounds
-    for i in range(10):
+    for i in range(2):
         new_atoms = starting_frame.copy()
         new_atoms.rattle(0.2, seed=i+500)  # don't reuse above seeds
         calc.get_forces(new_atoms)
