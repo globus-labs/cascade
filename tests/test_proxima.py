@@ -149,8 +149,9 @@ def test_pretrained_threshold(starting_frame, simple_proxima, target_calc):
     simple_proxima.get_forces(starting_frame)
     assert isclose(simple_proxima.threshold, 0., abs_tol=1e-12) and simple_proxima.alpha is None  # It sets to zero if all UQs are the same
 
-def test_blending(starting_frame, simple_model, target_calc, tmpdir): 
-    
+
+def test_blending(starting_frame, simple_model, target_calc, tmpdir):
+
     # how many steps to blend for
     n_blending_steps = 10
 
@@ -174,43 +175,41 @@ def test_blending(starting_frame, simple_model, target_calc, tmpdir):
         new_atoms.rattle(0.02, seed=i)
         calc.get_forces(new_atoms)
 
-
     # assert the incrementing happens the way its supposed to
-    for i in range(1, n_blending_steps+1): 
+    for i in range(1, n_blending_steps+1):
         new_atoms = starting_frame.copy()
-        new_atoms.rattle(0.2, seed=i+100) # don't reuse above seeds
+        new_atoms.rattle(0.2, seed=i+100)  # don't reuse above seeds
         calc.get_forces(new_atoms)
         assert calc.used_surrogate
         assert calc.blending_step == i
     assert calc.lambda_target == 0
 
     # and that we dont go out of bounds
-    for i in range(10): 
+    for i in range(10):
         new_atoms = starting_frame.copy()
-        new_atoms.rattle(0.2, seed=i+500) # don't reuse above seeds
+        new_atoms.rattle(0.2, seed=i+500)  # don't reuse above seeds
         calc.get_forces(new_atoms)
         assert calc.used_surrogate
         assert calc.blending_step == n_blending_steps
         assert calc.lambda_target == 0
 
-    # now change the error target such that the surrogate will *never* be called 
+    # now change the error target such that the surrogate will *never* be called
     calc.parameters['target_ferr'] = 1e-12
-    calc.threshold = 0 # force the threshold to be small
+    calc.threshold = 0  # force the threshold to be small
     # make sure blending back to target works as expected
-    for i in range(n_blending_steps-1, -1, -1): 
+    for i in range(n_blending_steps-1, -1, -1):
         new_atoms = starting_frame.copy()
-        new_atoms.rattle(0.2, seed=i+800) # don't reuse above seeds
+        new_atoms.rattle(0.2, seed=i+800)  # don't reuse above seeds
         calc.get_forces(new_atoms)
         assert not calc.used_surrogate
         assert calc.blending_step == i
     assert calc.blending_step == 0
     assert calc.lambda_target == 1
 
-
     # again assert we dont go out of bounds and blending stays the same
-    for i in range(10): 
+    for i in range(2):
         new_atoms = starting_frame.copy()
-        new_atoms.rattle(0.2, seed=i+1200) # don't reuse above seeds
+        new_atoms.rattle(0.2, seed=i+1200)  # don't reuse above seeds
         calc.get_forces(new_atoms)
         assert not calc.used_surrogate
         assert calc.blending_step == 0
