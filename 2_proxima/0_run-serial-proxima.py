@@ -63,6 +63,7 @@ if __name__ == "__main__":
     group.add_argument('--error-history', type=int, default=8, help='Number of past timesteps to use to inform controller')
     group.add_argument('--retrain-freq', type=int, default=8, help='How frequently to retrain the evaluator')
     group.add_argument('--min-target-frac', type=float, default=0.05, help='Minimum fraction of evaluations to use DFT')
+    group.add_argument('--n-blending-steps', type=int, default=0, help='How many steps to smoothly blend surrogate and DFT forces')
 
     args = parser.parse_args()
     if args.file is not None:
@@ -76,7 +77,7 @@ if __name__ == "__main__":
     # Create the run directory
     _skip_keys = ('steps', 'training-device', 'file')
     params_hash = sha256(json.dumps([(k, v) for k, v in args.__dict__.items() if k not in _skip_keys]).encode()).hexdigest()[-8:]
-    run_name = f'{strc_name}-temp={args.temperature}-method={args.calculator}-{params_hash}'
+    run_name = f'{strc_name}-temp={args.temperature}-method={args.calculator}-blend={args.n_blending_steps}-{params_hash}'
     run_dir = Path('runs') / run_name
     run_dir.mkdir(exist_ok=True, parents=True)
 
@@ -159,6 +160,7 @@ if __name__ == "__main__":
         target_ferr=args.target_error,
         history_length=args.error_history,
         min_target_fraction=args.min_target_frac,
+        n_blending_steps=args.n_blending_steps,
         db_path=db_path,
     )
 
@@ -168,16 +170,13 @@ if __name__ == "__main__":
             learning_calc.set_state(pkl.load(fp))
         main_logger.info(f'Read model state from {state_path}')
 
-
     # Make functions which will track and store state of proxima
     def _save_state():
         with state_path.open('wb') as fs:
             pkl.dump(learning_calc.get_state(), fs)
 
-
     proxima_log_path = run_dir / 'proxima-log.json'
     start_time = perf_counter()
-
 
     def _log_proxima():
         global start_time
@@ -195,6 +194,8 @@ if __name__ == "__main__":
                 'used_surrogate': bool(learning_calc.used_surrogate),
                 'proxima_alpha': learning_calc.alpha,
                 'proxima_threshold': learning_calc.threshold,
+                'proxima_blending_step': int(learning_calc.blending_step),
+                'proxima_lambda_target': float(learning_calc.lambda_target),
                 'last_uncer': float(last_uncer),
                 'last_error': float(last_error),
                 'total_invocations': learning_calc.total_invocations,
@@ -202,12 +203,10 @@ if __name__ == "__main__":
                 'model_version': learning_calc.model_version
             }), file=fp)
 
-
     def _write_to_traj():
         with Trajectory(traj_path, mode='a') as traj:
             can_atoms = canonicalize(atoms)
             traj.write(can_atoms)
-
 
     # Prepare the dynamics
     md_log_path = run_dir / 'md.log'

@@ -1,6 +1,13 @@
 # 
-cp2k-run
-runinfo
+**/cp2k-run/*
+**/runinfo/*
+**/*.err
+**/*.out
+**/*.sh.o*
+**/*.sh.e*
+**/md/*
+**/relax/*
+**/runs/*
 
 
 # Byte-compiled / optimized / DLL files
