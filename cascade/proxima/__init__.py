@@ -24,6 +24,8 @@ class SerialLearningCalculator(Calculator):
     Determines when to switch between the physics and learnable calculator based
     on an uncertainty metric from the learnable calculator.
 
+    Will run `history_length` steps under physics before considering surrogate
+
     Switching can be applied smoothly, that is by taking a mixture of physics-
     and surrogate-derived quantities that moves slowly between full surrogate
     and full physics utilization over time. The rate of this smoothing is
@@ -56,7 +58,8 @@ class SerialLearningCalculator(Calculator):
     history_length: int
         The number of previous observations of the error between target and surrogate
         function to use when establishing a link between uncertainty metric
-        and the maximum observed error
+        and the maximum observed error. Will run exactly this number of target
+        calculations before considering using the surrogate
     min_target_fraction: float
         Minimum fraction of timesteps to run the target function.
         This value is used as the probability of running the target function
@@ -107,7 +110,7 @@ class SerialLearningCalculator(Calculator):
     blending_step: int = 0
     """Ranges from 0 to n_blending_steps, corresponding to
     full surrogate and full physics, respectively"""
-    lambda_target: float = 0.
+    lambda_target: float = 1.
     """Ranges from 0-1, describing mixture between surrogate and physics"""
     model_version: int = 0
     """How many times the model has been retrained"""
@@ -208,7 +211,7 @@ class SerialLearningCalculator(Calculator):
         # Track blending parameters for surrogate/targe
         increment = +1 if self.used_surrogate else -1
         self.blending_step = np.clip(self.blending_step + increment, 0, self.parameters['n_blending_steps'])
-        self.lambda_target = self.smoothing_function((self.parameters['n_blending_steps'] - self.blending_step) / self.parameters['n_blending_steps'])
+        self.lambda_target = self.smoothing_function(self.blending_step / self.parameters['n_blending_steps'])
         
         # Case: fully use the surrogate
         if self.used_surrogate and self.blending_step == self.parameters['n_blending_steps']:
