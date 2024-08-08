@@ -38,7 +38,7 @@ def simple_model(starting_frame) -> tuple[list[ANIModelContents], TorchANI]:
 
 @fixture()
 def target_calc() -> CP2K:
-    yield make_calculator('blyp')
+    yield make_calculator('lda')
 
 
 @fixture()
@@ -148,3 +148,4 @@ def test_pretrained_threshold(starting_frame, simple_proxima, target_calc):
     assert simple_proxima.threshold is None and simple_proxima.alpha is None
     simple_proxima.get_forces(starting_frame)
     assert isclose(simple_proxima.threshold, 0., abs_tol=1e-12) and simple_proxima.alpha is None  # It sets to zero if all UQs are the same
+
