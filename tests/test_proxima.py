@@ -149,3 +149,36 @@ def test_pretrained_threshold(starting_frame, simple_proxima, target_calc):
     simple_proxima.get_forces(starting_frame)
     assert isclose(simple_proxima.threshold, 0., abs_tol=1e-12) and simple_proxima.alpha is None  # It sets to zero if all UQs are the same
 
+def test_blending(starting_frame, simple_model, target_calc, tmpdir): 
+    
+    # how many steps to blend for
+    n_blending_steps = 10
+
+    # create a different proxima instance since we will have different parameters
+    tmpdir = Path(tmpdir)
+    model_msgs, learner = simple_model
+    calc = SerialLearningCalculator(
+        target_calc=target_calc,
+        learner=learner,
+        models=model_msgs,
+        train_kwargs={'num_epochs': 4, 'batch_size': 4},
+        db_path=tmpdir / 'data.db',
+        n_blending_steps=n_blending_steps,
+        min_target_fraction=0,
+        target_ferr=1e100,  # Should always use the ML
+    )
+
+    for i in range(n_blending_steps): 
+        new_atoms = starting_frame.copy()
+        new_atoms.rattle(0.2, seed=i)
+        calc.get_forces(new_atoms)
+        if i > 0: # first invocation will use the target calc to estimate alpha
+            assert calc.used_surrogate
+            assert calc.blending_step == i
+
+    """
+    Todo, assert: 
+        * it works in the other direction
+        * anything else?
+    """
+
