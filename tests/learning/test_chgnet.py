@@ -26,3 +26,19 @@ def test_inference(chgnet, example_data):
     assert np.isclose(atoms.get_potential_energy(), energy[0]).all()
     assert np.isclose(atoms.get_forces(), forces[0]).all()
     assert np.isclose(atoms.get_stress(voigt=False), stresses[0]).all()
+
+
+def test_training(example_data, chgnet):
+    """Run example network on test data"""
+
+    # Get baseline predictions, train
+    cgi = CHGNetInterface()
+    orig_e, orig_f, orig_s = cgi.evaluate(chgnet, example_data)
+    model_msg, log = cgi.train(chgnet, example_data, example_data, 2, batch_size=2)
+    assert len(log) == 2
+
+    # Make sure the predictions change
+    new_e, new_f, new_s = cgi.evaluate(model_msg, example_data)
+    assert not np.isclose(new_e, orig_e).all()
+    for new, orig in zip(new_f, orig_f):
+        assert not np.isclose(new, orig).all()
