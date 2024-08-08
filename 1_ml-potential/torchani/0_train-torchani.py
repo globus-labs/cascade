@@ -157,7 +157,7 @@ if __name__ == "__main__":
     eval_time = perf_counter()
     pred_e, pred_f, pred_s = ani.evaluate(model_msg, test_atoms, batch_size=args.batch_size, device='cuda')
     eval_time = perf_counter() - eval_time
-    logger.info('Inference complete. Computing performance')
+    logger.info('Inference complete. Computing performance on train set')
 
     true_n = np.array([len(a) for a in test_atoms])
     true_e = np.array([a.get_potential_energy() for a in test_atoms])
@@ -175,6 +175,8 @@ if __name__ == "__main__":
         'force_max_error': float(np.mean([np.linalg.norm(t - p, axis=1).max() for t, p in zip(true_f, pred_f)])),
         'stress_mae': float(np.abs(true_s.flatten() - pred_s.flatten()).mean())
     }
+    for key, value in train_log.iloc[-1].to_dict().items():
+        performance[f'last_epoch.{key}'] = value
 
     # Store the model, predictions, and ground truth
     logger.info('Saving model and results')
