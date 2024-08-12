@@ -79,7 +79,7 @@ if __name__ == "__main__":
     strc_name = strc_path.with_suffix('').name
 
     # Create the run directory
-    _skip_keys = ('steps', 'training-device', 'file')
+    _skip_keys = ('steps', 'training-device', 'file', 'cascade_commit', 'my_commit', 'start_time')
     params_hash = sha256(json.dumps([(k, v) for k, v in args.__dict__.items() if k not in _skip_keys]).encode()).hexdigest()[-8:]
     run_name = f'{strc_name}-temp={args.temperature}-method={args.calculator}-blend={args.n_blending_steps}-{params_hash}'
     run_dir = Path('runs') / run_name
