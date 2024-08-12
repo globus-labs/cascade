@@ -59,6 +59,7 @@ if __name__ == "__main__":
     group.add_argument('--training-batch-size', type=int, default=32, help='Which device to use for training models')
     group.add_argument('--training-max-size', type=int, default=None, help='Maximum training set size to use when updating models')
     group.add_argument('--training-recency-bias', type=float, default=1., help='Factor by which to favor recent data when reducing training set size')
+    group.add_argument('--training-learning-rate', type=float, default=1., help='Learning rate used in model training')
     group.add_argument('--training-device', default='cuda', help='Which device to use for training models')
 
     group = parser.add_argument_group(title='Proxima', description="Settings for learning on the fly")
@@ -165,6 +166,7 @@ if __name__ == "__main__":
             'num_epochs': args.training_epochs,
             'batch_size': args.training_batch_size,
             'reset_weights': not args.online_training,
+            'learning_rate': args.training_learning_rate,
             'device': args.training_device},  # Configuration for the training routines
         train_freq=args.retrain_freq,
         train_max_size=args.training_max_size,
