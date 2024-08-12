@@ -1,6 +1,7 @@
 """Training based on the `"ChargeNet" neural network <https://doi.org/10.1038/s42256-023-00716-3>`_"""
-import os
 from contextlib import redirect_stdout
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import ase
@@ -57,6 +58,7 @@ class CHGNetInterface(BaseLearnableForcefield[CHGNet]):
                  batch_size: int = 64,
                  device: str = 'cpu') -> (np.ndarray, list[np.ndarray], np.ndarray):
         model = self.get_model(model_msg)
+        model.to(device)
 
         # Convert structures to Pymatgen
         structures = [AseAtomsAdaptor.get_structure(a) for a in atoms]
@@ -76,7 +78,7 @@ class CHGNetInterface(BaseLearnableForcefield[CHGNet]):
         return energies, forces, stress
 
     def train(self,
-              model_msg: bytes | State,
+              model_msg: bytes | CHGNet,
               train_data: list[ase.Atoms],
               valid_data: list[ase.Atoms],
               num_epochs: int,
@@ -90,30 +92,46 @@ class CHGNetInterface(BaseLearnableForcefield[CHGNet]):
               **kwargs) -> tuple[bytes, pd.DataFrame]:
         model = self.get_model(model_msg)
 
-        with open(os.devnull, 'w') as fp, redirect_stdout(fp):
-            # Make the data loaders
-            train_dataset = make_chgnet_dataset(train_data)
-            valid_dataset = make_chgnet_dataset(valid_data)
-            train_loader = get_loader(train_dataset, batch_size=batch_size)
-            valid_loader = get_loader(valid_dataset, batch_size=batch_size)
+        # Reset weights, if needed
+        if reset_weights:
+            def init_params(m):
+                if hasattr(m, 'reset_parameters'):
+                    m.reset_parameters()
 
-            # Run the training
-            trainer = Trainer(
-                model=model,
-                targets='efs',
-                criterion="Huber",
-                force_loss_ratio=force_weight,
-                stress_loss_ratio=stress_weight,
-                epochs=num_epochs,
-                learning_rate=learning_rate,
-                use_device=device,
-                print_freq=num_epochs + 1
-            )
-            trainer.train(train_loader, valid_loader, train_composition_model=True)
-            model.to('cpu')
+            model.apply(init_params)
 
-            # Store the results
-            best_model = trainer.get_best_model()
+        with TemporaryDirectory(prefix='chgnet_') as tmpdir:
+            tmpdir = Path(tmpdir)
+            with open(tmpdir / 'chgnet.stdout', 'w') as fp, redirect_stdout(fp):
+                # Make the data loaders
+                train_dataset = make_chgnet_dataset(train_data)
+                valid_dataset = make_chgnet_dataset(valid_data)
+                train_loader = get_loader(train_dataset, batch_size=batch_size)
+                valid_loader = get_loader(valid_dataset, batch_size=batch_size)
+
+                # Fit the atomic reference energies
+                model.composition_model.fit(
+                    train_dataset.structures,
+                    train_dataset.energies
+                )
+
+                # Run the training
+                trainer = Trainer(
+                    model=model,
+                    targets='efs',
+                    criterion="Huber",
+                    force_loss_ratio=force_weight,
+                    stress_loss_ratio=stress_weight,
+                    epochs=num_epochs,
+                    learning_rate=learning_rate,
+                    use_device=device,
+                    print_freq=num_epochs + 1
+                )
+                trainer.train(train_loader, valid_loader, train_composition_model=True, save_dir=str(tmpdir))
+                model.to('cpu')
+
+                # Store the results
+                best_model = trainer.get_best_model()
 
         log = {}
         for key_1, history_1 in trainer.training_history.items():
