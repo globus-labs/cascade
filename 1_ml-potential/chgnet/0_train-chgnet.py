@@ -13,7 +13,9 @@ import numpy as np
 import torch
 from ase import Atoms
 from ase.io import read, iread
+from chgnet.model import CHGNet
 
+from cascade.learning.chgnet import CHGNetInterface
 from cascade.learning.torchani import build, TorchANI
 
 if __name__ == "__main__":
@@ -30,21 +32,10 @@ if __name__ == "__main__":
     group.add_argument('--num-epochs', default=32, help='Number of training epochs', type=int)
     group.add_argument('--batch-size', default=64, help='Number of records per batch', type=int)
     group.add_argument('--learning-rate', default=1e-4, help='Learning rate for optimizer', type=float)
-    group.add_argument('--loss-weights', default=(1, 10, 100), help='Weights for the energy, forces, and stress', nargs=3, type=float)
-    group.add_argument('--scale-energies', action='store_true', help='Whether to scale the weights to match the mean/std of training data.')
+    group.add_argument('--loss-weights', default=(1, 1, 0.1), help='Weights for the energy, forces, and stress', nargs=3, type=float)
 
-    group = parser.add_argument_group(title='Model Architecture', description='Parameters describing the ANI model')
-    group.add_argument('--hidden-layers', default=2, help='Number of hidden layers in the output network', type=int)
-    group.add_argument('--hidden-units', default=128, help='Number of units in the first hidden layer of output networks', type=int)
-    group.add_argument('--hidden-decay', default=0.8, help='Decrease in number of units between hidden layers', type=float)
-    group.add_argument('--radial-cutoff', default=5.2, help='Maximum distance of radial terms', type=float)
-    group.add_argument('--angular-cutoff', default=3.5, help='Maximum distance of angular terms', type=float)
-    group.add_argument('--radial-eta', default=16, help='Width parameter of radial terms', type=float)
-    group.add_argument('--angular-eta', default=8, help='Width parameter of angular terms', type=float)
-    group.add_argument('--angular-zeta', default=8, help='Angular width parameter of angular terms', type=float)
-    group.add_argument('--num-radial-terms', default=16, help='Number of radial terms', type=int)
-    group.add_argument('--num-angular-dist-terms', default=4, help='Number of radial steps of angular terms', type=int)
-    group.add_argument('--num-angular-angl-terms', default=8, help='Number of radial steps of angular terms', type=int)
+    group = parser.add_argument_group(title='Model Architecture', description='Parameters describing the CHGNet model')
+    group.add_argument('--reset-weights', action='store_true', help='Whether to reset the pre-trained weights')
     args = parser.parse_args()
 
     # Load the training data
@@ -105,40 +96,16 @@ if __name__ == "__main__":
         json.dump(params, fp, indent=2)
 
     # Assemble the model
-    species = set()
-    for atoms in train_atoms:
-        species.update(atoms.symbols)
-    species = sorted(species)
-    atom_energies = dict((s, 0) for s in species)  # Guess zero to start
-    logger.info(f'Found {len(species)} species: {", ".join(species)}')
-
-    aev_computer = build.make_aev_computer(
-        radial_cutoff=args.radial_cutoff,
-        angular_cutoff=args.angular_cutoff,
-        radial_eta=args.radial_eta,
-        angular_eta=args.angular_eta,
-        zeta=args.angular_zeta,
-        num_radial_terms=args.num_radial_terms,
-        num_angular_dist_terms=args.num_angular_dist_terms,
-        num_angular_angl_terms=args.num_angular_angl_terms,
-        species=species
-    )
-    aev_computer.to('cuda')
-    aev_length = aev_computer.aev_length
-    logger.info(f'Made an AEV computer which produces {aev_length} features')
-
-    nn = build.make_output_nets(species, aev_computer, args.hidden_units, args.hidden_layers, args.hidden_decay)
-
-    model = torch.nn.Sequential(aev_computer, nn).to('cuda')
-    total_params = sum(np.prod(p.size()) for p in model.parameters(recurse=True))
-    logger.info(f'Made the ANI model with {total_params} parameters. Training')
+    model = CHGNet.load(use_device='cpu')
+    model.to('cuda')
+    logger.info('Loaded model and moved it to CUDA')
 
     # Train using the wrapper function from Cascade
-    ani = TorchANI()
+    ani = CHGNetInterface()
     loss_e, loss_f, loss_s = args.loss_weights
     train_time = perf_counter()
     model_msg, train_log = ani.train(
-        (aev_computer, nn, atom_energies),
+        model,
         train_data=train_atoms,
         valid_data=valid_atoms,
         num_epochs=args.num_epochs,
@@ -146,8 +113,7 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         force_weight=loss_f / loss_e,
         stress_weight=loss_s / loss_e,
-        reset_weights=True,
-        scale_energies=args.scale_energies,
+        reset_weights=args.reset_weights,
         device='cuda'
     )
     train_time = perf_counter() - train_time

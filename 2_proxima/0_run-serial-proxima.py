@@ -17,8 +17,10 @@ from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase import units, io
 from ase.db import connect
 from ase.md import MDLogger, VelocityVerlet
+from chgnet.model import CHGNet
 from gitinfo import get_git_info
 
+from cascade.learning.chgnet import CHGNetInterface
 from cascade.proxima import SerialLearningCalculator
 from cascade.calculator import make_calculator
 from cascade.learning.torchani import TorchANI
@@ -48,6 +50,7 @@ if __name__ == "__main__":
     group.add_argument('--seed', type=int, default=1, help='Random seed used to start dynamics')
 
     group = parser.add_argument_group(title="Learner Details", description="Configure the surrogate model")
+    group.add_argument('--model-type', choices=['ani', 'chgnet'], help='Which type of machine learning model to train.')
     group.add_argument('--initial-model', help='Path to initial model in message format. Code will generate a network with default settings if none provided')
     group.add_argument('--initial-data', nargs='*', default=(), help='Path to data files (e.g., ASE .traj and .db) containing initial training data')
     group.add_argument('--ensemble-size', type=int, default=2, help='Number of models to train on different data segments')
@@ -114,20 +117,29 @@ if __name__ == "__main__":
         main_logger.info(f'Training database has {len(db)} entries.')
 
     # Set up the models
-    learner = TorchANI()
+    learner = {
+        'ani': TorchANI(),
+        'chgnet': CHGNetInterface(),
+    }[args.model_type]
+    main_logger.info(f'Ready to train a {args.model_type} model')
 
     atoms = io.read(strc_path)
-    if args.initial_model is None:
+    if args.initial_model is not None:
+        model = Path(args.initial_model).read_bytes()
+        models = [model] * args.ensemble_size
+        logger.info(f'Loaded a model from {args.initial_model}')
+    elif args.model_type == 'ani':
         species = list(set(atoms.symbols))
         aev = make_aev_computer(species)
 
         models = [(aev, make_output_nets(species, aev), dict((s, 0.) for s in species))
                   for i in range(args.ensemble_size)]
         logger.info('Created new default TorchANI networks')
+    elif args.model_type == 'chgnet':
+        models = [CHGNet.load()] * args.ensemble_size
+        logger.info('Loaded the pretrained weights for CHGNet')
     else:
-        model = Path(args.initial_model).read_bytes()
-        models = [model] * args.ensemble_size
-        logger.info(f'Loaded a model from {args.initial_model}')
+        raise NotImplemented(f'Default models not implemented for {args.model_type}')
 
     # Get either the last step from the traj, or thermalize the starting structure
     traj_path = run_dir / 'md.traj'
