@@ -1,5 +1,8 @@
+from contextlib import redirect_stdout
+from os import devnull
+
 from chgnet.model import CHGNet
-from pytest import fixture
+from pytest import fixture, mark
 import numpy as np
 
 from cascade.learning.chgnet import CHGNetInterface
@@ -7,7 +10,8 @@ from cascade.learning.chgnet import CHGNetInterface
 
 @fixture()
 def chgnet() -> CHGNet:
-    return CHGNet.load(use_device='cpu')
+    with open(devnull, 'w') as fp, redirect_stdout(fp):
+        return CHGNet.load(use_device='cpu', verbose=False)
 
 
 def test_inference(chgnet, example_data):
@@ -28,13 +32,14 @@ def test_inference(chgnet, example_data):
     assert np.isclose(atoms.get_stress(voigt=False), stresses[0]).all()
 
 
-def test_training(example_data, chgnet):
+@mark.parametrize('reset_weights', [False, True])
+def test_training(example_data, chgnet, reset_weights):
     """Run example network on test data"""
 
     # Get baseline predictions, train
     cgi = CHGNetInterface()
     orig_e, orig_f, orig_s = cgi.evaluate(chgnet, example_data)
-    model_msg, log = cgi.train(chgnet, example_data, example_data, 2, batch_size=2)
+    model_msg, log = cgi.train(chgnet, example_data, example_data, 2, batch_size=2, reset_weights=reset_weights)
     assert len(log) == 2
 
     # Make sure the predictions change
