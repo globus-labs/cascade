@@ -231,10 +231,9 @@ class SerialLearningCalculator(Calculator):
             results_surrogate = self.surrogate_calc.results
             self.results = {}
             for k in results_surrogate.keys():
-                if k in results_target.keys(): # blend on the intersection of keys
+                if k in results_target.keys():  # blend on the intersection of keys
                     r_target, r_surrogate = results_target[k], results_surrogate[k]
-                    
-                    # handle differences in voigt vs (3,3) stress convention
+                    #  handle differences in voigt vs (3,3) stress convention
                     if k == 'stress' and r_target.shape != r_surrogate.shape:
                         r_target, r_surrogate = map(to_voigt, [r_target, r_surrogate])
                     self.results[k] = self.lambda_target*r_target + (1-self.lambda_target)*r_surrogate
