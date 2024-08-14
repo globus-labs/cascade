@@ -1,6 +1,7 @@
 from io import StringIO
 from copy import deepcopy
 
+import numpy as np
 import ase
 from ase import Atoms
 from ase.calculators.calculator import Calculator
@@ -76,3 +77,19 @@ def apply_calculator(
         atoms.get_forces()
         traj[i] = canonicalize(atoms)
     return traj
+
+
+def to_voigt(stress: np.ndarray) -> np.ndarray:
+    """Converts a (3,3) stress tensor to voigt form, or do nothing if its already in this form
+
+    Args:
+        stress: a stess tensor of shape (3,3) or (6,), in which case this function is a no-op
+    Returns:
+        stress: a (6,) stress tensor in voigt form
+    """
+    if stress.shape == (3, 3):
+        stress = np.array([stress[0, 0], stress[1, 1], stress[2, 2],
+                           stress[1, 2], stress[0, 2], stress[0, 1]])
+    elif stress.shape != (6, ):
+        raise ValueError(f"Stress tensor must either be of shape (3,3) or (6,), got {stress.shape}")
+    return stress
