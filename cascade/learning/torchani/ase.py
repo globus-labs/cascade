@@ -8,7 +8,6 @@
 # TODO (wardlt): TorchANI is in a code freeze as they refactor, so I'm copying my alterations over to here
 #  They are originally from https://github.com/aiqm/torchani/blob/17204c6dccf6210753bc8c0ca4c92278b60719c9/torchani/ase.py
 
-import numpy as np
 import torch
 from ase.calculators.calculator import all_properties
 
@@ -103,8 +102,4 @@ class Calculator(ase.calculators.calculator.Calculator):
         if 'stress' in properties:
             volume = self.atoms.get_volume()
             stress = torch.autograd.grad(energy.squeeze(), scaling)[0] / volume
-            stress = stress.cpu().numpy()
-            # put in voigt form to match ASE defaults
-            stress = np.array([stress[0, 0], stress[1, 1], stress[2, 2],
-                               stress[1, 2], stress[0, 2], stress[0, 1]])
-            self.results['stress'] = stress
+            self.results['stress'] = stress.cpu().numpy()
