@@ -56,6 +56,10 @@ class SerialLearningCalculator(Calculator):
     target_ferr: float
         Target maximum difference between the forces predicted by the target
         calculator and the learnable surrogate
+    train_from_original: bool
+        Whether to use the original models provided when creating the class as the starting
+        point for training rather than the models produced from the most-recent training.
+        The calculator will preserve the original models only if ``True``.
     history_length: int
         The number of previous observations of the error between target and surrogate
         function to use when establishing a link between uncertainty metric
@@ -67,7 +71,7 @@ class SerialLearningCalculator(Calculator):
         even if it need not be used based on the UQ metric.
     n_blending_steps: int
         How many timesteps to smoothly combine target and surrogate forces.
-        When the threshold is satisy we apply an increasing mixture of ML and
+        When the threshold is satisfied we apply an increasing mixture of ML and
         target forces.
     db_path: Path or str
         Database in which to store the results of running the target calculator,
@@ -83,6 +87,7 @@ class SerialLearningCalculator(Calculator):
         'train_freq': 1,
         'train_max_size': None,
         'train_recency_bias': 1.,
+        'train_from_original': False,
         'target_ferr': 0.1,  # TODO (wardlt): Make the error metric configurable
         'min_target_fraction': 0.,
         'n_blending_steps': 0,
@@ -115,6 +120,8 @@ class SerialLearningCalculator(Calculator):
     """Ranges from 0-1, describing mixture between surrogate and physics"""
     model_version: int = 0
     """How many times the model has been retrained"""
+    models: Optional[list] = None
+    """Ensemble of models from the latest training invocation. The same as ``parameters['models']`` if `train_from_original`"""
 
     def set(self, **kwargs):
         # TODO (wardlt): Fix ASE such that it does not try to do a numpy comparison on everything
@@ -132,10 +139,16 @@ class SerialLearningCalculator(Calculator):
     @staticmethod
     def smoothing_function(x):
         """Smoothing used for blending surrogate with physics"""
-        return 0.5*((np.cos(np.pi*x)) + 1)
+        return 0.5 * ((np.cos(np.pi * x)) + 1)
 
     def retrain_surrogate(self):
         """Retrain the surrogate models using the currently-available data"""
+        # Determine where the updated models will be stored
+        model_list = self.models = (
+            [None] * len(self.parameters['models'])  # Create a new list
+            if self.parameters['train_from_original'] else
+            self.parameters['models']  # Edit it in place
+        )
 
         # Load in the data from the db
         db_path = self.parameters['db_path']
@@ -154,7 +167,6 @@ class SerialLearningCalculator(Calculator):
             return
 
         # Train each model using a different, randomly-selected subset of the data
-        model_list = self.parameters['models']  # Edit it in place
         self.train_logs = []
         for i, model_msg in enumerate(self.parameters['models']):
             # Assign splits such that the same entries do not switch between train/validation as test grows
@@ -166,7 +178,8 @@ class SerialLearningCalculator(Calculator):
             # Downselect training set if it is larger than the fixed maximum
             train_max_size = self.parameters['train_max_size']
             if train_max_size is not None and len(train_atoms) > train_max_size:
-                valid_size = train_max_size * len(valid_atoms) // len(train_atoms)  # Decrease the validation size proportionally
+                # Decrease the validation size proportionally
+                valid_size = train_max_size * len(valid_atoms) // len(train_atoms)
 
                 train_weights = np.geomspace(1, self.parameters['train_recency_bias'], len(train_atoms))
                 train_ids = rng.choice(len(train_atoms), size=(train_max_size,), p=train_weights / train_weights.sum(), replace=False)
@@ -193,7 +206,7 @@ class SerialLearningCalculator(Calculator):
         if self.surrogate_calc is None:
             self.retrain_surrogate()
             self.surrogate_calc = EnsembleCalculator(
-                calculators=[self.learner.make_calculator(m, self.parameters['device']) for m in self.parameters['models']]
+                calculators=[self.learner.make_calculator(m, self.parameters['device']) for m in self.models]
             )
         self.surrogate_calc.calculate(atoms, properties + ['forces'], system_changes)  # Make sure forces are computed too
 
@@ -236,7 +249,7 @@ class SerialLearningCalculator(Calculator):
                     #  handle differences in voigt vs (3,3) stress convention
                     if k == 'stress' and r_target.shape != r_surrogate.shape:
                         r_target, r_surrogate = map(to_voigt, [r_target, r_surrogate])
-                    self.results[k] = self.lambda_target*r_target + (1-self.lambda_target)*r_surrogate
+                    self.results[k] = self.lambda_target * r_target + (1 - self.lambda_target) * r_surrogate
                 else:
                     # the surrogate may have some extra results which we store
                     self.results[k] = results_surrogate[k]
@@ -313,7 +326,7 @@ class SerialLearningCalculator(Calculator):
             'model_version': self.model_version
         }
         if self.surrogate_calc is not None:
-            output['models'] = [self.learner.serialize_model(s) for s in self.parameters['models']]
+            output['models'] = [self.learner.serialize_model(s) for s in self.models]
         return output
 
     def set_state(self, state: dict[str, Any]):
@@ -337,7 +350,11 @@ class SerialLearningCalculator(Calculator):
 
         # Remake the surrogate calculator, if available
         if 'models' in state:
-            self.parameters['models'] = state['models']
+            # Store in a different place depending on whether we are training from original or latest
+            if self.parameters['train_from_original']:
+                self.models = state['models']
+            else:
+                self.models = self.parameters['models'] = state['models']  # Both are the same
             self.surrogate_calc = EnsembleCalculator(
                 calculators=[self.learner.make_calculator(m, self.parameters['device']) for m in state['models']]
             )
