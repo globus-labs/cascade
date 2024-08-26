@@ -318,7 +318,7 @@ class SerialLearningCalculator(Calculator):
             'threshold': self.threshold,
             'alpha': self.alpha,
             'blending_step': int(self.blending_step),
-            'error_history': list(self.error_history),
+            'error_history': list(self.error_history) if self.error_history is not None else [],
             'new_points': self.new_points,
             'train_logs': self.train_logs,
             'total_invocations': self.total_invocations,
