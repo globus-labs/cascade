@@ -56,7 +56,7 @@ class CHGNetInterface(BaseLearnableForcefield[CHGNet]):
                  model_msg: bytes | CHGNet,
                  atoms: list[ase.Atoms],
                  batch_size: int = 64,
-                 device: str = 'cpu') -> (np.ndarray, list[np.ndarray], np.ndarray):
+                 device: str = 'cpu') -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
         model = self.get_model(model_msg)
         model.to(device)
 

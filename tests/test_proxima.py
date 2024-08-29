@@ -179,7 +179,7 @@ def test_blending(starting_frame, simple_model, target_calc, tmpdir):
     for i in range(1, n_blending_steps+1):
         new_atoms = starting_frame.copy()
         new_atoms.rattle(0.2, seed=i+100)  # don't reuse above seeds
-        calc.get_forces(new_atoms)
+        calc.get_stress(new_atoms)  # test blending of stresses since this caused errors in the past
         assert calc.used_surrogate
         assert calc.blending_step == i
     assert calc.lambda_target == 0
