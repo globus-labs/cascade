@@ -2,10 +2,12 @@ from io import StringIO
 from copy import deepcopy
 
 import numpy as np
+from tqdm.auto import tqdm
 import ase
 from ase import Atoms
 from ase.calculators.calculator import Calculator
 from ase.calculators.singlepoint import SinglePointCalculator
+from ase.geometry import get_distances
 
 
 # Taken from ExaMol
@@ -93,3 +95,77 @@ def to_voigt(stress: np.ndarray) -> np.ndarray:
     elif stress.shape != (6, ):
         raise ValueError(f"Stress tensor must either be of shape (3,3) or (6,), got {stress.shape}")
     return stress
+
+
+def unwrap_trajectory(traj: list[ase.Atoms]) -> np.ndarray:
+    """Unwraps a trajectory from periodic boundary conditions
+    
+    Does so by incrementing finding the minimum image displacement vector between 
+    time-adjacent frames and using this displacement to advance positions over time
+
+    Args: 
+        traj: a dynamics trajectory of length n_frames run with PBC
+    Returns: 
+        a numpy array (n_frames, n_atoms, 3) of frames unwrapped from PBC
+    """
+
+    out = []
+    
+    # save initial positions 
+    r = traj[0].positions.copy()
+    out.append(r)
+    
+    # iterate over time-adjacent frames
+    for i in range(1, len(traj)):
+
+        # (n, n, 3) - dr is the displacement *tensor* 
+        # between every pair of atoms across the frames
+        dr, _ = get_distances(traj[i-1].positions, 
+                              traj[i].positions, 
+                              cell=traj[i].cell,  # this is scary what if the cell is changing
+                              pbc=True)
+        
+        # (n, 3) - just take the displacement of atom_i across time
+        dr = np.diagonal(dr).T
+        
+        # update and save positions
+        r += dr
+        out.append(r.copy())
+    
+    return np.asarray(out)
+
+
+def calculate_sqared_disp(traj: np.ndarray) -> np.ndarray: 
+    """Calculate the MSD time correlation function
+    
+    Calculates the MSD for every length of time accessible in the trajectory, 
+    using every eligable timestep pair for that length of time
+
+    Args: 
+        traj: a numpy array of positions (n_frames, n_atoms, 3)
+              **!important:** make sure these positions are unwrapped from PBC
+    Returns: 
+        a numpy array of mean squared displacement (n_frames, )
+    """
+    n_frames, n_atoms, _ = traj.shape
+    step_sizes = np.arange(1, n_frames)
+    r_step = np.zeros_like(step_sizes, float)
+    
+    for step_size in tqdm(step_sizes, 'Calculating MSD for step size'):
+        # this is the number of steps of size step_size in our simulation
+        n_steps = n_frames-step_size
+
+        # we'll just store every delta squared
+        # this is inneficient, but I know its correct
+        disp_sq = np.zeros((n_atoms, n_steps), float)
+        # for every possible starting position
+        for start_ix in np.arange(n_steps):
+            # this is the corresponding stop position
+            stop_ix = start_ix + step_size
+            # stop - start
+            dr = traj[stop_ix, :] - traj[start_ix, :]
+            disp_sq[:, start_ix] = (dr * dr).sum(1)
+        # subtract 1 since its zero indexed
+        r_step[step_size-1] = disp_sq.mean()
+    return r_step
+    
