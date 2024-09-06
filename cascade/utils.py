@@ -174,3 +174,9 @@ def calculate_sqared_disp(traj: np.ndarray, n_jobs=None, verbose=1) -> np.ndarra
     p = Parallel(n_jobs=n_jobs, verbose=verbose)
     out = p(f(s) for s in step_sizes)
     return np.asarray(out)
+
+
+def set_volume(frame: ase.Atoms, vol: float) -> None:
+    """Set the volume of a cell and move the atoms accordingly"""
+    scalar = (vol / frame.get_volume())**(1/3)
+    frame.set_cell(scalar*frame.cell, scale_atoms=True)
