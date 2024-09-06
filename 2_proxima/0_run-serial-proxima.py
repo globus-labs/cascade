@@ -25,7 +25,7 @@ from cascade.proxima import SerialLearningCalculator
 from cascade.calculator import make_calculator
 from cascade.learning.torchani import TorchANI
 from cascade.learning.torchani.build import make_output_nets, make_aev_computer
-from cascade.utils import canonicalize
+from cascade.utils import canonicalize, set_volume
 import cascade
 
 main_logger = logging.getLogger('main')
@@ -48,6 +48,8 @@ if __name__ == "__main__":
                        help='Characteristic time for pressure controller in NPT, assuming a bulk modulus of 100 GPa. Units: fs')
     group.add_argument('--steps', type=int, default=128, help='Number of dynamics steps to run')
     group.add_argument('--seed', type=int, default=1, help='Random seed used to start dynamics')
+    group.add_argument('--bulk-modulus', type=float, default=98., help='Used for calculating pfactor in npt')
+    group.add_argument('--initial-volume', type=float, default=None, help='Rescale the cell and atom positions. Useful if, e.g., going from NPT -> NVT')
 
     group = parser.add_argument_group(title="Learner Details", description="Configure the surrogate model")
     group.add_argument('--model-type', choices=['ani', 'chgnet'], help='Which type of machine learning model to train.')
@@ -123,7 +125,7 @@ if __name__ == "__main__":
     }[args.model_type]
     main_logger.info(f'Ready to train a {args.model_type} model')
 
-    atoms = io.read(strc_path)
+    atoms = io.read(strc_path, index='-1')
     if args.initial_model is not None:
         model = Path(args.initial_model).read_bytes()
         models = [model] * args.ensemble_size
@@ -148,9 +150,17 @@ if __name__ == "__main__":
         main_logger.info(f'Loaded last structure from {traj_path}')
         start_frame = len(io.read(traj_path, ':'))
     else:
-        MaxwellBoltzmannDistribution(atoms, temperature_K=args.temperature, rng=np.random.RandomState(args.seed))
-        main_logger.info(f'Initialized velocities to T={args.temperature}')
+        has_velocities = np.count_nonzero(atoms.get_velocities())
+        if has_velocities:
+            main_logger.info('Velocities detected, not thermalizing')
+        else:
+            MaxwellBoltzmannDistribution(atoms, temperature_K=args.temperature, rng=np.random.RandomState(args.seed))
+            main_logger.info(f'Initialized velocities to T={args.temperature}')
         start_frame = 0
+
+    if args.initial_volume:
+        main_logger.info(f'Setting cell volume to V={args.initial_volume}')
+        set_volume(atoms, args.initial_volume)
 
     # Set up the proxima calculator
     calc_dir = Path('cp2k-run') / params_hash
@@ -239,7 +249,7 @@ if __name__ == "__main__":
                        temperature_K=args.temperature,
                        ttime=args.temp_tau * units.fs,
                        externalstress=0.,
-                       pfactor=(args.stress_tau * units.fs) ** 2 * 100 * units.GPa,
+                       pfactor=(args.stress_tau * units.fs) ** 2 * args.bulk_modulus * units.GPa,
                        mask=np.diag([1, 1, 1]))
         logger.info(f'Running NVT dynamics at T={args.temperature}')
     md_logger = MDLogger(np, atoms, str(md_log_path), stress=True)
