@@ -127,8 +127,14 @@ if __name__ == "__main__":
 
     atoms = io.read(strc_path, index='-1')
     if args.initial_model is not None:
-        model = Path(args.initial_model).read_bytes()
-        models = [model] * args.ensemble_size
+        if args.initial_model.endswith('proxima-state.pkl'):
+            # in this case we are starting a new trajectory with models from an old trajectory
+            with open(args.initial_model, 'rb') as f:
+                state = pkl.load(f)
+            models = state['models']
+        else:
+            model = Path(args.initial_model).read_bytes()
+            models = [model] * args.ensemble_size
         logger.info(f'Loaded a model from {args.initial_model}')
     elif args.model_type == 'ani':
         species = list(set(atoms.symbols))
