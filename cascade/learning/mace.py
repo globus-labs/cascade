@@ -1,4 +1,6 @@
-"""Interface to the """
+"""Interface to the higher-order equivariant neural networks
+of `Batatia et al. <https://arxiv.org/abs/2206.07697>`_"""
+
 import logging
 from io import BytesIO
 
@@ -7,8 +9,7 @@ import torch
 import numpy as np
 import pandas as pd
 from ase import Atoms, data
-from ignite.engine import Engine, create_supervised_evaluator, Events
-from ignite.metrics import Loss
+from ignite.engine import Engine, Events
 from mace.data import AtomicData
 from mace.data.utils import config_from_atoms
 from mace.modules import WeightedHuberEnergyForcesStressLoss, ScaleShiftMACE
@@ -35,6 +36,7 @@ def atoms_to_loader(atoms: list[Atoms], batch_size: int, z_table: AtomicNumberTa
         z_table: Map between atom ID in mace and periodic table
         r_max: Cutoff distance
     """
+
     def _prepare_atoms(my_atoms: Atoms):
         """MACE expects the training outputs to be stored in `info` and `arrays`"""
         my_atoms.info = {
@@ -55,8 +57,8 @@ def atoms_to_loader(atoms: list[Atoms], batch_size: int, z_table: AtomicNumberTa
     )
 
 
-class MACEInterface(BaseLearnableForcefield):
-    """"""
+class MACEInterface(BaseLearnableForcefield[MACEState]):
+    """Interface to the `MACE library <https://github.com/ACEsuit/mace>`_"""
 
     def evaluate(self,
                  model_msg: bytes | State,
@@ -156,6 +158,7 @@ class MACEInterface(BaseLearnableForcefield):
 
         # Prepare the training engine
         train_losses = []
+
         def get_loss_stats(b, y):
             """Compute the losses"""
             na = batch.ptr[1:] - batch.ptr[:-1]
@@ -211,7 +214,6 @@ class MACEInterface(BaseLearnableForcefield):
                 detailed_loss['epoch'] = engine.state.epoch - 1
                 detailed_loss['total_loss'] = loss.item()
                 valid_losses.append(detailed_loss)
-
 
         logger.info('Started training')
         trainer.run(train_loader, max_epochs=num_epochs)
