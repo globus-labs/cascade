@@ -26,3 +26,21 @@ def test_training(example_data, mace, reset_weights):
     assert not np.isclose(new_e, orig_e).all()
     for new, orig in zip(new_f, orig_f):
         assert not np.isclose(new, orig).all()
+
+
+def test_inference(mace, example_data):
+    mi = MACEInterface()
+    energy, forces, stresses = mi.evaluate(mace, example_data)
+
+    assert energy.shape == (2,)
+    for atoms, f in zip(example_data, forces):
+        assert f.shape == (len(atoms), 3)
+    assert stresses.shape == (2, 3, 3)
+
+    # Test the calculator interface
+    calc = mi.make_calculator(mace, 'cpu')
+    atoms = example_data[0]
+    atoms.calc = calc
+    assert np.isclose(atoms.get_potential_energy(), energy[0]).all()
+    assert np.isclose(atoms.get_forces(), forces[0]).all()
+    assert np.isclose(atoms.get_stress(voigt=False), stresses[0]).all()

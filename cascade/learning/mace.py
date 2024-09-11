@@ -2,13 +2,15 @@
 of `Batatia et al. <https://arxiv.org/abs/2206.07697>`_"""
 
 import logging
-from io import BytesIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import ase
 import torch
 import numpy as np
 import pandas as pd
 from ase import Atoms, data
+from ase.calculators.calculator import Calculator
 from ignite.engine import Engine, Events
 from mace.data import AtomicData
 from mace.data.utils import config_from_atoms
@@ -16,6 +18,7 @@ from mace.modules import WeightedHuberEnergyForcesStressLoss, ScaleShiftMACE
 from mace.tools import AtomicNumberTable
 from mace.tools.torch_geometric.dataloader import DataLoader
 from mace.tools.scripts_utils import extract_config_mace_model
+from mace.calculators import MACECalculator
 
 from cascade.learning.base import BaseLearnableForcefield, State
 from cascade.learning.utils import estimate_atomic_energies
@@ -90,7 +93,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
             forces_numpy = y['forces'].cpu().detach().numpy()
             for i, j in zip(batch.ptr, batch.ptr[1:]):
                 forces.append(forces_numpy[i:j, :])
-        return np.array(energies), forces, np.array(stresses)
+        return np.array(energies), forces, np.array(stresses)[0, :, :, :]
 
     def train(self,
               model_msg: bytes | State,
@@ -223,14 +226,18 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
         logger.info('Started training')
         trainer.run(train_loader, max_epochs=num_epochs)
         logger.info('Finished training')
-
-        # Write the model to a Bytes string
-        model.cpu()
-        io = BytesIO()
-        torch.save(model, io)
+        model.cpu()  # Force it off the GPU
 
         # Compile the loss
         train_losses = pd.DataFrame(train_losses).groupby('epoch').mean().reset_index()
         valid_losses = pd.DataFrame(valid_losses).groupby('epoch').mean().reset_index()
         log = train_losses.merge(valid_losses, on='epoch', suffixes=('_train', '_valid'))
-        return io.getvalue(), log
+        return self.serialize_model(model), log
+
+    def make_calculator(self, model_msg: bytes | State, device: str) -> Calculator:
+        # MACE calculator loads the model from disk, so let's write to disk
+        with TemporaryDirectory(self.scratch_dir, prefix='mace_') as tmp:
+            model_path = Path(tmp) / 'model.pt'
+            model_path.write_bytes(self.serialize_model(model_msg))
+
+            return MACECalculator(model_paths=[model_path], device=device, compile_mode=None)
