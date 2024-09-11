@@ -214,3 +214,20 @@ def test_blending(starting_frame, simple_model, target_calc, tmpdir):
         assert not calc.used_surrogate
         assert calc.blending_step == 0
         assert calc.lambda_target == 1
+
+
+def test_train_from_original(starting_frame, simple_proxima, initialized_db):
+    # Set the train_from_original flag
+    simple_proxima.parameters['train_from_original'] = True
+    assert simple_proxima.models is None  # Should start unset
+
+    # Ensure the original models are unchanged
+    orig_models = simple_proxima.parameters['models'].copy()
+    simple_proxima.retrain_surrogate()
+    assert all(x is y for x, y in zip(simple_proxima.parameters['models'], orig_models))
+    assert all(x is not y for x, y in zip(simple_proxima.models, orig_models))
+
+    # Ensure that pickling does not alter the original models
+    state = pkl.loads(pkl.dumps(simple_proxima.get_state()))
+    simple_proxima.set_state(state)
+    assert all(x is y for x, y in zip(simple_proxima.parameters['models'], orig_models))
