@@ -80,7 +80,10 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
         energies = []
         forces = []
         stresses = []
+        model.to(device)
+        model.eval()
         for batch in loader:
+            batch = batch.to(device)
             y = model(
                 batch,
                 training=False,
@@ -89,11 +92,11 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
                 compute_stress=True,
             )
             energies.extend(y['energy'].cpu().detach().numpy())
-            stresses.append(y['stress'].cpu().detach().numpy())
+            stresses.extend(y['stress'].cpu().detach().numpy())
             forces_numpy = y['forces'].cpu().detach().numpy()
             for i, j in zip(batch.ptr, batch.ptr[1:]):
                 forces.append(forces_numpy[i:j, :])
-        return np.array(energies), forces, np.array(stresses)[0, :, :, :]
+        return np.array(energies), forces, np.array(stresses)
 
     def train(self,
               model_msg: bytes | State,
@@ -141,7 +144,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
 
         # Update the shift of the energy scale
         errors = []
-        for _, batch in zip(range(4), train_loader):  # Use only the first 4 batches, for computational efficiency
+        for batch in train_loader:
             batch = batch.to(device)
             num_atoms = batch.ptr[1:] - batch.ptr[:-1]  # Use the offsets to compute the number of atoms per inference
             ml = model(
@@ -207,12 +210,13 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
         @trainer.on(Events.EPOCH_COMPLETED)
         def validation_process(engine):
             model.eval()
+            logger.info(f'Started validation for epoch {engine.state.epoch - 1}')
 
             for batch in valid_loader:
                 batch.to(device)
                 y = model(
                     batch,
-                    training=True,
+                    training=False,
                     compute_force=True,
                     compute_virials=False,
                     compute_stress=True,
@@ -222,6 +226,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
                 detailed_loss['epoch'] = engine.state.epoch - 1
                 detailed_loss['total_loss'] = loss.item()
                 valid_losses.append(detailed_loss)
+            logger.info(f'Completed validation for epoch {engine.state.epoch - 1}')
 
         logger.info('Started training')
         trainer.run(train_loader, max_epochs=num_epochs)
