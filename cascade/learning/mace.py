@@ -118,7 +118,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
         if reset_weights:
             config = extract_config_mace_model(model)
             model = ScaleShiftMACE(**config)
-            model.to(device)
+        model.to(device)
 
         # Unpin weights
         for p in model.parameters():
@@ -142,8 +142,8 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
         # Update the shift of the energy scale
         errors = []
         for _, batch in zip(range(4), train_loader):  # Use only the first 4 batches, for computational efficiency
-            num_atoms = batch.ptr[1:] - batch.ptr[:-1]  # Taken from loss function, still don't understand it
             batch = batch.to(device)
+            num_atoms = batch.ptr[1:] - batch.ptr[:-1]  # Use the offsets to compute the number of atoms per inference
             ml = model(
                 batch,
                 training=False,
