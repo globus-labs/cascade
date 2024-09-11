@@ -8,7 +8,7 @@ from cascade.learning.mace import MACEState, MACEInterface
 @fixture()
 def mace() -> MACEState:
     calc = mace_mp('small', device='cpu', default_dtype="float32")
-    return calc.models[0], calc.z_table, calc.r_max
+    return calc.models[0]
 
 
 @mark.parametrize('reset_weights', [False, True])

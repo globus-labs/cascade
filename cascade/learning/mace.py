@@ -22,8 +22,8 @@ from cascade.learning.utils import estimate_atomic_energies
 
 logger = logging.getLogger(__name__)
 
-MACEState = tuple[ScaleShiftMACE, AtomicNumberTable, float]
-"""Model, atomic reference energies, cutoff distance"""
+MACEState = ScaleShiftMACE
+"""Just the model, which we require being the MACE which includes scale shifting logic"""
 
 
 def atoms_to_loader(atoms: list[Atoms], batch_size: int, z_table: AtomicNumberTable, r_max: float, **kwargs):
@@ -66,7 +66,10 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
                  batch_size: int = 64,
                  device: str = 'cpu') -> (np.ndarray, list[np.ndarray], np.ndarray):
         # Ready the models and the data
-        model, z_table, r_max = self.get_model(model_msg)
+        model = self.get_model(model_msg)
+        r_max = model.r_max.item()
+        z_table = AtomicNumberTable(model.atomic_numbers.cpu().numpy().tolist())
+
         model.to(device)
         loader = atoms_to_loader(atoms, batch_size=batch_size, z_table=z_table, r_max=r_max, shuffle=False, drop_last=False)
 
@@ -104,7 +107,9 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
               **kwargs) -> tuple[bytes, pd.DataFrame]:
 
         # Load the model
-        model, z_table, r_max = self.get_model(model_msg)
+        model = self.get_model(model_msg)
+        r_max = model.r_max.item()
+        z_table = AtomicNumberTable(model.atomic_numbers.cpu().numpy().tolist())
 
         # Reset weights if desired
         if reset_weights:
@@ -222,7 +227,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
         # Write the model to a Bytes string
         model.cpu()
         io = BytesIO()
-        torch.save((model, z_table, r_max), io)
+        torch.save(model, io)
 
         # Compile the loss
         train_losses = pd.DataFrame(train_losses).groupby('epoch').mean().reset_index()
