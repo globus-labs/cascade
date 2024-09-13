@@ -56,11 +56,14 @@ if __name__ == "__main__":
     group.add_argument('--initial-model', help='Path to initial model in message format. Code will generate a network with default settings if none provided')
     group.add_argument('--initial-data', nargs='*', default=(), help='Path to data files (e.g., ASE .traj and .db) containing initial training data')
     group.add_argument('--ensemble-size', type=int, default=2, help='Number of models to train on different data segments')
-    group.add_argument('--online-training', action='store_true', help='Whether to use the weights from the last training step as starting for the next')
+    group.add_argument('--training-mode', choices=['online', 'reset', 'finetune'],
+            help='How to begin each training step. Random weights (reset), weights from last training step (online), or weights from original model (finetune)'
+    )
     group.add_argument('--training-epochs', type=int, default=32, help='Number of epochs per training event')
     group.add_argument('--training-batch-size', type=int, default=32, help='Which device to use for training models')
     group.add_argument('--training-max-size', type=int, default=None, help='Maximum training set size to use when updating models')
     group.add_argument('--training-recency-bias', type=float, default=1., help='Factor by which to favor recent data when reducing training set size')
+    group.add_argument('--training-learning-rate', type=float, default=1e-3, help='Initial learning rate for the optimizer.')
     group.add_argument('--training-device', default='cuda', help='Which device to use for training models')
 
     group = parser.add_argument_group(title='Proxima', description="Settings for learning on the fly")
@@ -170,11 +173,13 @@ if __name__ == "__main__":
         train_kwargs={
             'num_epochs': args.training_epochs,
             'batch_size': args.training_batch_size,
-            'reset_weights': not args.online_training,
+            'reset_weights': args.training_mode == 'reset',
+            'learning_rate': args.training_learning_rate,
             'device': args.training_device},  # Configuration for the training routines
         train_freq=args.retrain_freq,
         train_max_size=args.training_max_size,
         train_recency_bias=args.training_recency_bias,
+        train_from_original=args.training_mode == 'finetune',
         target_ferr=args.target_error,
         history_length=args.error_history,
         min_target_fraction=args.min_target_frac,
