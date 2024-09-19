@@ -151,7 +151,6 @@ def test_pretrained_threshold(starting_frame, simple_proxima, target_calc):
 
 
 def test_blending(starting_frame, simple_model, target_calc, tmpdir):
-
     # how many steps to blend for
     n_blending_steps = 3
 
@@ -176,9 +175,9 @@ def test_blending(starting_frame, simple_model, target_calc, tmpdir):
         calc.get_forces(new_atoms)
 
     # assert the incrementing happens the way its supposed to
-    for i in range(1, n_blending_steps+1):
+    for i in range(1, n_blending_steps + 1):
         new_atoms = starting_frame.copy()
-        new_atoms.rattle(0.2, seed=i+100)  # don't reuse above seeds
+        new_atoms.rattle(0.2, seed=i + 100)  # don't reuse above seeds
         calc.get_stress(new_atoms)  # test blending of stresses since this caused errors in the past
         assert calc.used_surrogate
         assert calc.blending_step == i
@@ -187,7 +186,7 @@ def test_blending(starting_frame, simple_model, target_calc, tmpdir):
     # and that we dont go out of bounds
     for i in range(2):
         new_atoms = starting_frame.copy()
-        new_atoms.rattle(0.2, seed=i+500)  # don't reuse above seeds
+        new_atoms.rattle(0.2, seed=i + 500)  # don't reuse above seeds
         calc.get_forces(new_atoms)
         assert calc.used_surrogate
         assert calc.blending_step == n_blending_steps
@@ -197,9 +196,9 @@ def test_blending(starting_frame, simple_model, target_calc, tmpdir):
     calc.parameters['target_ferr'] = 1e-12
     calc.threshold = 0  # force the threshold to be small
     # make sure blending back to target works as expected
-    for i in range(n_blending_steps-1, -1, -1):
+    for i in range(n_blending_steps - 1, -1, -1):
         new_atoms = starting_frame.copy()
-        new_atoms.rattle(0.2, seed=i+800)  # don't reuse above seeds
+        new_atoms.rattle(0.2, seed=i + 800)  # don't reuse above seeds
         calc.get_forces(new_atoms)
         assert not calc.used_surrogate
         assert calc.blending_step == i
@@ -209,11 +208,19 @@ def test_blending(starting_frame, simple_model, target_calc, tmpdir):
     # again assert we dont go out of bounds and blending stays the same
     for i in range(2):
         new_atoms = starting_frame.copy()
-        new_atoms.rattle(0.2, seed=i+1200)  # don't reuse above seeds
+        new_atoms.rattle(0.2, seed=i + 1200)  # don't reuse above seeds
         calc.get_forces(new_atoms)
         assert not calc.used_surrogate
         assert calc.blending_step == 0
         assert calc.lambda_target == 1
+
+
+def test_train_from_original_empty_db(simple_proxima):
+    simple_proxima.parameters['train_from_original'] = True
+    assert simple_proxima.models is None  # Should start unset
+
+    simple_proxima.retrain_surrogate()
+    assert simple_proxima.models[0] is not None
 
 
 def test_train_from_original(starting_frame, simple_proxima, initialized_db):

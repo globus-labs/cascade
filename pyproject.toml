@@ -46,3 +46,7 @@ ani = [
 chgnet = [
     'chgnet',
 ]
+mace = [
+    'mace-torch',
+    'ignite'
+]

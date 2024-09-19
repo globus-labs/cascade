@@ -18,13 +18,15 @@ from ase import units, io
 from ase.db import connect
 from ase.md import MDLogger, VelocityVerlet
 from chgnet.model import CHGNet
+from mace.calculators import mace_mp
 from gitinfo import get_git_info
 
 from cascade.learning.chgnet import CHGNetInterface
-from cascade.proxima import SerialLearningCalculator
-from cascade.calculator import make_calculator
 from cascade.learning.torchani import TorchANI
 from cascade.learning.torchani.build import make_output_nets, make_aev_computer
+from cascade.learning.mace import MACEInterface
+from cascade.proxima import SerialLearningCalculator
+from cascade.calculator import make_calculator
 from cascade.utils import canonicalize
 import cascade
 
@@ -50,7 +52,7 @@ if __name__ == "__main__":
     group.add_argument('--seed', type=int, default=1, help='Random seed used to start dynamics')
 
     group = parser.add_argument_group(title="Learner Details", description="Configure the surrogate model")
-    group.add_argument('--model-type', choices=['ani', 'chgnet'], help='Which type of machine learning model to train.')
+    group.add_argument('--model-type', choices=['ani', 'chgnet', 'mace'], help='Which type of machine learning model to train.')
     group.add_argument('--initial-model', help='Path to initial model in message format. Code will generate a network with default settings if none provided')
     group.add_argument('--initial-data', nargs='*', default=(), help='Path to data files (e.g., ASE .traj and .db) containing initial training data')
     group.add_argument('--ensemble-size', type=int, default=2, help='Number of models to train on different data segments')
@@ -123,6 +125,7 @@ if __name__ == "__main__":
     learner = {
         'ani': TorchANI(),
         'chgnet': CHGNetInterface(),
+        'mace': MACEInterface()
     }[args.model_type]
     main_logger.info(f'Ready to train a {args.model_type} model')
 
@@ -141,6 +144,9 @@ if __name__ == "__main__":
     elif args.model_type == 'chgnet':
         models = [CHGNet.load()] * args.ensemble_size
         logger.info('Loaded the pretrained weights for CHGNet')
+    elif args.model_type == 'mace':
+        models = [mace_mp('small').models[0]] * args.ensemble_size
+        logger.info('Loaded the MACE-MP small model.')
     else:
         raise NotImplemented(f'Default models not implemented for {args.model_type}')
 

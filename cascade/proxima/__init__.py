@@ -143,12 +143,8 @@ class SerialLearningCalculator(Calculator):
 
     def retrain_surrogate(self):
         """Retrain the surrogate models using the currently-available data"""
-        # Determine where the updated models will be stored
-        model_list = self.models = (
-            [None] * len(self.parameters['models'])  # Create a new list
-            if self.parameters['train_from_original'] else
-            self.parameters['models']  # Edit it in place
-        )
+        # Start with the models set as the originals
+        self.models = self.parameters['models'].copy()
 
         # Load in the data from the db
         db_path = self.parameters['db_path']
@@ -165,6 +161,13 @@ class SerialLearningCalculator(Calculator):
         if len(all_atoms) < 10:
             logger.info('Too few entries to retrain. Skipping')
             return
+
+        # Determine where the updated models will be stored
+        model_list = self.models = (
+            [None] * len(self.parameters['models'])  # Create a new list
+            if self.parameters['train_from_original'] else
+            self.parameters['models']  # Edit it in place
+        )
 
         # Train each model using a different, randomly-selected subset of the data
         self.train_logs = []
