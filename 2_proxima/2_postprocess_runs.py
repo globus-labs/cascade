@@ -65,7 +65,7 @@ print('Unwrapping trajectory')
 traj_unwrapped = unwrap_trajectory(traj)
 
 print('Computing mean squared displacement')
-msd = calculate_sqared_disp(traj_unwrapped)
+msd = calculate_sqared_disp(traj_unwrapped, n_jobs=-1)
 t = np.arange(msd.shape[0])
 
 

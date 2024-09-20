@@ -8,6 +8,7 @@ from ase import Atoms
 from ase.calculators.calculator import Calculator
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.geometry import get_distances
+from joblib import Parallel, delayed
 
 
 # Taken from ExaMol
@@ -135,7 +136,7 @@ def unwrap_trajectory(traj: list[ase.Atoms]) -> np.ndarray:
     return np.asarray(out)
 
 
-def calculate_sqared_disp(traj: np.ndarray) -> np.ndarray: 
+def calculate_sqared_disp(traj: np.ndarray, n_jobs=None, verbose=1) -> np.ndarray:
     """Calculate the MSD time correlation function
     
     Calculates the MSD for every length of time accessible in the trajectory, 
@@ -144,14 +145,15 @@ def calculate_sqared_disp(traj: np.ndarray) -> np.ndarray:
     Args: 
         traj: a numpy array of positions (n_frames, n_atoms, 3)
               **!important:** make sure these positions are unwrapped from PBC
+        n_jobs: passed to joblib.Parallel
+        verbose: passed to joblib.Parallel
     Returns: 
         a numpy array of mean squared displacement (n_frames, )
     """
     n_frames, n_atoms, _ = traj.shape
     step_sizes = np.arange(1, n_frames)
-    r_step = np.zeros_like(step_sizes, float)
-    
-    for step_size in tqdm(step_sizes, 'Calculating MSD for step size'):
+
+    def calc_for_step_size(step_size):
         # this is the number of steps of size step_size in our simulation
         n_steps = n_frames-step_size
 
@@ -166,6 +168,15 @@ def calculate_sqared_disp(traj: np.ndarray) -> np.ndarray:
             dr = traj[stop_ix, :] - traj[start_ix, :]
             disp_sq[:, start_ix] = (dr * dr).sum(1)
         # subtract 1 since its zero indexed
-        r_step[step_size-1] = disp_sq.mean()
-    return r_step
+        return disp_sq.mean()
     
+    f = delayed(calc_for_step_size)
+    p = Parallel(n_jobs=n_jobs, verbose=verbose)
+    out = p(f(s) for s in step_sizes)
+    return np.asarray(out)
+
+
+def set_volume(frame: ase.Atoms, vol: float) -> None:
+    """Set the volume of a cell and move the atoms accordingly"""
+    scalar = (vol / frame.get_volume())**(1/3)
+    frame.set_cell(scalar*frame.cell, scale_atoms=True)
