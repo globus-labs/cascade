@@ -29,6 +29,10 @@ def test_training(example_data, mace, reset_weights):
 
 
 def test_inference(mace, example_data):
+    # Delete any previous results from the example data
+    for atoms in example_data:
+        atoms.calc = None
+
     mi = MACEInterface()
     energy, forces, stresses = mi.evaluate(mace, example_data)
 
