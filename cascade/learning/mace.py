@@ -42,14 +42,28 @@ def atoms_to_loader(atoms: list[Atoms], batch_size: int, z_table: AtomicNumberTa
 
     def _prepare_atoms(my_atoms: Atoms):
         """MACE expects the training outputs to be stored in `info` and `arrays`"""
-        my_atoms.info = {
-            'energy': my_atoms.get_potential_energy(),
-            'stress': my_atoms.get_stress()
-        }
+        # Start with a copy of positions, which should be available always
         my_atoms.arrays.update({
-            'forces': my_atoms.get_forces(),
             'positions': my_atoms.positions,
         })
+
+        if my_atoms.calc is None:
+            return my_atoms  # No calc, no results
+
+        # Now make an info dictionary if one doesn't exist yet
+        if my_atoms.info is None:
+            my_atoms.info = {}
+
+        # Copy over all property data which exists
+        if 'energy' in my_atoms.calc.results:
+            my_atoms.info['energy'] = my_atoms.get_potential_energy()
+
+        if 'stress' in my_atoms.calc.results:
+            my_atoms.info['stress'] = my_atoms.get_stress()
+
+        if 'forces' in my_atoms.calc.results:
+            my_atoms.arrays['forces'] = my_atoms.get_forces()
+
         return my_atoms
 
     atoms = [config_from_atoms(_prepare_atoms(a)) for a in atoms]
