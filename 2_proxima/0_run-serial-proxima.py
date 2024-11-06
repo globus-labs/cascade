@@ -114,7 +114,7 @@ if __name__ == "__main__":
             for initial_data in args.initial_data:
                 main_logger.info(f'Adding data from {initial_data} to database')
                 for frame in io.iread(initial_data):
-                    db.write(frame)
+                    db.write(canonicalize(frame))
 
     with connect(db_path) as db:
         main_logger.info(f'Training database has {len(db)} entries.')
@@ -175,7 +175,7 @@ if __name__ == "__main__":
     if args.calculator != 'mace_mp':
         target_calc = make_calculator(args.calculator, directory=str(calc_dir))
     else: 
-        target_calc = mace_mp('small')
+        target_calc = mace_mp('small', device=args.training_device)
 
     learning_calc = SerialLearningCalculator(
         target_calc=target_calc,
@@ -220,12 +220,12 @@ if __name__ == "__main__":
                 'step_time': step_time,
                 'energy': float(atoms.get_potential_energy()),
                 'maximum_force': float(np.linalg.norm(atoms.get_forces(), axis=1).max()),
-                'stress': list(map(float, atoms.get_stress().astype(float).tolist())),
+                'stress': atoms.get_stress().astype(float).tolist(),
                 'temperature': float(atoms.get_temperature()),
                 'volume': float(atoms.get_volume()),
                 'used_surrogate': bool(learning_calc.used_surrogate),
-                'proxima_alpha': learning_calc.alpha,
-                'proxima_threshold': learning_calc.threshold,
+                'proxima_alpha': float(learning_calc.alpha) if learning_calc.alpha is not None else float(np.nan),
+                'proxima_threshold': float(learning_calc.threshold) if learning_calc.threshold is not None else float(np.nan),
                 'proxima_blending_step': int(learning_calc.blending_step),
                 'proxima_lambda_target': float(learning_calc.lambda_target),
                 'last_uncer': float(last_uncer),
