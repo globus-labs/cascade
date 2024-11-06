@@ -13,7 +13,7 @@ from ase.db import connect
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.calculator import EnsembleCalculator
-from cascade.utils import to_voigt
+from cascade.utils import to_voigt, canonicalize
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +248,7 @@ class SerialLearningCalculator(Calculator):
         db_atoms = atoms.copy()
         db_atoms.calc = target_calc
         with connect(self.parameters['db_path']) as db:
-            db.write(db_atoms)
+            db.write(canonicalize(db_atoms))
 
         # Reset the model if the training frequency has been reached
         surrogate_forces = self.surrogate_calc.results['forces']
