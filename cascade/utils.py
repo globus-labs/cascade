@@ -60,6 +60,11 @@ def canonicalize(atoms: Atoms) -> Atoms:
         old_calc = atoms.calc
         out_atoms.calc = SinglePointCalculator(atoms)
         out_atoms.calc.results = old_calc.results.copy()
+    
+        for k, v in out_atoms.calc.results.items(): 
+            if isinstance(v, np.ndarray): 
+                out_atoms.calc.results[k] = v.astype(np.float64)
+
     return out_atoms
 
 
