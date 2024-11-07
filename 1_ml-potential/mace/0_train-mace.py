@@ -80,7 +80,8 @@ if __name__ == "__main__":
     })
 
     run_hash = sha256(json.dumps(params).encode()).hexdigest()[-8:]
-    run_dir = Path('runs') / f'{datetime.now().isoformat(timespec="seconds").replace(":", "").replace("-", "")}-{run_hash}'
+    start_time = datetime.now().isoformat(timespec="seconds").replace(":", "").replace("-", "")
+    run_dir = Path('runs') / f'train-{train_hash}' / f'{start_time}-{run_hash}'
     run_dir.mkdir(parents=True)
 
     # Make a logger
@@ -119,27 +120,31 @@ if __name__ == "__main__":
     logger.info('Training complete. Running inference')
 
     # Run inference on the validation dataset
-    eval_time = perf_counter()
-    pred_e, pred_f, pred_s = ani.evaluate(model_msg, test_atoms, batch_size=args.batch_size, device='cuda')
-    eval_time = perf_counter() - eval_time
-    logger.info('Inference complete. Computing performance on train set')
+    performance = {'train_time': train_time / args.num_epochs}
+    for name, atoms in [('train', train_atoms), ('valid', valid_atoms), ('test', test_atoms)]:
+        eval_time = perf_counter()
+        pred_e, pred_f, pred_s = ani.evaluate(model_msg, atoms, batch_size=args.batch_size, device='cuda')
+        eval_time = perf_counter() - eval_time
+        logger.info(f'Computing performance on {name} set')
 
-    true_n = np.array([len(a) for a in test_atoms])
-    true_e = np.array([a.get_potential_energy() for a in test_atoms])
-    true_f = [a.get_forces() for a in test_atoms]
-    true_s = np.array([a.get_stress(False) for a in test_atoms])
+        true_n = np.array([len(a) for a in atoms])
+        true_e = np.array([a.get_potential_energy() for a in atoms])
+        true_f = [a.get_forces() for a in atoms]
+        true_s = np.array([a.get_stress(False) for a in atoms])
 
-    pred_e_pa = pred_e / true_n
-    true_e_pa = true_e / true_n
+        pred_e_pa = pred_e / true_n
+        true_e_pa = true_e / true_n
 
-    performance = {
-        'train_time': train_time / args.num_epochs,
-        'eval_time': eval_time / len(test_atoms),
-        'energy_mae': float(np.abs(pred_e_pa - true_e_pa).mean()),
-        'force_mean_error': float(np.mean([np.linalg.norm(t - p, axis=1).mean() for t, p in zip(true_f, pred_f)])),
-        'force_max_error': float(np.mean([np.linalg.norm(t - p, axis=1).max() for t, p in zip(true_f, pred_f)])),
-        'stress_mae': float(np.abs(true_s.flatten() - pred_s.flatten()).mean())
-    }
+        performance[name] = {
+            'size': len(atoms),
+            'eval_time': eval_time / len(atoms),
+            'energy_mae': float(np.abs(pred_e_pa - true_e_pa).mean()),
+            'force_mean_error': float(np.mean([np.linalg.norm(t - p, axis=1).mean() for t, p in zip(true_f, pred_f)])),
+            'force_max_error': float(np.mean([np.linalg.norm(t - p, axis=1).max() for t, p in zip(true_f, pred_f)])),
+            'stress_mae': float(np.abs(true_s.flatten() - pred_s.flatten()).mean())
+        }
+        np.savez_compressed(run_dir / f'{name}_true.npz', source=test_source, count=true_n, energy=true_e, forces=np.concatenate(true_f, axis=0), stress=true_s)
+        np.savez_compressed(run_dir / f'{name}_pred.npz', source=test_source, count=true_n, energy=pred_e, forces=np.concatenate(pred_f, axis=0), stress=pred_s)
     for key, value in train_log.iloc[-1].to_dict().items():
         performance[f'last_epoch.{key}'] = value
 
@@ -149,6 +154,3 @@ if __name__ == "__main__":
     train_log.to_csv(run_dir / 'log.csv', index=False)
     with open(run_dir / 'performance.json', 'w') as fp:
         json.dump(performance, fp, indent=2)
-
-    np.savez_compressed(run_dir / 'test_true.npz', source=test_source, count=true_n, energy=true_e, forces=np.concatenate(true_f, axis=0), stress=true_s)
-    np.savez_compressed(run_dir / 'test_pred.npz', source=test_source, count=true_n, energy=pred_e, forces=np.concatenate(pred_f, axis=0), stress=pred_s)
