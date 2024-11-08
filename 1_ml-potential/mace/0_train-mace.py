@@ -42,8 +42,15 @@ if __name__ == "__main__":
     train_atoms: list[Atoms] = []
     valid_atoms: list[Atoms] = []
     train_hasher = sha256()
+    rng = np.random.RandomState(1)
     for file in args.train_files:
         my_atoms = read(file, slice(None))
+
+        # Shuffle the data if they are not from a traj file
+        if not file.endswith('.traj'):
+            rng.shuffle(my_atoms)
+
+        # Hash dataset for reproducibility
         for atoms in my_atoms:
             train_hasher.update(atoms.positions.tobytes())
             train_hasher.update(atoms.cell.tobytes())
