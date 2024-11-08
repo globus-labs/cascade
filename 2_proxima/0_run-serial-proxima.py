@@ -18,6 +18,7 @@ from ase import units, io
 from ase.db import connect
 from ase.md import MDLogger, VelocityVerlet
 from chgnet.model import CHGNet
+from mace.calculators import mace_mp
 from gitinfo import get_git_info
 
 from cascade.learning.chgnet import CHGNetInterface
@@ -113,7 +114,7 @@ if __name__ == "__main__":
             for initial_data in args.initial_data:
                 main_logger.info(f'Adding data from {initial_data} to database')
                 for frame in io.iread(initial_data):
-                    db.write(frame)
+                    db.write(canonicalize(frame))
 
     with connect(db_path) as db:
         main_logger.info(f'Training database has {len(db)} entries.')
@@ -171,7 +172,10 @@ if __name__ == "__main__":
     # Set up the proxima calculator
     calc_dir = Path('cp2k-run') / params_hash
     calc_dir.mkdir(parents=True, exist_ok=True)
-    target_calc = make_calculator(args.calculator, directory=str(calc_dir))
+    if args.calculator != 'mace_mp':
+        target_calc = make_calculator(args.calculator, directory=str(calc_dir))
+    else: 
+        target_calc = mace_mp('small', device=args.training_device)
 
     learning_calc = SerialLearningCalculator(
         target_calc=target_calc,
@@ -212,16 +216,16 @@ if __name__ == "__main__":
         start_time = perf_counter()
         with open(run_dir / 'proxima-log.json', 'a') as fp:
             last_uncer, last_error = learning_calc.error_history[-1]
-            print(json.dumps({
+            d = {
                 'step_time': step_time,
                 'energy': float(atoms.get_potential_energy()),
                 'maximum_force': float(np.linalg.norm(atoms.get_forces(), axis=1).max()),
                 'stress': atoms.get_stress().astype(float).tolist(),
-                'temperature': atoms.get_temperature(),
-                'volume': atoms.get_volume(),
+                'temperature': float(atoms.get_temperature()),
+                'volume': float(atoms.get_volume()),
                 'used_surrogate': bool(learning_calc.used_surrogate),
-                'proxima_alpha': learning_calc.alpha,
-                'proxima_threshold': learning_calc.threshold,
+                'proxima_alpha': float(learning_calc.alpha) if learning_calc.alpha is not None else float(np.nan),
+                'proxima_threshold': float(learning_calc.threshold) if learning_calc.threshold is not None else float(np.nan),
                 'proxima_blending_step': int(learning_calc.blending_step),
                 'proxima_lambda_target': float(learning_calc.lambda_target),
                 'last_uncer': float(last_uncer),
@@ -229,7 +233,9 @@ if __name__ == "__main__":
                 'total_invocations': learning_calc.total_invocations,
                 'target_invocations': learning_calc.target_invocations,
                 'model_version': learning_calc.model_version
-            }), file=fp)
+            }
+            #print({k: type(v) for k,v in d.items()})
+            print(json.dumps(d), file=fp)
 
     def _write_to_traj():
         with Trajectory(traj_path, mode='a') as traj:
