@@ -176,7 +176,6 @@ def calculate_sqared_disp(traj: np.ndarray,
             dr = traj[stop_ix, :] - traj[start_ix, :]
             if subtract_com_shift: 
                 delta_com = traj[stop_ix, :].mean(0) - traj[start_ix, :].mean(0)
-                import pdb; pdb.set_trace()
                 dr -= delta_com
             disp_sq[:, start_ix] = (dr * dr).sum(1)
         # subtract 1 since its zero indexed
