@@ -50,6 +50,7 @@ if __name__ == "__main__":
         if not file.endswith('.traj'):
             rng.shuffle(my_atoms)
 
+        # Hash dataset for reproducibility
         for atoms in my_atoms:
             train_hasher.update(atoms.positions.tobytes())
             train_hasher.update(atoms.cell.tobytes())
