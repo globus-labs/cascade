@@ -50,3 +50,7 @@ mace = [
     'mace-torch',
     'ignite'
 ]
+schnet = [
+    'schnetpack',
+    'torch<2.5'
+]
