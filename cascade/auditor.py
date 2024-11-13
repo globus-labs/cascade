@@ -41,6 +41,37 @@ class BaseAuditor:
         raise NotImplementedError()
 
 
+class RandomAuditor(BaseAuditor):
+
+    def __init__(self, random_state: int | np.random.RandomState = None):
+        """Randomly samples frames from a trajectory to be audited and assigns score"""
+        if isinstance(random_state, int):
+            self.rng = np.random.RandomState(random_state)
+        else:
+            self.rng = random_state
+
+    def audit(self,
+              atoms: list[Atoms],
+              n_audits: int,
+              sort_audits: bool = False,
+              ) -> tuple[float, list[int]]:
+    """
+    Args:
+        atoms: list of ase atoms. Should have atoms.info['forces_ens']
+                set by the cascade EnsembleCalculator
+        n_audits: number of frames to return
+        sort_audits: in this case does nothing, since there is no UQ order
+    Returns:
+        p_any: drawn from Unif(0,1)
+        audit_frames: indices of the frams that were sampled
+    """
+        score = self.rng.uniform(0, 1)
+
+        ix = self.rng.choice(a=len(atoms),
+                             size=n_audits,
+                             replace=False)
+        return score, ix
+
 class ForceThresholdAuditor(BaseAuditor):
     """Determines the likelihood all calculations have error below the
     threshold, based on ensemble variance
