@@ -2,19 +2,21 @@ name: cascade
 channels:
   - defaults
   - conda-forge
+  - pytorch
 dependencies:
   # Core dependencies
-  - python==3.11
+  - python==3.10
   - matplotlib
   - scikit-learn>=1
   - jupyterlab
+  - pytorch==2.4.1
   - pandas
   - pytest
   - flake8
   - pip
 
   # Computational chemistry
-  - packmol
+#  - packmol
 
   # For nersc's jupyterlab
   - ipykernel
@@ -23,7 +25,7 @@ dependencies:
   - pip:
       - git+https://gitlab.com/ase/ase.git
       - git+https://github.com/ACEsuit/mace.git
-      - torch
+      - schnetpack
       - mlflow
       - pytorch-ignite
       - python-git-info
