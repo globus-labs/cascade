@@ -52,5 +52,6 @@ mace = [
 ]
 schnet = [
     'schnetpack',
-    'torch<2.5'
+    'torch<2.5',
+    'more_itertools'
 ]

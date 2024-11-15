@@ -1,16 +1,12 @@
-from io import BytesIO
-
-import torch
-from pytest import fixture
+from pytest import fixture, mark
 import schnetpack as spk
 import numpy as np
 
-
 from cascade.learning.spk import SchnetPackInterface
+
 
 @fixture
 def schnet():
-
     # Make the input representation
     cutoff = 5
     pairwise_distance = spk.atomistic.PairwiseDistances()  # calculates pairwise distances between atoms
@@ -33,6 +29,7 @@ def schnet():
     )
     return model
 
+
 def test_inference(schnet, example_data):
     # Delete any previous results from the example data
     for atoms in example_data:
@@ -53,3 +50,20 @@ def test_inference(schnet, example_data):
     assert np.isclose(atoms.get_potential_energy(), energy[0], atol=1e-4).all()
     assert np.allclose(atoms.get_forces(), forces[0], atol=1e-3)
     assert np.allclose(atoms.get_stress(voigt=False), stresses[0], atol=1e-3)
+
+
+@mark.parametrize('reset_weights', [False, True])
+def test_training(example_data, schnet, reset_weights):
+    """Run example network on test data"""
+
+    # Get baseline predictions, train
+    spi = SchnetPackInterface()
+    orig_e, orig_f, orig_s = spi.evaluate(schnet, example_data)
+    model_msg, log = spi.train(schnet, example_data, example_data, 2, batch_size=2, reset_weights=reset_weights)
+    assert len(log) == 2
+
+    # Make sure the predictions change
+    new_e, new_f, new_s = spi.evaluate(model_msg, example_data)
+    assert not np.isclose(new_e, orig_e).all()
+    for new, orig in zip(new_f, orig_f):
+        assert not np.isclose(new, orig).all()

@@ -1,55 +1,23 @@
 """Utilities for using models based on SchNet"""
 from tempfile import TemporaryDirectory, NamedTemporaryFile
-from typing import List, Dict
 from pathlib import Path
-import os
 
 from ase.calculators.calculator import Calculator
-from more_itertools import batched
-from schnetpack.data import AtomsLoader, ASEAtomsData
-
+from schnetpack.data import ASEAtomsData
 from schnetpack import transform as trn
+from more_itertools import batched
+from pytorch_lightning.loggers import CSVLogger
+from ase import data
+import pytorch_lightning as pl
 import schnetpack as spk
-from torch import optim
+import torchmetrics
 import pandas as pd
 import numpy as np
 import torch
 import ase
 
 from .base import BaseLearnableForcefield, State
-
-
-def ase_to_spkdata(atoms: List[ase.Atoms], path: Path) -> ASEAtomsData:
-    """Add a list of Atoms objects to a SchNetPack database
-
-    Args:
-        atoms: List of Atoms objects
-        path: Path to the database file
-    Returns:
-        A link to the database
-    """
-
-    _props = ['energy', 'forces', 'stress']
-    if Path(path).exists():
-        raise ValueError('Path already exists')
-    db = ASEAtomsData(str(path))
-
-    # Get the properties as dictionaries
-    prop_lst = []
-    for a in atoms:
-        props = {}
-        # If we have the property, store it
-        if a.calc is not None:
-            calc = a.calc
-            for k in _props:
-                if k in calc.results:
-                    props[k] = np.atleast_1d(calc.results[k])
-        else:
-            # If not, store a placeholder
-            props.update(dict((k, np.atleast_1d([])) for k in ['energy', 'forces', 'stress']))
-        prop_lst.append(props)
-    db.add_systems(prop_lst, atoms)
-    return db
+from .utils import estimate_atomic_energies
 
 
 class SchnetPackInterface(BaseLearnableForcefield):
@@ -89,13 +57,12 @@ class SchnetPackInterface(BaseLearnableForcefield):
             energies.extend(pred['energy'].detach().cpu().numpy().tolist())
             batch_f = pred['forces'].detach().cpu().numpy()
             forces.extend(np.array_split(batch_f, np.cumsum([len(a) for a in batch]))[:-1])
-            print(pred['stress'])
             stresses.append(pred['stress'].detach().cpu().numpy())
 
         return np.array(energies), forces, np.concatenate(stresses)
 
     def train(self,
-              model_msg: bytes | State,
+              model_msg: bytes | spk.model.NeuralNetworkPotential,
               train_data: list[ase.Atoms],
               valid_data: list[ase.Atoms],
               num_epochs: int,
@@ -109,96 +76,114 @@ class SchnetPackInterface(BaseLearnableForcefield):
               **kwargs) -> tuple[bytes, pd.DataFrame]:
 
         # Make sure the models are converted to Torch models
-        model_msg = self.get_model(model_msg)
+        model = self.get_model(model_msg)
 
         # If desired, re-initialize weights
         if reset_weights:
-            for module in model_msg.modules():
+            for module in model.modules():
                 if hasattr(module, 'reset_parameters'):
                     module.reset_parameters()
 
+        # Update the atomic energies using the data from all trajectories
+        atomrefs = np.zeros((100,), dtype=np.float32)
+        atomic_energies_dict = estimate_atomic_energies(train_data)
+        for s, e in atomic_energies_dict.items():
+            atomrefs[data.atomic_numbers[s]] = e
+
         # Start the training process
         with TemporaryDirectory(dir=self.scratch_dir, prefix='spk') as td:
-            # Save the data to an ASE Atoms database
-            train_file = Path(td) / 'train_data.db'
-            train_db = ase_to_spkdata(train_data, train_file)
-            train_loader = AtomsLoader(train_db, batch_size=batch_size, shuffle=True, num_workers=8,
-                                       pin_memory=device != "cpu")
+            td = Path(td)
+            # Save the data to a single ASE database, manually setting the splits
+            db_file = td / 'train_data.db'
+            property_dict = {'energy': 'eV', 'forces': 'eV/Ang', 'stress': 'eV/Ang/Ang/Ang'}
+            train_dataset = ASEAtomsData.create(str(db_file),
+                                                distance_unit='Ang',
+                                                property_unit_dict=property_dict)
+            for atoms_list in [train_data, valid_data]:
+                for atoms in atoms_list:
+                    train_dataset.add_system(atoms,
+                                             energy=np.array(atoms.get_potential_energy())[None],
+                                             forces=atoms.get_forces(),
+                                             stress=atoms.get_stress(voigt=False)[None, :, :])
 
-            valid_file = Path(td) / 'valid_data.db'
-            valid_db = ase_to_spkdata(train_data, valid_file)
-            valid_loader = AtomsLoader(valid_db, batch_size=batch_size, num_workers=8, pin_memory=device != "cpu")
+            dataset = spk.data.AtomsDataModule(
+                str(db_file),
+                batch_size=batch_size,
+                distance_unit='Ang',
+                property_units=property_dict,
+                num_train=len(train_dataset),
+                num_val=len(valid_data),
+                transforms=[
+                    trn.ASENeighborList(cutoff=5.),
+                    trn.RemoveOffsets("energy", remove_mean=True, remove_atomrefs=False),
+                    trn.CastTo32()
+                ],
+                num_workers=0,
+            )
+            dataset.train_idx = np.arange(0, len(train_data)).tolist()
+            dataset.val_idx = np.arange(len(train_data), len(train_data) + len(valid_data)).tolist()
+            dataset.test_idx = np.array([]).tolist()
 
-            # Make the trainer
-            opt = optim.Adam(model_msg.parameters(), lr=learning_rate)
-
-            # tradeoff
-            rho_tradeoff = 0.9
-
-            # loss function
-            if huber_deltas is None:
-                # Use mean-squared loss
-                def loss(batch, result):
-                    # compute the mean squared error on the energies
-                    diff_energy = batch['energy'] - result['energy']
-                    err_sq_energy = torch.mean(diff_energy ** 2)
-
-                    # compute the mean squared error on the forces
-                    diff_forces = batch['forces'] - result['forces']
-                    err_sq_forces = torch.mean(diff_forces ** 2)
-
-                    # build the combined loss function
-                    err_sq = rho_tradeoff * err_sq_energy + (1 - rho_tradeoff) * err_sq_forces
-
-                    return err_sq
-            else:
-                # Use huber loss
-                delta_energy, delta_force = huber_deltas
-
-                def loss(batch: Dict[str, torch.Tensor], result):
-                    # compute the mean squared error on the energies per atom
-                    n_atoms = batch['_atom_mask'].sum(axis=1)
-                    err_sq_energy = torch.nn.functional.huber_loss(batch['energy'] / n_atoms,
-                                                                   result['energy'].float() / n_atoms,
-                                                                   delta=delta_energy)
-
-                    # compute the mean squared error on the forces
-                    err_sq_forces = torch.nn.functional.huber_loss(batch['forces'], result['forces'], delta=delta_force)
-
-                    # build the combined loss function
-                    err_sq = rho_tradeoff * err_sq_energy + (1 - rho_tradeoff) * err_sq_forces
-
-                    return err_sq
-
-            metrics = [
-                spk.metrics.MeanAbsoluteError('energy'),
-                spk.metrics.MeanAbsoluteError('forces')
-            ]
-
-            hooks = [
-                trn.CSVHook(log_path=td, metrics=metrics),
-            ]
-
-            trainer = trn.Trainer(
-                model_path=td,
-                model=model_msg,
-                hooks=hooks,
-                loss_fn=loss,
-                optimizer=opt,
-                train_loader=train_loader,
-                validation_loader=valid_loader,
-                checkpoint_interval=num_epochs + 1  # Turns off checkpointing
+            # Make the loss function
+            output_energy = spk.task.ModelOutput(
+                name='energy',
+                loss_fn=torch.nn.MSELoss(),
+                loss_weight=1,
+                metrics={
+                    "MAE": torchmetrics.MeanAbsoluteError()
+                }
+            )
+            output_forces = spk.task.ModelOutput(
+                name='forces',
+                loss_fn=torch.nn.MSELoss(),
+                loss_weight=force_weight,
+                metrics={
+                    "MAE": torchmetrics.MeanAbsoluteError()
+                }
+            )
+            output_stress = spk.task.ModelOutput(
+                name='stress',
+                loss_fn=torch.nn.MSELoss(),
+                loss_weight=stress_weight,
+                metrics={
+                    "MAE": torchmetrics.MeanAbsoluteError()
+                }
             )
 
-            trainer.train(device, n_epochs=num_epochs)
+            # Make the trainer
+            task = spk.task.AtomisticTask(
+                model=model,
+                outputs=[output_energy, output_forces, output_stress],
+                optimizer_cls=torch.optim.AdamW,
+                optimizer_args={"lr": learning_rate}
+            )
+
+            csv_writer = CSVLogger(td)
+            model_path = td / "best_inference_model"
+            callbacks = [
+                spk.train.ModelCheckpoint(
+                    model_path=str(model_path),
+                    save_top_k=1,
+                    monitor="val_loss"
+                ),
+            ]
+
+            trainer = pl.Trainer(
+                callbacks=callbacks,
+                logger=csv_writer,
+                default_root_dir=td,
+                max_epochs=num_epochs,
+                enable_progress_bar=False,
+            )
+            trainer.fit(task, dataset)
 
             # Load in the best model
-            model_msg = torch.load(os.path.join(td, 'best_model'), map_location='cpu')
+            model = torch.load(model_path, map_location='cpu')
 
             # Load in the training results
-            train_results = pd.read_csv(os.path.join(td, 'log.csv'))
+            train_results = pd.read_csv(next(td.rglob('metrics.csv')))
 
-            return self.serialize_model(model_msg), train_results
+            return self.serialize_model(model), train_results
 
     def make_calculator(self, model_msg: bytes | State, device: str) -> Calculator:
         # Write model to disk
