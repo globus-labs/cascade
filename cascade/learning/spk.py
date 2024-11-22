@@ -15,12 +15,13 @@ import pandas as pd
 import numpy as np
 import torch
 import ase
+from schnetpack.model import NeuralNetworkPotential
 
 from .base import BaseLearnableForcefield, State
 from .utils import estimate_atomic_energies
 
 
-class SchnetPackInterface(BaseLearnableForcefield):
+class SchnetPackInterface(BaseLearnableForcefield[NeuralNetworkPotential]):
     """Forcefield based on the SchNetPack implementation of SchNet"""
 
     def __init__(self, scratch_dir: Path | None = None, timeout: float = None):
@@ -90,6 +91,12 @@ class SchnetPackInterface(BaseLearnableForcefield):
         for s, e in atomic_energies_dict.items():
             atomrefs[data.atomic_numbers[s]] = e
 
+        # Access the cutoff distance from the representation layer
+        cutoff = model.representation.cutoff_fn.cutoff.cpu().numpy().item()
+        for post in model.postprocessors:
+            if isinstance(post, trn.AddOffsets):
+                post.atomref = torch.from_numpy(atomrefs)
+
         # Start the training process
         with TemporaryDirectory(dir=self.scratch_dir, prefix='spk') as td:
             td = Path(td)
@@ -114,8 +121,7 @@ class SchnetPackInterface(BaseLearnableForcefield):
                 num_train=len(train_dataset),
                 num_val=len(valid_data),
                 transforms=[
-                    trn.ASENeighborList(cutoff=5.),
-                    trn.RemoveOffsets("energy", remove_mean=True, remove_atomrefs=False),
+                    trn.ASENeighborList(cutoff=cutoff),
                     trn.CastTo32()
                 ],
                 num_workers=0,
@@ -185,18 +191,20 @@ class SchnetPackInterface(BaseLearnableForcefield):
 
             return self.serialize_model(model), train_results
 
-    def make_calculator(self, model_msg: bytes | State, device: str) -> Calculator:
+    def make_calculator(self, model_msg: bytes | NeuralNetworkPotential, device: str) -> Calculator:
         # Write model to disk
         with NamedTemporaryFile(suffix='.pt') as tf:
             tf.close()
             tf_path = Path(tf.name)
             tf_path.write_bytes(self.serialize_model(model_msg))
 
+            model = self.get_model(model_msg)
+            cutoff = model.representation.cutoff_fn.cutoff.cpu().numpy().item()
             return spk.interfaces.SpkCalculator(
                 model_file=str(tf_path),
                 neighbor_list=spk.transform.SkinNeighborList(
                     cutoff_skin=2.0,
-                    neighbor_list=spk.transform.ASENeighborList(cutoff=5.)
+                    neighbor_list=spk.transform.ASENeighborList(cutoff=cutoff)
                 ),
                 energy_unit='eV',
                 stress_key='stress',

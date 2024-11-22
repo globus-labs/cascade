@@ -26,6 +26,9 @@ def schnet():
         representation=schnet,
         input_modules=[spk.atomistic.Strain(), pairwise_distance],
         output_modules=[pred_energy, pred_forces],
+        postprocessors=[
+            spk.transform.AddOffsets("energy", add_mean=True, add_atomrefs=False),
+        ]
     )
     return model
 
