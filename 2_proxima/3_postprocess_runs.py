@@ -3,7 +3,6 @@
 1. saves trajectories as extended xyz format for visualization in ovito
 2. calculates diffusivities and saves numbers/plot to disk
 
-
 """
 from argparse import ArgumentParser
 from pathlib import Path
