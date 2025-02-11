@@ -63,17 +63,20 @@ for t, atoms in enumerate(traj[1:]):
             steps_new[t] = 1
             # update the reference n_neighbor distribution
             nn = nn_new
+            # keep track of the new neighbor states we access
+            nn_all.append(nn)
     else: 
         steps_wrong[t] = 1
 
 hop_indices = np.where(steps_new == 1)[0]
 durations = np.diff(hop_indices)
-durations = hop_indices[0] + list(durations)
+#durations = hop_indices[0] + list(durations)
 
 np.savez(path/'hops.npz', 
     hop_indices=hop_indices,
     durations=durations,
     steps_new=steps_new,
     steps_wrong=steps_wrong,
+    nn_all=nn_all
 )
 

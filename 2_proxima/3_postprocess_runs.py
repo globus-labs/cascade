@@ -19,19 +19,25 @@ from cascade.utils import unwrap_trajectory, calculate_sqared_disp
 
 parser = ArgumentParser()
 parser.add_argument('path', type=str)
-parser.add_argument('--start_index', 
+parser.add_argument('--start-index', 
                     type=int, 
                     default=5000,
                     help='Which index')
+parser.add_argument('--subtract-com', 
+                    type=int, 
+                    default=0, 
+                    help='Whether to subtract center of mass, helpful when the simulation drifts')
 
 args = parser.parse_args()
 
 # do all work in the target directory
 os.chdir(args.path)
+print(f"setting dir to {args.path}")
+
 traj = read('md.traj', index=':')
 
 # save the extended xyz
-extxyz.write_extxyz('traj.xyz', traj)
+#extxyz.write_extxyz('traj.xyz', traj)
 
 E0 = traj[0].get_potential_energy()
 E = [a.get_potential_energy() - E0 for a in traj]
@@ -64,7 +70,7 @@ print('Unwrapping trajectory')
 traj_unwrapped = unwrap_trajectory(traj)
 
 print('Computing mean squared displacement')
-msd = calculate_sqared_disp(traj_unwrapped, n_jobs=-1)
+msd = calculate_sqared_disp(traj_unwrapped, n_jobs=-1, subtract_com_shift=bool(args.subtract_com))
 t = np.arange(msd.shape[0])
 
 
@@ -89,9 +95,9 @@ plt.axvline(poly_stop, color='k', linestyle='dotted')
 plt.ylabel(r'$\langle \Delta r^2(t) \rangle$')
 plt.xlabel('t (fs)')
 plt.legend()
-plt.savefig('msd.png')
+plt.savefig(f'msd-com={args.subtract_com}.png')
 
-np.savez('msd.npz', 
+np.savez(f'msd-com={args.subtract_com}.npz', 
          msd=msd,
          traj_unwrapped=traj_unwrapped,
          m=m, b=b, d=m/6
