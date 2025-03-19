@@ -366,6 +366,17 @@ class SerialLearningCalculator(Calculator):
         # Never skip defaults because testing for equality between current and default breaks for our data types
         output = super().todict(False)
 
+        # Drop a brief status report into here as well
+        #  Note: you must convert from numpy to Python int/floats before serialization
+        output.update({
+            'blending_step': int(self.blending_step),
+            'total_invocations': int(self.total_invocations),
+            'target_invocations': int(self.target_invocations),
+        })
+        if self.error_history is not None:
+            output['current_error'] = float(np.mean([e for _, e in self.error_history]))
+
         # The models don't json serialize, so let's skip them
         output.pop('models')
+        output.pop('learner')
         return output
