@@ -125,6 +125,7 @@ if __name__ == "__main__":
         input_modules=[
             spk.atomistic.Strain(), spk.atomistic.PairwiseDistances(),
         ],
+        output_modules=[pred_energy, pred_forces],
         postprocessors=[
             spk.transform.AddOffsets("energy", add_mean=True, add_atomrefs=False),
         ]

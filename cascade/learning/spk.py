@@ -40,7 +40,8 @@ class SchnetPackInterface(BaseLearnableForcefield[NeuralNetworkPotential]):
                  batch_size: int = 64,
                  device: str = 'cpu') -> (np.ndarray, list[np.ndarray], np.ndarray):
         # Get the message
-        model_msg = self.get_model(model_msg)
+        model = self.get_model(model_msg)
+        model.to(device)
 
         # Iterate over chunks, coverting as we go
         converter = spk.interfaces.AtomsConverter(
@@ -52,7 +53,7 @@ class SchnetPackInterface(BaseLearnableForcefield[NeuralNetworkPotential]):
         for batch in batched(atoms, batch_size):
             # Push the batch to the device
             inputs = converter(list(batch))
-            pred = model_msg(inputs)
+            pred = model(inputs)
 
             # Extract data
             energies.extend(pred['energy'].detach().cpu().numpy().tolist())
@@ -124,7 +125,7 @@ class SchnetPackInterface(BaseLearnableForcefield[NeuralNetworkPotential]):
                     trn.ASENeighborList(cutoff=cutoff),
                     trn.CastTo32()
                 ],
-                num_workers=0,
+                num_workers=1,
             )
             dataset.train_idx = np.arange(0, len(train_data)).tolist()
             dataset.val_idx = np.arange(len(train_data), len(train_data) + len(valid_data)).tolist()
@@ -180,6 +181,7 @@ class SchnetPackInterface(BaseLearnableForcefield[NeuralNetworkPotential]):
                 default_root_dir=td,
                 max_epochs=num_epochs,
                 enable_progress_bar=False,
+                accelerator=device,
             )
             trainer.fit(task, dataset)
 
