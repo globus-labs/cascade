@@ -130,7 +130,7 @@ def test_proxima(starting_frame, simple_proxima):
 def test_logging(simple_proxima, initialized_db, tmpdir):
     """Ensure we can write the logs to the target section"""
 
-    with raises(ValueError, match='specify'):
+    with raises(ValueError, match='requires either'):
         simple_proxima.write_log_to_dir()
 
     # Make sure it happens if specifically-set
