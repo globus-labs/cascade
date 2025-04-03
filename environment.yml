@@ -15,6 +15,7 @@ dependencies:
 
   # Computational chemistry
   - packmol
+  - cp2k
 
   # For nersc's jupyterlab
   - ipykernel
