@@ -135,7 +135,7 @@ def test_logging(simple_proxima, initialized_db, tmpdir):
 
     # Make sure it happens if specifically-set
     set_dir = Path(tmpdir) / 'manually-set'
-    simple_proxima.write_log_to_dir()
+    simple_proxima.write_log_to_dir(set_dir)
     assert set_dir.joinpath('proxima.json').is_file()
 
     set_dir = Path(tmpdir) / 'parameter'
