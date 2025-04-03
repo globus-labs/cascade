@@ -12,7 +12,6 @@ import pandas as pd
 from ase import Atoms, data
 from ase.calculators.calculator import Calculator
 from ignite.engine import Engine, Events
-from ignite.handlers import EarlyStopping
 from mace.data import AtomicData
 from mace.data.utils import config_from_atoms
 from mace.modules import WeightedHuberEnergyForcesStressLoss, ScaleShiftMACE
@@ -257,7 +256,6 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
                 if patience_status['patience'] < 0:
                     engine.terminate()
                     logger.info('Early stopping criterion met')
-
 
         logger.info('Started training')
         trainer.run(train_loader, max_epochs=num_epochs)
