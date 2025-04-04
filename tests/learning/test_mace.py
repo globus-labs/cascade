@@ -18,7 +18,7 @@ def test_training(example_data, mace, reset_weights):
     # Get baseline predictions, train
     mi = MACEInterface()
     orig_e, orig_f, orig_s = mi.evaluate(mace, example_data)
-    model_msg, log = mi.train(mace, example_data, example_data, 2, batch_size=2, reset_weights=reset_weights)
+    model_msg, log = mi.train(mace, example_data, example_data, 2, batch_size=2, reset_weights=reset_weights, patience=1)
     assert len(log) == 2
 
     # Make sure the predictions change
