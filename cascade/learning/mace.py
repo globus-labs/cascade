@@ -124,6 +124,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
               force_weight: float = 10,
               stress_weight: float = 100,
               reset_weights: bool = False,
+              patience: int | None = None,
               **kwargs) -> tuple[bytes, pd.DataFrame]:
 
         # Load the model
@@ -220,9 +221,10 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
 
         # Make the validation step
         valid_losses = []
+        patience_status = {'best_loss': np.inf, 'patience': patience}
 
         @trainer.on(Events.EPOCH_COMPLETED)
-        def validation_process(engine):
+        def validation_process(engine: Engine):
             model.eval()
             logger.info(f'Started validation for epoch {engine.state.epoch - 1}')
 
@@ -241,6 +243,19 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
                 detailed_loss['total_loss'] = loss.item()
                 valid_losses.append(detailed_loss)
             logger.info(f'Completed validation for epoch {engine.state.epoch - 1}')
+
+            # Add early stopping if desired
+            if patience_status['patience'] is not None:
+                cur_loss = np.mean([x['total_loss'] for x in valid_losses if x['epoch'] == engine.state.epoch - 1])
+                if cur_loss < patience_status['best_loss']:
+                    patience_status['best_loss'] = cur_loss
+                    patience_status['patience'] = patience
+                else:
+                    patience_status['patience'] -= 1
+
+                if patience_status['patience'] < 0:
+                    engine.terminate()
+                    logger.info('Early stopping criterion met')
 
         logger.info('Started training')
         trainer.run(train_loader, max_epochs=num_epochs)
