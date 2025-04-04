@@ -204,8 +204,6 @@ class SerialLearningCalculator(Calculator):
             self.train_logs.append(log)
             logger.debug(f'Finished training model {i}')
         self.model_version += 1
-        if 'log_dir' in self.parameters:
-            self.write_log_to_dir()
 
     def write_log_to_dir(self, log_dir: Path | None = None):
         """Write the current proxima state to a logging directory
@@ -248,6 +246,8 @@ class SerialLearningCalculator(Calculator):
             self.surrogate_calc = EnsembleCalculator(
                 calculators=[self.learner.make_calculator(m, self.parameters['device']) for m in self.models]
             )
+            if 'log_dir' in self.parameters:  # Log if desired
+                self.write_log_to_dir()
         self.surrogate_calc.calculate(atoms, properties + ['forces'], system_changes)  # Make sure forces are computed too
 
         # Compute an uncertainty metric for the ensemble model
@@ -365,6 +365,8 @@ class SerialLearningCalculator(Calculator):
             'target_invocations': self.target_invocations,
             'model_version': self.model_version
         }
+
+        # Write models if they have been assembled into a calculator
         if self.surrogate_calc is not None:
             output['models'] = [self.learner.serialize_model(s) for s in self.models]
         return output

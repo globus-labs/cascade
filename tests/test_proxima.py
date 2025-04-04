@@ -127,7 +127,7 @@ def test_proxima(starting_frame, simple_proxima):
     assert simple_proxima.threshold is not None
 
 
-def test_logging(simple_proxima, initialized_db, tmpdir):
+def test_logging(simple_proxima, initialized_db, starting_frame, tmpdir):
     """Ensure we can write the logs to the target section"""
 
     with raises(ValueError, match='requires either'):
@@ -140,7 +140,7 @@ def test_logging(simple_proxima, initialized_db, tmpdir):
 
     set_dir = Path(tmpdir) / 'parameter'
     simple_proxima.parameters['log_dir'] = set_dir
-    simple_proxima.retrain_surrogate()
+    simple_proxima.get_forces(starting_frame)
     assert set_dir.joinpath('proxima.json').is_file()
 
 
