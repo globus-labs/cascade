@@ -231,7 +231,7 @@ class SerialLearningCalculator(Calculator):
             out_dir.joinpath(f'model_{i}.bin').write_bytes(model)
 
         # Save the training log
-        for i, log in enumerate(state.pop('train_logs', [])):
+        for i, log in enumerate(state.pop('train_logs') or []):
             log.to_csv(out_dir.joinpath(f'train-log_{i}.csv'), index=False)
 
         with out_dir.joinpath('proxima.json').open('w') as fp:
