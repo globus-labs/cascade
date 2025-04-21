@@ -1,6 +1,6 @@
 [project]
 name = "cascade"
-version = "0.0.1"
+dynamic = ["version"]
 authors = [
     { name = "Logan Ward", email = "lward@anl.gov" },
     { name = "Logan Ward", email = "lward@anl.gov" },
@@ -31,7 +31,7 @@ include = ['cascade*']
 
 [project.optional-dependencies]
 test = [
-    'nbstripout',  # Used as a pre-commit hook
+    'nbstripout', # Used as a pre-commit hook
     'flake8',
     'pytest',
     'pytest-forked',
@@ -50,3 +50,9 @@ mace = [
     'mace-torch',
     'pytorch-ignite'
 ]
+
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
