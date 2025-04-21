@@ -5,6 +5,7 @@ from typing import List, Optional, Any
 from pathlib import Path
 from random import random
 import logging
+import json
 
 import numpy as np
 import pandas as pd
@@ -27,10 +28,10 @@ class SerialLearningCalculator(Calculator):
 
     Will run `history_length` steps under physics before considering surrogate
 
-    Switching can be applied smoothly, that is by taking a mixture of physics-
-    and surrogate-derived quantities that moves slowly between full surrogate
-    and full physics utilization over time. The rate of this smoothing is
-    controleld by the parameters n_blending_steps
+    Switching can be applied smoothly by mixing of physics-
+    and surrogate-derived energies, forces, and stresses.
+    The calculator will move between full surrogate
+    and full physics at a rate controlled by the ``n_blending_steps`` parameter.
 
     Parameters for the calculator are:
 
@@ -76,6 +77,9 @@ class SerialLearningCalculator(Calculator):
     db_path: Path or str
         Database in which to store the results of running the target calculator,
         which are used to train the surrogate model
+    log_path: Path or str or None
+        Optional. Path to a directory in which to write model files and training logs.
+        Writes logs after each re-training event.
     """
 
     default_parameters = {
@@ -92,7 +96,8 @@ class SerialLearningCalculator(Calculator):
         'min_target_fraction': 0.,
         'n_blending_steps': 0,
         'history_length': 8,
-        'db_path': None
+        'db_path': 'proxima.db',
+        'log_path': None
     }
 
     train_logs: Optional[List[pd.DataFrame]] = None
@@ -200,6 +205,36 @@ class SerialLearningCalculator(Calculator):
             logger.debug(f'Finished training model {i}')
         self.model_version += 1
 
+    def write_log_to_dir(self, log_dir: Path | None = None):
+        """Write the current proxima state to a logging directory
+
+        Args:
+            log_dir: Path to the output directory. Use the one
+        """
+
+        # Output dir
+        if log_dir is not None:
+            out_dir = log_dir
+        elif 'log_dir' in self.parameters:
+            out_dir = self.parameters['log_dir']
+        else:
+            raise ValueError('Logging requires either setting the `log_dir` parameter of the calculator, '
+                             'or supplying one to this function.')
+
+        state = self.get_state()
+
+        # Make the output directory
+        out_dir.mkdir(exist_ok=True, parents=True)
+        for i, model in enumerate(state.pop('models', [])):
+            out_dir.joinpath(f'model_{i}.bin').write_bytes(model)
+
+        # Save the training log
+        for i, log in enumerate(state.pop('train_logs') or []):
+            log.to_csv(out_dir.joinpath(f'train-log_{i}.csv'), index=False)
+
+        with out_dir.joinpath('proxima.json').open('w') as fp:
+            json.dump(state, fp, indent=2)
+
     def calculate(
             self, atoms=None, properties=all_properties, system_changes=all_changes
     ):
@@ -211,6 +246,8 @@ class SerialLearningCalculator(Calculator):
             self.surrogate_calc = EnsembleCalculator(
                 calculators=[self.learner.make_calculator(m, self.parameters['device']) for m in self.models]
             )
+            if 'log_dir' in self.parameters:  # Log if desired
+                self.write_log_to_dir()
         self.surrogate_calc.calculate(atoms, properties + ['forces'], system_changes)  # Make sure forces are computed too
 
         # Compute an uncertainty metric for the ensemble model
@@ -328,6 +365,8 @@ class SerialLearningCalculator(Calculator):
             'target_invocations': self.target_invocations,
             'model_version': self.model_version
         }
+
+        # Write models if they have been assembled into a calculator
         if self.surrogate_calc is not None:
             output['models'] = [self.learner.serialize_model(s) for s in self.models]
         return output
@@ -366,6 +405,17 @@ class SerialLearningCalculator(Calculator):
         # Never skip defaults because testing for equality between current and default breaks for our data types
         output = super().todict(False)
 
+        # Drop a brief status report into here as well
+        #  Note: you must convert from numpy to Python int/floats before serialization
+        output.update({
+            'blending_step': int(self.blending_step),
+            'total_invocations': int(self.total_invocations),
+            'target_invocations': int(self.target_invocations),
+        })
+        if self.error_history is not None:
+            output['current_error'] = float(np.mean([e for _, e in self.error_history]))
+
         # The models don't json serialize, so let's skip them
         output.pop('models')
+        output.pop('learner')
         return output

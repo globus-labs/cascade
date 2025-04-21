@@ -6,7 +6,7 @@ import pickle as pkl
 import logging
 
 from ase.calculators.cp2k import CP2K
-from pytest import fixture
+from pytest import fixture, raises
 from ase.db import connect
 from ase.io import read
 from ase import Atoms
@@ -125,6 +125,23 @@ def test_proxima(starting_frame, simple_proxima):
     simple_proxima.threshold = None
     simple_proxima.set_state(state)
     assert simple_proxima.threshold is not None
+
+
+def test_logging(simple_proxima, initialized_db, starting_frame, tmpdir):
+    """Ensure we can write the logs to the target section"""
+
+    with raises(ValueError, match='requires either'):
+        simple_proxima.write_log_to_dir()
+
+    # Make sure it happens if specifically-set
+    set_dir = Path(tmpdir) / 'manually-set'
+    simple_proxima.write_log_to_dir(set_dir)
+    assert set_dir.joinpath('proxima.json').is_file()
+
+    set_dir = Path(tmpdir) / 'parameter'
+    simple_proxima.parameters['log_dir'] = set_dir
+    simple_proxima.get_forces(starting_frame)
+    assert set_dir.joinpath('proxima.json').is_file()
 
 
 def test_max_size(starting_frame, simple_proxima, target_calc, initialized_db, caplog):
