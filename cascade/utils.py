@@ -1,8 +1,9 @@
+"""Utilities employed across cascade"""
 from io import StringIO
 from copy import deepcopy
 
+from ase import io as aio
 import numpy as np
-import ase
 from ase import Atoms
 from ase.calculators.calculator import Calculator
 from ase.calculators.singlepoint import SinglePointCalculator
@@ -26,18 +27,19 @@ def write_to_string(atoms: Atoms, fmt: str, **kwargs) -> str:
     return out.getvalue()
 
 
-def read_from_string(atoms_msg: str, fmt: str) -> Atoms:
+def read_from_string(atoms_msg: str, fmt: str, index=None) -> Atoms:
     """Read an ASE atoms object from a string
 
     Args:
         atoms_msg: String format of the object to read
         fmt: Format (cannot be autodetected)
+        index: Which frame(s) to read. See :meth:`ase.io.read`
     Returns:
         Parsed atoms object
     """
 
     out = StringIO(str(atoms_msg))  # str() ensures that Proxies are resolved
-    return ase.io.read(out, format=fmt)
+    return aio.read(out, format=fmt, index=index)
 
 
 def canonicalize(atoms: Atoms) -> Atoms:
@@ -90,6 +92,6 @@ def to_voigt(stress: np.ndarray) -> np.ndarray:
     if stress.shape == (3, 3):
         stress = np.array([stress[0, 0], stress[1, 1], stress[2, 2],
                            stress[1, 2], stress[0, 2], stress[0, 1]])
-    elif stress.shape != (6, ):
+    elif stress.shape != (6,):
         raise ValueError(f"Stress tensor must either be of shape (3,3) or (6,), got {stress.shape}")
     return stress
