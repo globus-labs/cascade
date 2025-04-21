@@ -50,6 +50,11 @@ mace = [
     'mace-torch',
     'pytorch-ignite'
 ]
+docs = [
+    'sphinx',
+    'pydata-sphinx-theme',
+    'nbsphinx'
+]
 
 [build-system]
 requires = ["setuptools>=64", "setuptools-scm>=8"]

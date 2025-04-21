@@ -1,7 +1,7 @@
 Running Dynamics
 ================
 
-.. note:: A picture would be nice.
+.. note:: We may drop this part of Cascade as we continue building. Don't bother learning this yet.
 
 The :class:`~cascade.dynamics.DynamicsProtocol` class from Cascade propagates a dynamic system
 using the learned surrogate and returns copies of the system at many timesteps for use
