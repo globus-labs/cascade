@@ -5,29 +5,20 @@ channels:
 dependencies:
   # Core dependencies
   - python==3.11
-  - matplotlib
-  - scikit-learn>=1
-  - jupyterlab
-  - pandas
-  - pytest
-  - flake8
-  - pip
 
   # Computational chemistry
   - packmol
   - cp2k
 
-  # For nersc's jupyterlab
-  - ipykernel
-
-# Pip packages for all of them
+  # Pip packages for the Python modules
+  - pip
   - pip:
-      - git+https://gitlab.com/ase/ase.git
-      - git+https://github.com/ACEsuit/mace.git
-      - torch
-      - mlflow
-      - pytorch-ignite
-      - python-git-info
-      - tqdm
+      # General utilities
+      - matplotlib
       - papermill
-      - -e .
+      - scikit-learn>=1
+      - jupyterlab
+      - pandas
+
+      # ML side
+      - -e .[mace,chgnet,ani]

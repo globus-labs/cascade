@@ -59,7 +59,6 @@ def simple_proxima(simple_model, target_calc, tmpdir):
 def initialized_db(simple_proxima, target_calc, starting_frame):
     """Initialize the database"""
     # Compute a set of initial calcs if required
-    global _initial_calcs
     if len(_initial_calcs) == 0:
         for i in range(12):
             new_frame = starting_frame.copy()

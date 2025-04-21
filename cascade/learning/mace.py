@@ -29,6 +29,34 @@ MACEState = ScaleShiftMACE
 """Just the model, which we require being the MACE which includes scale shifting logic"""
 
 
+# TODO (wardlt): Use https://github.com/ACEsuit/mace/pull/830 when merged
+def freeze_layers(model: torch.nn.Module, n: int = 4) -> None:
+    """
+    Freezes the first `n` layers of a model. If `n` is negative, freezes the last `|n|` layers.
+    Args:
+        model (torch.nn.Module): The model.
+        n (int): The number of layers to freeze.
+    """
+    layers = list(model.children())
+    num_layers = len(layers)
+
+    logging.info(f"Total layers in model: {num_layers}")
+
+    if abs(n) > num_layers:
+        logging.warning(
+            f"Requested {n} layers, but model only has {num_layers}. Adjusting `n` to fit the model."
+        )
+        n = num_layers if n > 0 else -num_layers
+
+    frozen_layers = layers[:n] if n > 0 else layers[n:]
+
+    logging.info(f"Freezing {len(frozen_layers)} layers.")
+
+    for layer in frozen_layers:
+        for param in layer.parameters():
+            param.requires_grad = False
+
+
 def atoms_to_loader(atoms: list[Atoms], batch_size: int, z_table: AtomicNumberTable, r_max: float, **kwargs):
     """
     Make a data loader from a list of ASE atoms objects
@@ -125,7 +153,29 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
               stress_weight: float = 100,
               reset_weights: bool = False,
               patience: int | None = None,
-              **kwargs) -> tuple[bytes, pd.DataFrame]:
+              num_freeze: int | None = None
+              ) -> tuple[bytes, pd.DataFrame]:
+        """Train a model
+
+        Args:
+            model_msg: Model to be retrained
+            train_data: Structures used for training
+            valid_data: Structures used for validation
+            num_epochs: Number of training epochs
+            device: Device (e.g., 'cuda', 'cpu') used for training
+            batch_size: Batch size during training
+            learning_rate: Initial learning rate for optimizer
+            huber_deltas: Delta parameters for the loss functions for energy and force
+            force_weight: Amount of weight to use for the force part of the loss function
+            stress_weight: Amount of weight to use for the stress part of the loss function
+            reset_weights: Whether to reset the weights before training
+            patience: Halt training after validation error increases for these many epochs
+            num_freeze: Number of layers to freeze. Starts from the top of the model (node embedding)
+                See: `Radova et al. <https://arxiv.org/html/2502.15582v1>`_
+        Returns:
+            - model: Retrained model
+            - history: Training history
+        """
 
         # Load the model
         model = self.get_model(model_msg)
@@ -141,6 +191,10 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
         # Unpin weights
         for p in model.parameters():
             p.requires_grad = True
+
+        # Freeze desired layers
+        if num_freeze is not None:
+            freeze_layers(model, num_freeze)
 
         # Convert the training data from ASE -> MACE Configs
         train_loader = atoms_to_loader(train_data, batch_size, z_table, r_max, shuffle=True, drop_last=True)

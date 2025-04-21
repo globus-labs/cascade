@@ -48,3 +48,13 @@ def test_inference(mace, example_data):
     assert np.isclose(atoms.get_potential_energy(), energy[0]).all()
     assert np.isclose(atoms.get_forces(), forces[0]).all()
     assert np.isclose(atoms.get_stress(voigt=False), stresses[0]).all()
+
+
+def test_freeze(example_data, mace):
+    # Get baseline predictions, train
+    mi = MACEInterface()
+    model_msg, _ = mi.train(mace, example_data, example_data, 2, batch_size=2, patience=1, num_freeze=2)
+    model: MACEState = mi.get_model(model_msg)
+    is_trainable = [all(y.requires_grad for y in x.parameters()) for x in model.children()]
+    assert not is_trainable[0]
+    assert all(is_trainable[4:6])  # Layers >4 include some layers which are not trainable
