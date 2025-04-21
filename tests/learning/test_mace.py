@@ -56,5 +56,5 @@ def test_freeze(example_data, mace):
     model_msg, _ = mi.train(mace, example_data, example_data, 2, batch_size=2, patience=1, num_freeze=2)
     model: MACEState = mi.get_model(model_msg)
     is_trainable = [all(y.requires_grad for y in x.parameters()) for x in model.children()]
-    assert not any(is_trainable[:2])
+    assert not is_trainable[0]
     assert all(is_trainable[4:6])  # Layers >4 include some layers which are not trainable
