@@ -339,6 +339,19 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
                 valid_losses.append(detailed_loss)
             logger.info(f'Completed validation for epoch {engine.state.epoch - 1}')
 
+            # Add early stopping if desired
+            if patience_status['patience'] is not None:
+                cur_loss = np.mean([x['total_loss'] for x in valid_losses if x['epoch'] == engine.state.epoch - 1])
+                if cur_loss < patience_status['best_loss']:
+                    patience_status['best_loss'] = cur_loss
+                    patience_status['patience'] = patience
+                else:
+                    patience_status['patience'] -= 1
+
+                if patience_status['patience'] < 0:
+                    engine.terminate()
+                    logger.info('Early stopping criterion met')
+
         # Add multi-head replay, if desired
         if replay is not None:
             # Downselect data, if desired
@@ -363,7 +376,6 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
             @trainer.on(Events.EPOCH_COMPLETED(every=replay.epoch_frequency))
             def replay_process(engine: Engine):
                 replay_model.train()
-                epoch = engine.state.epoch - 1
                 logger.info(f'Started replay for epoch {engine.state.epoch - 1}')
 
                 for batch in replay_loader:
@@ -383,19 +395,6 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
                     detailed_loss['epoch'] = engine.state.epoch - 1
                     detailed_loss['total_loss_replay'] = loss.item()
                     valid_losses.append(detailed_loss)
-
-            # Add early stopping if desired
-            if patience_status['patience'] is not None:
-                cur_loss = np.mean([x['total_loss'] for x in valid_losses if x['epoch'] == engine.state.epoch - 1])
-                if cur_loss < patience_status['best_loss']:
-                    patience_status['best_loss'] = cur_loss
-                    patience_status['patience'] = patience
-                else:
-                    patience_status['patience'] -= 1
-
-                if patience_status['patience'] < 0:
-                    engine.terminate()
-                    logger.info('Early stopping criterion met')
 
         logger.info('Started training')
         trainer.run(train_loader, max_epochs=num_epochs)
