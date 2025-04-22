@@ -105,6 +105,32 @@ def atoms_to_loader(atoms: list[Atoms], batch_size: int, z_table: AtomicNumberTa
 class MACEInterface(BaseLearnableForcefield[MACEState]):
     """Interface to the `MACE library <https://github.com/ACEsuit/mace>`_"""
 
+    def create_extra_heads(self, model: ScaleShiftMACE, num_heads: int) -> list[ScaleShiftMACE]:
+        """Create multiple instances of a ScaleShiftMACE model that share some of the same layers
+
+        The new models will share the node embedding, interaction, and product layers;
+        but will have separate atomic energy, readout, and scale_shift layers.
+
+        Args:
+            model: Model to be replicated
+            num_heads: Number of replicas to create
+        Returns:
+            Additional copies of the model with the same internal layers
+        """
+
+        _shared_layers = ('node_embedding', 'interactions', 'products')
+
+        output = []
+        for _ in range(num_heads):
+            # Make a deep copy of the model
+            new_model = self.get_model(self.serialize_model(model))
+
+            # Copy over the shared layers
+            for layer in _shared_layers:
+                setattr(new_model, layer, getattr(model, layer))
+            output.append(new_model)
+        return output
+
     def evaluate(self,
                  model_msg: bytes | State,
                  atoms: list[ase.Atoms],

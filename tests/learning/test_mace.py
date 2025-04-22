@@ -58,3 +58,14 @@ def test_freeze(example_data, mace):
     is_trainable = [all(y.requires_grad for y in x.parameters()) for x in model.children()]
     assert not is_trainable[0]
     assert all(is_trainable[4:6])  # Layers >4 include some layers which are not trainable
+
+
+def test_make_heads(mace):
+    mi = MACEInterface()
+    new_models = mi.create_extra_heads(mace, 2)
+    assert len(new_models) == 2
+    assert new_models[0].interactions is new_models[1].interactions
+    assert new_models[0].interactions is mace.interactions
+
+    assert new_models[1].readouts is not new_models[0].readouts
+    assert new_models[1].readouts is not mace.readouts
