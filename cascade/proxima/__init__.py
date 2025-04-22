@@ -220,6 +220,7 @@ class SerialLearningCalculator(Calculator):
         else:
             raise ValueError('Logging requires either setting the `log_dir` parameter of the calculator, '
                              'or supplying one to this function.')
+        out_dir = Path(out_dir)
 
         state = self.get_state()
 
@@ -315,7 +316,7 @@ class SerialLearningCalculator(Calculator):
         actual_err = np.linalg.norm(target_calc.results['forces'] - surrogate_forces, axis=-1).max()
         if self.error_history is None:
             self.error_history = deque(maxlen=self.parameters['history_length'])
-        self.error_history.append((unc_metric, actual_err))
+        self.error_history.append((float(unc_metric), float(actual_err)))
 
         if len(self.error_history) < self.parameters['history_length']:
             logger.debug(f'Too few entries in training history. {len(self.error_history)} < {self.parameters["history_length"]}')
@@ -355,8 +356,8 @@ class SerialLearningCalculator(Calculator):
         """
 
         output = {
-            'threshold': self.threshold,
-            'alpha': self.alpha,
+            'threshold': None if self.threshold is None else float(self.threshold),
+            'alpha': None if self.alpha is None else float(self.alpha),
             'blending_step': int(self.blending_step),
             'error_history': list(self.error_history) if self.error_history is not None else [],
             'new_points': self.new_points,
