@@ -2,6 +2,7 @@
 of `Batatia et al. <https://arxiv.org/abs/2206.07697>`_"""
 
 import logging
+import random
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -21,12 +22,49 @@ from mace.tools.scripts_utils import extract_config_mace_model
 from mace.calculators import MACECalculator
 
 from cascade.learning.base import BaseLearnableForcefield, State
+from cascade.learning.finetuning import MultiHeadConfig
 from cascade.learning.utils import estimate_atomic_energies
 
 logger = logging.getLogger(__name__)
 
 MACEState = ScaleShiftMACE
 """Just the model, which we require being the MACE which includes scale shifting logic"""
+
+
+def _update_offset_factors(model: ScaleShiftMACE, train_data: list[Atoms], train_loader: DataLoader, device: str):
+    """Update the atomic energies and scale offset layers of a model
+
+    Args:
+        model: Model to be adjusted
+        train_data: Training dataset
+        train_loader: Loader built using the training set
+        device: Device on which to perform inference
+    """
+    # Update the atomic energies using the data from all trajectories
+    z_table = AtomicNumberTable(model.atomic_numbers.cpu().numpy().tolist())
+    new_ae = model.atomic_energies_fn.atomic_energies.cpu().numpy()
+    atomic_energies_dict = estimate_atomic_energies(train_data)
+    for s, e in atomic_energies_dict.items():
+        new_ae[z_table.zs.index(data.atomic_numbers[s])] = e
+    with torch.no_grad():
+        old_ae = model.atomic_energies_fn.atomic_energies
+        model.atomic_energies_fn.atomic_energies = torch.from_numpy(new_ae).to(old_ae.dtype).to(old_ae.device)
+
+    # Update the shift of the energy scale
+    errors = []
+    for batch in train_loader:
+        batch = batch.to(device)
+        num_atoms = batch.ptr[1:] - batch.ptr[:-1]  # Use the offsets to compute the number of atoms per inference
+        ml = model(
+            batch,
+            training=False,
+            compute_force=False,
+            compute_virials=False,
+            compute_stress=False,
+        )
+        error = (ml["energy"] - batch["energy"]) / num_atoms
+        errors.extend(error.cpu().detach().numpy().tolist())
+    model.scale_shift.shift -= np.mean(errors)
 
 
 # TODO (wardlt): Use https://github.com/ACEsuit/mace/pull/830 when merged
@@ -179,7 +217,8 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
               stress_weight: float = 100,
               reset_weights: bool = False,
               patience: int | None = None,
-              num_freeze: int | None = None
+              num_freeze: int | None = None,
+              replay: MultiHeadConfig | None = None
               ) -> tuple[bytes, pd.DataFrame]:
         """Train a model
 
@@ -198,6 +237,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
             patience: Halt training after validation error increases for these many epochs
             num_freeze: Number of layers to freeze. Starts from the top of the model (node embedding)
                 See: `Radova et al. <https://arxiv.org/html/2502.15582v1>`_
+            replay: Settings for replaying an initial training set
         Returns:
             - model: Retrained model
             - history: Training history
@@ -226,33 +266,8 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
         train_loader = atoms_to_loader(train_data, batch_size, z_table, r_max, shuffle=True, drop_last=True)
         valid_loader = atoms_to_loader(valid_data, batch_size, z_table, r_max, shuffle=False, drop_last=True)
 
-        # Update the atomic energies using the data from all trajectories
-        new_ae = model.atomic_energies_fn.atomic_energies.cpu().numpy()
-        atomic_energies_dict = estimate_atomic_energies(train_data)
-        for s, e in atomic_energies_dict.items():
-            new_ae[z_table.zs.index(data.atomic_numbers[s])] = e
-
-        with torch.no_grad():
-            old_ae = model.atomic_energies_fn.atomic_energies
-            model.atomic_energies_fn.atomic_energies = torch.from_numpy(new_ae).to(old_ae.dtype).to(old_ae.device)
-        logger.info('Updated atomic energies')
-
-        # Update the shift of the energy scale
-        errors = []
-        for batch in train_loader:
-            batch = batch.to(device)
-            num_atoms = batch.ptr[1:] - batch.ptr[:-1]  # Use the offsets to compute the number of atoms per inference
-            ml = model(
-                batch,
-                training=False,
-                compute_force=False,
-                compute_virials=False,
-                compute_stress=False,
-            )
-            error = (ml["energy"] - batch["energy"]) / num_atoms
-            errors.extend(error.cpu().detach().numpy().tolist())
-        model.scale_shift.shift -= np.mean(errors)
-        logger.info(f'Shifted model energy scale by {np.mean(errors):.3f} eV/atom')
+        # Update the atomic energies for the current dataset
+        _update_offset_factors(model, train_data, train_loader, device)
 
         opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
         criterion = WeightedHuberEnergyForcesStressLoss(
@@ -267,7 +282,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
 
         def get_loss_stats(b, y):
             """Compute the losses"""
-            na = batch.ptr[1:] - batch.ptr[:-1]
+            na = b.ptr[1:] - b.ptr[:-1]
             return {
                 'energy_mae': torch.mean(torch.abs(b['energy'] - y['energy']) / na).item(),
                 'force_rmse': torch.sqrt(torch.square(b['forces'] - y['forces']).mean()).item(),
@@ -323,6 +338,53 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
                 detailed_loss['total_loss'] = loss.item()
                 valid_losses.append(detailed_loss)
             logger.info(f'Completed validation for epoch {engine.state.epoch - 1}')
+
+            # Add multi-head replay, if desired
+            if replay is not None:
+                # Downselect data, if desired
+                #  TODO (wardlt): Use FPS to pick samples, as in https://arxiv.org/abs/2412.02877
+                if replay.num_downselect == 0:
+                    replay_data = replay.original_dataset.copy()
+                    random.shuffle(replay_data)
+                    replay_data = replay_data[:replay.num_downselect]
+                else:
+                    replay_data = replay.original_dataset
+
+                # Create and re-scale replay
+                replay_model = self.create_extra_heads(model, 1)[0]
+                replay_model.to(device)
+                replay_loader = atoms_to_loader(replay_data, replay.batch_size or batch_size,
+                                                z_table, r_max, shuffle=True, drop_last=True)
+                _update_offset_factors(replay_model, replay_data, replay_loader, device)
+
+                # Make the replay loss
+                replay_opt = torch.optim.Adam(replay_model.parameters(), lr=learning_rate // replay.lr_reduction)
+
+                @trainer.on(Events.EPOCH_COMPLETED)
+                def replay_process(engine: Engine):
+                    replay_model.train()
+                    epoch = engine.state.epoch - 1
+                    if epoch % replay.epoch_frequency != 0:
+                        return
+                    logger.info(f'Started replay for epoch {engine.state.epoch - 1}')
+
+                    for batch in replay_loader:
+                        batch.to(device)
+                        y = replay_model(
+                            batch,
+                            training=True,
+                            compute_force=True,
+                            compute_virials=False,
+                            compute_stress=True,
+                        )
+                        loss = criterion(pred=y, ref=batch)
+                        loss.backward()
+                        replay_opt.step()
+
+                        detailed_loss = dict((f'{k}_replay', v) for k, v in get_loss_stats(batch, y).items())
+                        detailed_loss['epoch'] = engine.state.epoch - 1
+                        detailed_loss['total_loss_replay'] = loss.item()
+                        valid_losses.append(detailed_loss)
 
             # Add early stopping if desired
             if patience_status['patience'] is not None:

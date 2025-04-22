@@ -2,6 +2,7 @@ from mace.calculators import mace_mp
 from pytest import fixture, mark
 import numpy as np
 
+from cascade.learning.finetuning import MultiHeadConfig
 from cascade.learning.mace import MACEState, MACEInterface
 
 
@@ -69,3 +70,20 @@ def test_make_heads(mace):
 
     assert new_models[1].readouts is not new_models[0].readouts
     assert new_models[1].readouts is not mace.readouts
+
+
+@mark.parametrize('epoch_frequency,num_downselect',
+                  [(1, None), (2, None), (1, 1)])
+def test_replay(example_data, mace, epoch_frequency, num_downselect):
+    # Create the replay information
+    replay = MultiHeadConfig(
+        num_downselect=num_downselect,
+        original_dataset=example_data,
+        epoch_frequency=epoch_frequency
+    )
+
+    # Get baseline predictions, train
+    mi = MACEInterface()
+    _, log = mi.train(mace, example_data, example_data, 4, batch_size=2, patience=1, replay=replay)
+    assert 'total_loss_replay' in log.columns
+    assert log['total_loss_replay'].isna().sum() == (4 - 4 // epoch_frequency)  # Ensure reply is skipped occasionally
