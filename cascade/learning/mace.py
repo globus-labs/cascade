@@ -339,52 +339,52 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
                 valid_losses.append(detailed_loss)
             logger.info(f'Completed validation for epoch {engine.state.epoch - 1}')
 
-            # Add multi-head replay, if desired
-            if replay is not None:
-                # Downselect data, if desired
-                #  TODO (wardlt): Use FPS to pick samples, as in https://arxiv.org/abs/2412.02877
-                if replay.num_downselect == 0:
-                    replay_data = replay.original_dataset.copy()
-                    random.shuffle(replay_data)
-                    replay_data = replay_data[:replay.num_downselect]
-                else:
-                    replay_data = replay.original_dataset
+        # Add multi-head replay, if desired
+        if replay is not None:
+            # Downselect data, if desired
+            #  TODO (wardlt): Use FPS to pick samples, as in https://arxiv.org/abs/2412.02877
+            if replay.num_downselect == 0:
+                replay_data = replay.original_dataset.copy()
+                random.shuffle(replay_data)
+                replay_data = replay_data[:replay.num_downselect]
+            else:
+                replay_data = replay.original_dataset
 
-                # Create and re-scale replay
-                replay_model = self.create_extra_heads(model, 1)[0]
-                replay_model.to(device)
-                replay_loader = atoms_to_loader(replay_data, replay.batch_size or batch_size,
-                                                z_table, r_max, shuffle=True, drop_last=True)
-                _update_offset_factors(replay_model, replay_data, replay_loader, device)
+            # Create and re-scale replay
+            replay_model = self.create_extra_heads(model, 1)[0]
+            replay_model.to(device)
+            replay_loader = atoms_to_loader(replay_data, replay.batch_size or batch_size,
+                                            z_table, r_max, shuffle=True, drop_last=True)
+            _update_offset_factors(replay_model, replay_data, replay_loader, device)
 
-                # Make the replay loss
-                replay_opt = torch.optim.Adam(replay_model.parameters(), lr=learning_rate // replay.lr_reduction)
+            # Make the replay loss
+            replay_opt = torch.optim.Adam(replay_model.parameters(), lr=learning_rate // replay.lr_reduction)
 
-                @trainer.on(Events.EPOCH_COMPLETED)
-                def replay_process(engine: Engine):
-                    replay_model.train()
-                    epoch = engine.state.epoch - 1
-                    if epoch % replay.epoch_frequency != 0:
-                        return
-                    logger.info(f'Started replay for epoch {engine.state.epoch - 1}')
+            @trainer.on(Events.EPOCH_COMPLETED)
+            def replay_process(engine: Engine):
+                replay_model.train()
+                epoch = engine.state.epoch - 1
+                if epoch % replay.epoch_frequency != 0:
+                    return
+                logger.info(f'Started replay for epoch {engine.state.epoch - 1}')
 
-                    for batch in replay_loader:
-                        batch.to(device)
-                        y = replay_model(
-                            batch,
-                            training=True,
-                            compute_force=True,
-                            compute_virials=False,
-                            compute_stress=True,
-                        )
-                        loss = criterion(pred=y, ref=batch)
-                        loss.backward()
-                        replay_opt.step()
+                for batch in replay_loader:
+                    batch.to(device)
+                    y = replay_model(
+                        batch,
+                        training=True,
+                        compute_force=True,
+                        compute_virials=False,
+                        compute_stress=True,
+                    )
+                    loss = criterion(pred=y, ref=batch)
+                    loss.backward()
+                    replay_opt.step()
 
-                        detailed_loss = dict((f'{k}_replay', v) for k, v in get_loss_stats(batch, y).items())
-                        detailed_loss['epoch'] = engine.state.epoch - 1
-                        detailed_loss['total_loss_replay'] = loss.item()
-                        valid_losses.append(detailed_loss)
+                    detailed_loss = dict((f'{k}_replay', v) for k, v in get_loss_stats(batch, y).items())
+                    detailed_loss['epoch'] = engine.state.epoch - 1
+                    detailed_loss['total_loss_replay'] = loss.item()
+                    valid_losses.append(detailed_loss)
 
             # Add early stopping if desired
             if patience_status['patience'] is not None:
