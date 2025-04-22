@@ -360,12 +360,10 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
             # Make the replay loss
             replay_opt = torch.optim.Adam(replay_model.parameters(), lr=learning_rate // replay.lr_reduction)
 
-            @trainer.on(Events.EPOCH_COMPLETED)
+            @trainer.on(Events.EPOCH_COMPLETED(every=replay.epoch_frequency))
             def replay_process(engine: Engine):
                 replay_model.train()
                 epoch = engine.state.epoch - 1
-                if epoch % replay.epoch_frequency != 0:
-                    return
                 logger.info(f'Started replay for epoch {engine.state.epoch - 1}')
 
                 for batch in replay_loader:
