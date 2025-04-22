@@ -35,6 +35,7 @@ if __name__ == "__main__":
 
     group = parser.add_argument_group(title='Model Architecture', description='Parameters describing the CHGNet model')
     group.add_argument('--reset-weights', action='store_true', help='Whether to reset the pre-trained weights')
+    group.add_argument('--freeze-layers', default=None, type=int, help='Number of layers to freeze')
     group.add_argument('--model-size', default='small', help='Which pretrained model to use')
     args = parser.parse_args()
 
@@ -121,6 +122,7 @@ if __name__ == "__main__":
         force_weight=loss_f / loss_e,
         stress_weight=loss_s / loss_e,
         reset_weights=args.reset_weights,
+        num_freeze=args.freeze_layers,
         device='cuda'
     )
     train_time = perf_counter() - train_time
