@@ -23,7 +23,7 @@ def filter_by_elements(atoms_gen: Iterable[Atoms], allowed_elems: Collection[str
         yield atoms
 
 
-# TODO (wardlt): Build towards more advanced methods, like
+# TODO (wardlt): Build towards more advanced methods, like https://arxiv.org/abs/2404.12526v1
 @dataclass
 class MultiHeadConfig:
     """Configuration used to define replay training"""
