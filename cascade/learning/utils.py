@@ -1,5 +1,4 @@
 """Tools used by many types of surrogates"""
-
 from ase import Atoms
 import numpy as np
 
