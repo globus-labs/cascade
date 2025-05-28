@@ -29,7 +29,7 @@ def advance_dynamics(
     traj_dir: str | Path,
     learner: BaseLearnableForcefield,
     model_msg: bytes,
-    name: str,
+    #name: str,
     steps: int,
     starting_step: int,
     write_freq: int,
@@ -50,7 +50,8 @@ def advance_dynamics(
         chunk_i_last = 0
     else:
         # otherwise: read the trajectory from the last chunk
-        chunks = sorted(a, key=lambda s: int(s.split('_')[-1]))
+        chunks = glob('./chunks')
+        chunks = sorted(chunks, key=lambda s: int(s.split('_')[-1]))
         chunk_last = chunks[-1]
         chunk_i_last = int(chunk_last.split('_'))
         atoms_file = traj_dir / chunk_last / 'md.traj'
@@ -68,7 +69,7 @@ def advance_dynamics(
     # set up dynamics
     dyn = dyn_class(
         atoms,
-        traj_file=chunk_current/'md.traj',
+        trajectory=str(chunk_current/'md.traj'),
         **dyn_kwargs
     )
 
@@ -123,7 +124,7 @@ class Thinker(BaseThinker):
                 break
         self.logger.info(f'Submitting trajecotry {traj_id} for advancement')
         self.queues.send_inputs(
-            method='advance_dynamics_partial',
+            method='advance_dynamics',
             input_kwargs=dict(
                 traj_dir=self.traj_dirs[traj_id],
                 starting_step=self.traj_progress[traj_id],
@@ -139,6 +140,7 @@ class Thinker(BaseThinker):
     @result_processor
     def process_dynamics(self, result: Result):
         if not result.success:
+            print(result.failure_info.traceback)
             raise RuntimeError(result.failure_info.exception)  # todo: implement custom error
         
         self.rec.release(1)  # free the resource from this traj
@@ -149,7 +151,7 @@ class Thinker(BaseThinker):
         if not traj_done:
             self.traj_avail.put(traj_id)
         
-        if np.all(traj_progress >= self.total_steps):
+        if np.all(self.traj_progress[traj_id] >= self.total_steps):
             self.done.set()
         
 
@@ -177,11 +179,6 @@ if __name__ == '__main__':
 
     # Set up Queues and TaskServer
     queues = PipeQueues(keep_inputs=False)
-    task_server = LocalTaskServer(
-        queues=queues, 
-        num_workers=args.num_workers, 
-        methods=[]
-    )
 
     # read in initial structures
     initial_frames = []
@@ -211,7 +208,7 @@ if __name__ == '__main__':
     # set up dynamics
     # todo: make this configurable via CLI
     dyn_class = VelocityVerlet
-    dyn_kwargs = {'dt': 1 * units.fs}
+    dyn_kwargs = {'timestep': 1 * units.fs}
     run_kwargs = {}
     # set up learner
     # todo: make this configurable via CLI
@@ -229,8 +226,14 @@ if __name__ == '__main__':
         dyn_kwargs=dyn_kwargs,
         run_kwargs=run_kwargs,
     )
-    advance_dynamics_partial = update_wrapper(advance_dynamics_partial, advance_dynamics) 
+    update_wrapper(advance_dynamics_partial, advance_dynamics)
     # Start the workflow
+
+    task_server = LocalTaskServer(
+        queues=queues,
+        num_workers=args.num_workers,
+        methods=[advance_dynamics_partial]
+    )
     try:
         task_server.start()
         thinker.run()
