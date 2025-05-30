@@ -6,6 +6,7 @@ import os
 from typing import Sequence
 from queue import Queue, Empty
 from functools import partial, update_wrapper
+from dataclasses import dataclass
 
 from colmena.models import Result
 from colmena.queue import PipeQueues, ColmenaQueues
@@ -67,16 +68,18 @@ def advance_dynamics(
     chunk_current = traj_dir / f'chunk_{chunk_i}'
     chunk_current.mkdir(parents=True, exist_ok=True)
     
+    traj_file = str(chunk_current/'md.traj')
     # set up dynamics
     dyn = dyn_class(
         atoms,
-        trajectory=str(chunk_current/'md.traj'),
+        trajectory=traj_file,
         **dyn_kwargs
     )
 
     # run dynamics
     dyn.run(steps, **run_kwargs)
-    return
+    traj = read(traj_file, index=':')
+    return traj
 
 
 class Thinker(BaseThinker):
@@ -113,7 +116,7 @@ class Thinker(BaseThinker):
             write(str(init_file), a)
             self.traj_dirs.append(traj_dir)
 
-    @task_submitter
+    @task_submitter()
     def submit_dynamics(self):
         while True:
             try:
@@ -125,6 +128,7 @@ class Thinker(BaseThinker):
                 break
         self.logger.info(f'Submitting trajecotry {traj_id} for advancement')
         self.queues.send_inputs(
+            topic='dynamics',
             method='advance_dynamics',
             input_kwargs=dict(
                 traj_dir=self.traj_dirs[traj_id],
@@ -138,14 +142,25 @@ class Thinker(BaseThinker):
         )
         return
 
-    @result_processor
+    @result_processor(task_type='dynamics')
     def process_dynamics(self, result: Result):
         if not result.success:
             print(result.failure_info.traceback)
             raise RuntimeError(result.failure_info.exception)  # todo: implement custom error
         
-        self.rec.release(None, 1)  # free the resource from this traj
+        self.rec.release('dynamics', 1)  # free the resource from this traj
         traj_id = result.task_info['traj_id']
+        self.queues.send_inputs(
+            topic='audit',
+            method=None,
+            input_kwargs=dict(
+                traj_dir=result.value,
+            ),
+            task_info=dict(
+                traj_id=traj_id
+            )
+        )
+
         self.traj_progress[traj_id] += result.task_info['steps']
         traj_done = self.traj_progress[traj_id] >= self.total_steps
         
@@ -154,7 +169,29 @@ class Thinker(BaseThinker):
         
         if np.all(self.traj_progress[traj_id] >= self.total_steps):
             self.done.set()
-        
+    
+    @result_processor(task_type='audit')
+    def process_audit(self, result: Result):
+        pass
+
+
+class Auditor():
+
+    def audit(self, traj: list[Atoms]) -> tuple[bool, float]:
+        raise NotImplementedError()
+
+
+@dataclass
+class DummyAuditor(Auditor):
+
+    accept_rate = 0.75
+
+    def audit(self, traj: list[Atoms]) -> tuple[bool, float]:
+        """a stub of a real audit"""
+        good = np.random.random() < self.accept_rate
+        score = float(good)
+        return good, score
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -179,7 +216,10 @@ if __name__ == '__main__':
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Set up Queues and TaskServer
-    queues = PipeQueues(keep_inputs=False)
+    queues = PipeQueues(
+        topics=['dynamics', 'audit'],
+        keep_inputs=False
+    )
 
     # read in initial structures
     initial_frames = []
@@ -205,6 +245,10 @@ if __name__ == '__main__':
             my_logger.addHandler(handler)
             my_logger.setLevel(logging.INFO)
     logger.info(f'Started. Running in {run_dir}. {"Restarting from previous run" if is_restart else ""}')
+
+
+    # set up auditor
+    auditor = DummyAuditor()
 
     # set up dynamics
     # todo: make this configurable via CLI
@@ -233,7 +277,7 @@ if __name__ == '__main__':
     task_server = LocalTaskServer(
         queues=queues,
         num_workers=args.num_workers,
-        methods=[advance_dynamics_partial]
+        methods=[advance_dynamics_partial, auditor.audit]
     )
     try:
         task_server.start()
