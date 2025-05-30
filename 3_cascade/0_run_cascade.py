@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 import logging
 import sys
+import os
 from typing import Sequence
 from queue import Queue, Empty
 from functools import partial, update_wrapper
@@ -50,10 +51,10 @@ def advance_dynamics(
         chunk_i_last = 0
     else:
         # otherwise: read the trajectory from the last chunk
-        chunks = glob('./chunks')
+        chunks = glob(str(traj_dir / 'chunk_*'))
         chunks = sorted(chunks, key=lambda s: int(s.split('_')[-1]))
-        chunk_last = chunks[-1]
-        chunk_i_last = int(chunk_last.split('_'))
+        chunk_last = os.path.basename(chunks[-1])
+        chunk_i_last = int(chunk_last.split('_')[-1])
         atoms_file = traj_dir / chunk_last / 'md.traj'
     atoms = read(atoms_file, index=-1)
     
@@ -143,7 +144,7 @@ class Thinker(BaseThinker):
             print(result.failure_info.traceback)
             raise RuntimeError(result.failure_info.exception)  # todo: implement custom error
         
-        self.rec.release(1)  # free the resource from this traj
+        self.rec.release(None, 1)  # free the resource from this traj
         traj_id = result.task_info['traj_id']
         self.traj_progress[traj_id] += result.task_info['steps']
         traj_done = self.traj_progress[traj_id] >= self.total_steps
