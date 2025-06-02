@@ -25,16 +25,18 @@ from mace.calculators import mace_mp
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.learning.mace import MACEInterface
+from cascade.utils import canonicalize
 
 
 def advance_dynamics(
-    traj_dir: str | Path,
+    atoms: Atoms,
+    run_dir: Path,
+    traj_i: int,
     learner: BaseLearnableForcefield,
     model_msg: bytes,
-    #name: str,
     steps: int,
-    starting_step: int,
-    write_freq: int,
+    current_step: int,
+    chunk_i: int,
     dyn_class: type[Dynamics],
     dyn_kwargs: dict[str, object],
     run_kwargs: dict[str, object] = None,
@@ -45,30 +47,21 @@ def advance_dynamics(
     """Advance an MD trajectory by n_steps
     """
 
-    # read in starting structure
-    if starting_step == 0:
-        # if we are starting, just read the initial structure
-        atoms_file = traj_dir/'init_strc.traj'
-        chunk_i_last = 0
-    else:
-        # otherwise: read the trajectory from the last chunk
-        chunks = glob(str(traj_dir / 'chunk_*'))
-        chunks = sorted(chunks, key=lambda s: int(s.split('_')[-1]))
-        chunk_last = os.path.basename(chunks[-1])
-        chunk_i_last = int(chunk_last.split('_')[-1])
-        atoms_file = traj_dir / chunk_last / 'md.traj'
-    atoms = read(atoms_file, index=-1)
-    
     # set up calculator
     calc = learner.make_calculator(model_msg, device='cpu')
     atoms.calc = calc
-    
+
     # create new dir for this chunk
-    chunk_i = chunk_i_last + 1
-    chunk_current = traj_dir / f'chunk_{chunk_i}'
+    chunk_current = run_dir / f'traj_{traj_i}' / f'chunk_{chunk_i}'
     chunk_current.mkdir(parents=True, exist_ok=True)
-    
     traj_file = str(chunk_current/'md.traj')
+
+    # if chunk exists: remove
+    # (if its here, it failed an audit)
+    # todo: possibly keep all with an index
+    if os.path.exists(traj_file):
+        os.remove(traj_file)
+
     # set up dynamics
     dyn = dyn_class(
         atoms,
@@ -97,24 +90,15 @@ class Thinker(BaseThinker):
         """
         super().__init__(queues, resource_counter=ResourceCounter(num_workers))
         self.run_dir = run_dir
-        self.initial_frames = initial_frames
+        self.atoms = initial_frames
         self.advance_steps = advance_steps
         self.total_steps = total_steps
-        self.n_traj = len(self.initial_frames)
+        self.n_traj = len(self.atoms)
         self.traj_progress = np.zeros(self.n_traj)
         self.traj_avail = Queue(self.n_traj)
         # populate the queue with all trajectories
         for i in range(self.n_traj):
             self.traj_avail.put(i)
-
-        # set up initial directory structure with initial_frames
-        self.traj_dirs = []
-        for i, a in enumerate(initial_frames):
-            traj_dir = self.run_dir / f'traj_{i}'
-            traj_dir.mkdir(exist_ok=True)
-            init_file = traj_dir/'init_strc.traj'
-            write(str(init_file), a)
-            self.traj_dirs.append(traj_dir)
 
     @task_submitter()
     def submit_dynamics(self):
@@ -127,13 +111,27 @@ class Thinker(BaseThinker):
             else:
                 break
         self.logger.info(f'Submitting trajecotry {traj_id} for advancement')
+
+        # calculate chunk index and how many steps to advance
+        step_current = self.traj_progress[traj_id]
+        steps = min(self.advance_steps, self.total_steps - step_current)
+        chunk_i = step_current // self.advance_steps
+
+        atoms = self.atoms[traj_id]
+        # print('\n\n')
+        # print(type(atoms))
+        # print('\n\n')
+
         self.queues.send_inputs(
             topic='dynamics',
             method='advance_dynamics',
             input_kwargs=dict(
-                traj_dir=self.traj_dirs[traj_id],
-                starting_step=self.traj_progress[traj_id],
-                steps=self.advance_steps,
+                atoms=atoms,
+                steps=steps,
+                traj_i=traj_id,
+                current_step=step_current,
+                chunk_i=chunk_i,
+                run_dir=self.run_dir
             ),
             task_info=dict(
                 traj_id=traj_id,
@@ -142,42 +140,61 @@ class Thinker(BaseThinker):
         )
         return
 
-    @result_processor(task_type='dynamics')
+    @result_processor(topic='dynamics')
     def process_dynamics(self, result: Result):
+        """receive the results of dynamcis and launch an audit task"""
+
+        # ensure dynamics ran successfully
         if not result.success:
             print(result.failure_info.traceback)
             raise RuntimeError(result.failure_info.exception)  # todo: implement custom error
-        
-        self.rec.release('dynamics', 1)  # free the resource from this traj
+
+        # free the resources
+        self.rec.release(None, 1)
+
+        # parse the results
+        traj = result.value
         traj_id = result.task_info['traj_id']
+
+        # launch audit task
         self.queues.send_inputs(
             topic='audit',
-            method=None,
+            method='audit',
             input_kwargs=dict(
-                traj_dir=result.value,
+                traj=traj
             ),
             task_info=dict(
-                traj_id=traj_id
+                traj_id=traj_id,
+                steps=result.task_info['steps']
             )
         )
 
-        self.traj_progress[traj_id] += result.task_info['steps']
+    @result_processor(topic='audit')
+    def process_audit(self, result: Result):
+
+        # parse out results
+        good, score, atoms = result.value
+        traj_id = result.task_info['traj_id']
+        steps = result.task_info['steps']
+
+        # only advance things if the audit passes
+        if not good:
+            return
+
+        self.atoms[traj_id] = atoms
+        self.traj_progress[traj_id] += steps
+        # check if this traj is finished
         traj_done = self.traj_progress[traj_id] >= self.total_steps
-        
+        # mark this trajectory as available
         if not traj_done:
             self.traj_avail.put(traj_id)
-        
+        # check if all trajectories are finished
         if np.all(self.traj_progress[traj_id] >= self.total_steps):
             self.done.set()
-    
-    @result_processor(task_type='audit')
-    def process_audit(self, result: Result):
-        pass
-
 
 class Auditor():
 
-    def audit(self, traj: list[Atoms]) -> tuple[bool, float]:
+    def audit(self, traj: list[Atoms]) -> tuple[bool, float, Atoms]:
         raise NotImplementedError()
 
 
@@ -186,11 +203,12 @@ class DummyAuditor(Auditor):
 
     accept_rate = 0.75
 
-    def audit(self, traj: list[Atoms]) -> tuple[bool, float]:
+    def audit(self, traj: list[Atoms]) -> tuple[bool, float, Atoms]:
         """a stub of a real audit"""
         good = np.random.random() < self.accept_rate
         score = float(good)
-        return good, score
+        atoms = traj[0] if good else traj[-1]
+        return good, score, atoms
 
 
 if __name__ == '__main__':
@@ -224,7 +242,7 @@ if __name__ == '__main__':
     # read in initial structures
     initial_frames = []
     for s in args.init_strc:
-        initial_frames.append(read(s, ':'))
+        initial_frames.append(read(s, '-1'))
 
     # Set up Thinker
     thinker = Thinker(
@@ -265,7 +283,7 @@ if __name__ == '__main__':
     advance_dynamics_partial = partial(
         advance_dynamics,
         learner=learner,
-        write_freq=1,  # todo: make an arg
+        #write_freq=1,  # todo: make an arg
         model_msg=model_msg,  # todo: allow this to vary with the run
         dyn_class=dyn_class,
         dyn_kwargs=dyn_kwargs,
