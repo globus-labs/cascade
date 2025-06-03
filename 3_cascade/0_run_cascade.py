@@ -118,9 +118,6 @@ class Thinker(BaseThinker):
         chunk_i = step_current // self.advance_steps
 
         atoms = self.atoms[traj_id]
-        # print('\n\n')
-        # print(type(atoms))
-        # print('\n\n')
 
         self.queues.send_inputs(
             topic='dynamics',
@@ -145,18 +142,20 @@ class Thinker(BaseThinker):
         """receive the results of dynamcis and launch an audit task"""
 
         # ensure dynamics ran successfully
+        traj_id = result.task_info['traj_id']
+        self.logger.info(f'Processing result from traj {traj_id}')
         if not result.success:
-            print(result.failure_info.traceback)
-            raise RuntimeError(result.failure_info.exception)  # todo: implement custom error
+            self.logger.error('Task failed with traceback:\n' + result.failure_info.traceback)
+            raise RuntimeError(result.failure_info.exception)
 
         # free the resources
+        self.logger.info('Freeing resourcs used in dynamics')
         self.rec.release(None, 1)
-
+        
         # parse the results
         traj = result.value
-        traj_id = result.task_info['traj_id']
-
         # launch audit task
+        self.logger.info(f'Launching audit task for traj {traj_id}')
         self.queues.send_inputs(
             topic='audit',
             method='audit',
@@ -176,20 +175,25 @@ class Thinker(BaseThinker):
         good, score, atoms = result.value
         traj_id = result.task_info['traj_id']
         steps = result.task_info['steps']
-
         # only advance things if the audit passes
         if not good:
+            self.logger.info(f'Audit for {traj_id} failed, reverting trajectory to previous state')
             return
-
+        self.logger.info(f'Audit for {traj_id} passed, updating trajectory state')
         self.atoms[traj_id] = atoms
         self.traj_progress[traj_id] += steps
+        self.logger.info(f'Traj {traj_id} has completed {self.traj_progress[traj_id]} steps')
         # check if this traj is finished
         traj_done = self.traj_progress[traj_id] >= self.total_steps
         # mark this trajectory as available
         if not traj_done:
+            self.logger.info(f'Traj {traj_id} not finished, marking as available')
             self.traj_avail.put(traj_id)
+        else:
+            self.logger.info(f'Traj {traj_id} finished')
         # check if all trajectories are finished
         if np.all(self.traj_progress[traj_id] >= self.total_steps):
+            self.logger.info(f'All trajectories finished, setting thinker to done')
             self.done.set()
 
 class Auditor():
