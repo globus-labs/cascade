@@ -178,6 +178,7 @@ class Thinker(BaseThinker):
         # only advance things if the audit passes
         if not good:
             self.logger.info(f'Audit for {traj_id} failed, reverting trajectory to previous state')
+            self.traj_avail.put(traj_id)
             return
         self.logger.info(f'Audit for {traj_id} passed, updating trajectory state')
         self.atoms[traj_id] = atoms
