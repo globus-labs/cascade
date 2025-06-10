@@ -184,36 +184,36 @@ class Thinker(BaseThinker):
         )
         return
 
-    # @task_submitter()
-    # def submit_data_selection(self):
-    #     while True:
-    #         try:
-    #             traj_id = self.to_select.get(block=True, timeout=1)
-    #         except Empty:
-    #             if self.done.is_set():
-    #                 return
-    #         else:
-    #             break
-    #     self.logger.info(f'Submitting trajecotry {traj_id} for data selection')
+    @task_submitter()
+    def submit_data_selection(self):
+        while True:
+            try:
+                traj_id = self.to_select.get(block=True, timeout=1)
+            except Empty:
+                if self.done.is_set():
+                    return
+            else:
+                break
+        self.logger.info(f'Submitting trajecotry {traj_id} for data selection')
 
-    #     step_current = self.traj_progress[traj_id]
-    #     chunk_i = int(step_current // self.advance_steps)
-    #     chunk_current = run_dir / f'traj_{traj_id}' / f'chunk_{chunk_i:d}' / 'md.traj'
-    #     atoms = read(str(chunk_current), index=':')
+        step_current = self.traj_progress[traj_id]
+        chunk_i = int(step_current // self.advance_steps)
+        chunk_current = run_dir / f'traj_{traj_id}' / f'chunk_{chunk_i:d}' / 'md.traj'
+        atoms = read(str(chunk_current), index=':')
 
-    #     self.queues.send_inputs(
-    #         topic='frame_selection',
-    #         method='select_training_frames',
-    #         input_kwargs=dict(
-    #             atoms=atoms,
-    #             n_frames=self.frames_per_chunk,
+        self.queues.send_inputs(
+            topic='frame_selection',
+            method='select_training_frames',
+            input_kwargs=dict(
+                atoms=atoms,
+                n_frames=self.frames_per_chunk,
 
-    #         ),
-    #         task_info=dict(
-    #             traj_id=traj_id,
-    #         )
-    #     )
-    #     return
+            ),
+            task_info=dict(
+                traj_id=traj_id,
+            )
+        )
+        return
 
     @result_processor(topic='dynamics')
     def process_dynamics(self, result: Result):
@@ -262,8 +262,7 @@ class Thinker(BaseThinker):
         # only advance things if the audit passes
         if not good:
             self.logger.info(f'Audit for {traj_id} failed, reverting trajectory to previous state')
-            #self.to_select.put(traj_id)
-            self.to_advance.put(traj_id)
+            self.to_select.put(traj_id)
             return
 
         self.logger.info(f'Audit for {traj_id} passed, updating trajectory state')
@@ -283,45 +282,52 @@ class Thinker(BaseThinker):
             self.logger.info(f'All trajectories finished, setting thinker to done')
             self.done.set()
 
-    # @result_processor(topic='frame_selection')
-    # def process_frame_selection(self, result: Result):
+    @result_processor(topic='frame_selection')
+    def process_frame_selection(self, result: Result):
 
-    #     if not result.success:
-    #         self.logger.error('Task failed with traceback:\n' + result.failure_info.traceback)
-    #         raise RuntimeError(result.failure_info.exception)
+        if not result.success:
+            self.logger.error('Task failed with traceback:\n' + result.failure_info.traceback)
+            raise RuntimeError(result.failure_info.exception)
 
-    #     atoms = result.value
-    #     for a in atoms:
-    #         self.to_label.put(a)
+        self.rec.release(None, 1)
+        atoms = result.value
+        self.to_advance.put(traj_id) 
+        # todo: wait until the model has been updated to do this. 
+        # maybe put these in a do-not-advance list and then clear that when 
+        # the model updates?
+        for a in atoms:
+            self.to_label.put(a)
 
-    # @task_submitter()
-    # def submit_labeling(self):
-    #     """label a training example"""
-    #     while True:
-    #         try:
-    #             atoms = self.to_label.get(block=True, timeout=1)
-    #         except Empty:
-    #             if self.done.is_set():
-    #                 return
-    #         else:
-    #             break
+    @task_submitter()
+    def submit_labeling(self):
+        """label a training example"""
+        while True:
+            try:
+                atoms = self.to_label.get(block=True, timeout=1)
+            except Empty:
+                if self.done.is_set():
+                    return
+            else:
+                break
 
-    #     self.queues.send_inputs(
-    #         topic='label',
-    #         method='label_training_frame',
-    #         input_kwargs=dict(
-    #             atoms=atoms
-    #         )
-    #     )
+        self.queues.send_inputs(
+            topic='label',
+            method='label_training_frame',
+            input_kwargs=dict(
+                atoms=atoms
+            )
+        )
 
-    # @result_processor(topic='label')
-    # def store_labeled_data(self, result: Result):
-    #     if not result.success:
-    #         self.logger.error('Task failed with traceback:\n' + result.failure_info.traceback)
-    #         raise RuntimeError(result.failure_info.exception)
+    @result_processor(topic='label')
+    def store_labeled_data(self, result: Result):
+        if not result.success:
+            self.logger.error('Task failed with traceback:\n' + result.failure_info.traceback)
+            raise RuntimeError(result.failure_info.exception)
 
-    #     atoms = result.value
-    #     pass
+        self.rec.release(None, 1)
+        atoms = result.value
+        with connect(self.db_path) as db:
+            db.write(atoms=atoms, training=True)
 
 class Auditor():
 
