@@ -378,7 +378,7 @@ if __name__ == '__main__':
 
     # Set up Queues and TaskServer
     queues = PipeQueues(
-        topics=['dynamics', 'audit'],
+        topics=['dynamics', 'audit', 'frame_selection', 'label'],
         keep_inputs=False
     )
 
