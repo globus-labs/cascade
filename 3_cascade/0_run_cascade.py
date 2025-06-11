@@ -58,7 +58,7 @@ def advance_dynamics(
 
     # set up calculator
     calc = learner.make_calculator(model_msg, device='cpu')
-    atoms.calc = calc
+    n_workers = calc
 
     with connect(db_path) as db:
 
@@ -82,11 +82,11 @@ def advance_dynamics(
             # trajectory=traj_file,
             **dyn_kwargs
         )
-        
+
         dyn.attach(write_to_db)
         # run dynamics
         dyn.run(steps, **run_kwargs)
-        
+
         traj = db.select(traj=traj_i, chunk=chunk_i)
         traj = [row.toatoms() for row in traj]
         #traj = read(traj_file, index=':')
@@ -107,8 +107,8 @@ def label_training_frame(
 ) -> Atoms:
     calc = calc_factory()
     atoms.calc = calc
-    atoms.calculate()
-    atoms = canonicalize(atoms)
+    atoms.get_forces()
+    #atoms = canonicalize(atoms)
     return atoms
 
 class Thinker(BaseThinker):
@@ -121,7 +121,7 @@ class Thinker(BaseThinker):
         db_path: Path | str,
         advance_steps: int,
         total_steps: int,
-        num_workers: int,
+        n_workers: int,
         sample_frames: int,
         start_train_frac: float
     ):
@@ -132,23 +132,28 @@ class Thinker(BaseThinker):
         db_path: what to call the ase database
         advance_steps: how many steps to advance md by at a time
         total_steps: how long md steps should be
-        num_workers: for the ResourceCounter
+        n_workers: for the ResourceCounter
         sample_frames: how many frames to sample from a chunk
         start_train_frac: start training when this fraction of trajectoreies 
             have been sampled from
         """
-        super().__init__(queues, resource_counter=ResourceCounter(num_workers))
+        super().__init__(
+            queues,
+            resource_counter=ResourceCounter(n_workers, task_types=['sim', 'train']))
         self.run_dir = run_dir
         self.atoms = initial_frames
         self.advance_steps = advance_steps
         self.total_steps = total_steps
         self.sample_frames = sample_frames
+        self.n_workers = n_workers
         self.db_path = str(db_path)
+        self.start_train_frac = start_train_frac
         self.n_traj = len(self.atoms)
         self.traj_progress = np.zeros(self.n_traj)
         self.to_advance = Queue(self.n_traj)
         self.to_select = Queue(self.n_traj)
         self.to_label = Queue()
+
         # populate the queue with all trajectories
         for i in range(self.n_traj):
             self.to_advance.put(i)
@@ -156,7 +161,10 @@ class Thinker(BaseThinker):
         self.start_training = Event()
         self.training_complete = Event()
 
-    @task_submitter()
+        # start with all sim workers
+        self.rec.reallocate(None, 'sim', self.n_workers)
+
+    @task_submitter(task_type='sim')
     def submit_dynamics(self):
         while True:
             try:
@@ -193,38 +201,6 @@ class Thinker(BaseThinker):
         )
         return
 
-    @task_submitter()
-    def submit_data_selection(self):
-        while True:
-            try:
-                traj_id = self.to_select.get(block=True, timeout=1)
-            except Empty:
-                if self.done.is_set():
-                    return
-            else:
-                break
-        self.logger.info(f'Submitting trajecotry {traj_id} for data selection')
-
-        step_current = self.traj_progress[traj_id]
-        chunk_i = int(step_current // self.advance_steps)
-        with connect(self.db_path) as db:
-            # make sure theres really only one
-            rows = db.select(traj=traj_id, chunk=chunk_i)
-        atoms = [r.toatoms() for r in rows]
-
-        self.queues.send_inputs(
-            topic='frame_selection',
-            method='select_training_frames',
-            input_kwargs=dict(
-                atoms=atoms,
-                n_frames=self.sample_frames,
-            ),
-            task_info=dict(
-                traj_id=traj_id,
-            )
-        )
-        return
-
     @result_processor(topic='dynamics')
     def process_dynamics(self, result: Result):
         """receive the results of dynamcis and launch an audit task"""
@@ -238,7 +214,7 @@ class Thinker(BaseThinker):
 
         # free the resources
         self.logger.info('Freeing resourcs used in dynamics')
-        self.rec.release(None, 1)
+        self.rec.release('sim', 1)
 
         # parse the results
         traj = result.value
@@ -276,6 +252,7 @@ class Thinker(BaseThinker):
         # only advance things if the audit passes
         if not good:
             self.logger.info(f'Audit for {traj_id} failed, reverting trajectory to previous state')
+            self.logger.info(f'Adding {traj_id} to selection queue')
             self.to_select.put(traj_id)
             return
 
@@ -296,6 +273,38 @@ class Thinker(BaseThinker):
             self.logger.info(f'All trajectories finished, setting thinker to done')
             self.done.set()
 
+    @task_submitter(task_type='sim')
+    def submit_data_selection(self):
+        while True:
+            try:
+                traj_id = self.to_select.get(block=True, timeout=1)
+            except Empty:
+                if self.done.is_set():
+                    return
+            else:
+                break
+        self.logger.info(f'Submitting trajecotry {traj_id} for data selection')
+
+        step_current = self.traj_progress[traj_id]
+        chunk_i = int(step_current // self.advance_steps)
+        with connect(self.db_path) as db:
+            # make sure theres really only one
+            rows = db.select(traj=traj_id, chunk=chunk_i)
+        atoms = [r.toatoms() for r in rows]
+
+        self.queues.send_inputs(
+            topic='frame_selection',
+            method='select_training_frames',
+            input_kwargs=dict(
+                atoms=atoms,
+                n_frames=self.sample_frames,
+            ),
+            task_info=dict(
+                traj_id=traj_id,
+            )
+        )
+        return
+
     @result_processor(topic='frame_selection')
     def process_frame_selection(self, result: Result):
 
@@ -303,16 +312,24 @@ class Thinker(BaseThinker):
             self.logger.error('Task failed with traceback:\n' + result.failure_info.traceback)
             raise RuntimeError(result.failure_info.exception)
 
-        self.rec.release(None, 1)
+        self.rec.release('sim', 1)
         atoms = result.value
+        traj_id = result.task_info['traj_id']
         
-        # todo: wait until the model has been updated to do this. 
-        # maybe put these in a do-not-advance list and then clear that when 
+        # todo: wait until the model has been updated to do this.
+        # maybe put these in a do-not-advance list and then clear that when
         # the model updates?
+        
+        # indicate that we are updating the model from this trajectory
+        self.logger.info(f'Marking {traj_id} as "sampled from"')
+        self.sampled_from.add(result.task_info['traj_id'])
+
+        # add sampled atoms to labeling queue
+        self.logger.info(f'Adding {len(atoms)} frames from {traj_id} to labeling queue')
         for a in atoms:
             self.to_label.put(a)
 
-    @task_submitter()
+    @task_submitter(task_type='sim')
     def submit_labeling(self):
         """label a training example"""
         while True:
@@ -323,7 +340,7 @@ class Thinker(BaseThinker):
                     return
             else:
                 break
-
+        self.logger.info('Submitting one frame to be labeled')
         self.queues.send_inputs(
             topic='label',
             method='label_training_frame',
@@ -338,10 +355,36 @@ class Thinker(BaseThinker):
             self.logger.error('Task failed with traceback:\n' + result.failure_info.traceback)
             raise RuntimeError(result.failure_info.exception)
 
-        self.rec.release(None, 1)
+        self.rec.release('sim', 1)
         atoms = result.value
+        self.logger.info('Labeled one frame')
         with connect(self.db_path) as db:
             db.write(atoms=atoms, training=True)
+
+        # check how many trajs have been sampled from
+        n_sampled = len(self.sampled_from)
+        frac_sampled = n_sampled / self.n_traj
+
+        # if we've sampled from enough trajectories and weve labeled everything
+        # start training
+        # todo: better logic for this, this won't work at scale
+        if frac_sampled > self.start_train_frac and self.to_label.empty():
+            logger.info('Finished labeling frames, starting training')
+            self.start_training.set()
+
+    @event_responder(event_name='start_training', reallocate_resources=True,
+                     gather_from="sim", gather_to="train", disperse_to="sim", max_slots=1)
+    def train_models(self):
+        """STUB: Submit models to be retrained"""
+        self.logger.info('Training model')
+        # put the sampled trajectories back into the advancing queue
+        for traj_id in self.sampled_from:
+            self.to_advance.put(traj_id)
+
+        # todo: think carefully about concurrency for this
+        self.sampled_from = set()
+        self.logger.info('Done training model')
+        # todo: actually pass around a model
 
 class Auditor():
 
@@ -373,7 +416,8 @@ if __name__ == '__main__':
         nargs='+',
         required=True
     )
-    parser.add_argument('--num-workers', type=int, default=3)
+    parser.add_argument('--start-train-frac', type=float, default=1.)
+    parser.add_argument('--num-workers', type=int, default=8)
     #parser.add_argument('--model-file', type=str)
 
     args = parser.parse_args()
@@ -403,7 +447,7 @@ if __name__ == '__main__':
 
     # Set up Thinker
     thinker = Thinker(
-        num_workers=args.num_workers,
+        n_workers=args.num_workers,
         initial_frames=initial_frames,
         queues=queues,
         run_dir=run_dir,
@@ -411,8 +455,8 @@ if __name__ == '__main__':
         advance_steps=args.advance_steps,
         total_steps=args.total_steps,
         sample_frames=1,
+        start_train_frac=args.start_train_frac
     )
-
     # Make a logger
     logger = logging.getLogger('main')
     handlers = [logging.StreamHandler(sys.stdout), logging.FileHandler(filename=run_dir / 'run.log')]
@@ -451,11 +495,21 @@ if __name__ == '__main__':
     )
     update_wrapper(advance_dynamics_partial, advance_dynamics)
 
+    # set up reference calc
+    calc_factory = partial(mace_mp, 'medium', device='cpu', default_type='float32')
+    label_partial = partial(label_training_frame, calc_factory=calc_factory)
+    update_wrapper(label_partial, label_training_frame)
+    
     # Start the workflow
     task_server = LocalTaskServer(
         queues=queues,
         num_workers=args.num_workers,
-        methods=[advance_dynamics_partial, auditor.audit]
+        methods=[
+            advance_dynamics_partial,
+            auditor.audit,
+            select_training_frames,
+            label_partial
+        ]
     )
     try:
         task_server.start()
