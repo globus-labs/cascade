@@ -9,11 +9,16 @@ from functools import partial, update_wrapper
 from dataclasses import dataclass
 from random import sample
 from typing import Callable
+from threading import Event
 
 from colmena.models import Result
 from colmena.queue import PipeQueues, ColmenaQueues
 from colmena.task_server.local import LocalTaskServer
-from colmena.thinker import BaseThinker, ResourceCounter, task_submitter, result_processor
+from colmena.thinker import (
+    BaseThinker, ResourceCounter, 
+    task_submitter, result_processor,
+    event_responder
+)
 import ase
 from ase import Atoms
 from ase.io import read, write
@@ -54,16 +59,6 @@ def advance_dynamics(
     # set up calculator
     calc = learner.make_calculator(model_msg, device='cpu')
     atoms.calc = calc
-
-    # create new dir for this chunk
-    # chunk_current = run_dir / f'traj_{traj_i}' / f'chunk_{chunk_i:d}'
-    # chunk_current.mkdir(parents=True, exist_ok=True)
-    # traj_file = str(chunk_current/'md.traj')
-    # # if chunk exists: remove
-    # # (if its here, it failed an audit)
-    # # todo: possibly keep all with an index
-    # if os.path.exists(traj_file):
-    #     os.remove(traj_file)
 
     with connect(db_path) as db:
 
@@ -127,16 +122,27 @@ class Thinker(BaseThinker):
         advance_steps: int,
         total_steps: int,
         num_workers: int,
-        training_frames_per_chunk: int
+        sample_frames: int,
+        start_train_frac: float
     ):
         """thinker
+        initial_frames: initial conditions for md trajectories
+        queues: for colmena
+        run_dir: where to store logs and ase database
+        db_path: what to call the ase database
+        advance_steps: how many steps to advance md by at a time
+        total_steps: how long md steps should be
+        num_workers: for the ResourceCounter
+        sample_frames: how many frames to sample from a chunk
+        start_train_frac: start training when this fraction of trajectoreies 
+            have been sampled from
         """
         super().__init__(queues, resource_counter=ResourceCounter(num_workers))
         self.run_dir = run_dir
         self.atoms = initial_frames
         self.advance_steps = advance_steps
         self.total_steps = total_steps
-        self.frames_per_chunk = training_frames_per_chunk
+        self.sample_frames = sample_frames
         self.db_path = str(db_path)
         self.n_traj = len(self.atoms)
         self.traj_progress = np.zeros(self.n_traj)
@@ -146,6 +152,9 @@ class Thinker(BaseThinker):
         # populate the queue with all trajectories
         for i in range(self.n_traj):
             self.to_advance.put(i)
+        self.sampled_from = set()  # which trajectories have new data in the training set
+        self.start_training = Event()
+        self.training_complete = Event()
 
     @task_submitter()
     def submit_dynamics(self):
@@ -208,7 +217,7 @@ class Thinker(BaseThinker):
             method='select_training_frames',
             input_kwargs=dict(
                 atoms=atoms,
-                n_frames=self.frames_per_chunk,
+                n_frames=self.sample_frames,
             ),
             task_info=dict(
                 traj_id=traj_id,
@@ -234,8 +243,12 @@ class Thinker(BaseThinker):
         # parse the results
         traj = result.value
         # launch audit task
-        self.logger.info(f'Launching audit task for traj {traj_id}')
-        self.logger.info(f'\n\nn_frames: {len(traj)}\n\n')
+        self.logger.info(
+            (
+                f'Launching audit task for traj {traj_id} with '
+                f'{len(traj)} frames'
+            )
+        )
         self.queues.send_inputs(
             topic='audit',
             method='audit',
@@ -397,7 +410,7 @@ if __name__ == '__main__':
         db_path=db_path,
         advance_steps=args.advance_steps,
         total_steps=args.total_steps,
-        training_frames_per_chunk=1,
+        sample_frames=1,
     )
 
     # Make a logger
