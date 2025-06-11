@@ -198,8 +198,10 @@ class Thinker(BaseThinker):
 
         step_current = self.traj_progress[traj_id]
         chunk_i = int(step_current // self.advance_steps)
-        chunk_current = run_dir / f'traj_{traj_id}' / f'chunk_{chunk_i:d}' / 'md.traj'
-        atoms = read(str(chunk_current), index=':')
+        with connect(self.db_path) as db:
+            # make sure theres really only one
+            rows = db.select(traj=traj_id, chunk=chunk_i)
+        atoms = [r.toatoms() for r in rows]
 
         self.queues.send_inputs(
             topic='frame_selection',
@@ -207,7 +209,6 @@ class Thinker(BaseThinker):
             input_kwargs=dict(
                 atoms=atoms,
                 n_frames=self.frames_per_chunk,
-
             ),
             task_info=dict(
                 traj_id=traj_id,
@@ -291,7 +292,7 @@ class Thinker(BaseThinker):
 
         self.rec.release(None, 1)
         atoms = result.value
-        self.to_advance.put(traj_id) 
+        
         # todo: wait until the model has been updated to do this. 
         # maybe put these in a do-not-advance list and then clear that when 
         # the model updates?
@@ -359,7 +360,7 @@ if __name__ == '__main__':
         nargs='+',
         required=True
     )
-    parser.add_argument('--num-workers', type=int, default=1)
+    parser.add_argument('--num-workers', type=int, default=3)
     #parser.add_argument('--model-file', type=str)
 
     args = parser.parse_args()
