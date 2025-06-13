@@ -383,6 +383,7 @@ class Thinker(BaseThinker):
         # todo: think carefully about concurrency for this
         self.sampled_from = set()
         self.logger.info('Done training model')
+        self.rec.release('train', 1) # todo: is this right?
         # todo: actually pass around a model
 
 class Auditor():
