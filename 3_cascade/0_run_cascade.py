@@ -362,11 +362,12 @@ class Thinker(BaseThinker):
         # check how many trajs have been sampled from
         n_sampled = len(self.sampled_from)
         frac_sampled = n_sampled / self.n_traj
+        logger.info(f'{n_sampled=}, {frac_sampled=}, {self.start_train_frac=}')
 
         # if we've sampled from enough trajectories and weve labeled everything
         # start training
         # todo: better logic for this, this won't work at scale
-        if frac_sampled > self.start_train_frac and self.to_label.empty():
+        if frac_sampled >= self.start_train_frac and self.to_label.empty():
             logger.info('Finished labeling frames, starting training')
             self.start_training.set()
 
