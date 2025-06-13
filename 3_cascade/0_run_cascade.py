@@ -58,7 +58,7 @@ def advance_dynamics(
 
     # set up calculator
     calc = learner.make_calculator(model_msg, device='cpu')
-    n_workers = calc
+    atoms.calc = calc
 
     with connect(db_path) as db:
 
@@ -79,7 +79,6 @@ def advance_dynamics(
         # set up dynamics
         dyn = dyn_class(
             atoms,
-            # trajectory=traj_file,
             **dyn_kwargs
         )
 
@@ -89,7 +88,6 @@ def advance_dynamics(
 
         traj = db.select(traj=traj_i, chunk=chunk_i)
         traj = [row.toatoms() for row in traj]
-        #traj = read(traj_file, index=':')
     return traj
 
 
