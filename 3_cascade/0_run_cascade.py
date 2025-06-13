@@ -106,7 +106,7 @@ def label_training_frame(
     calc = calc_factory()
     atoms.calc = calc
     atoms.get_forces()
-    #atoms = canonicalize(atoms)
+    atoms = canonicalize(atoms)
     return atoms
 
 class Thinker(BaseThinker):
