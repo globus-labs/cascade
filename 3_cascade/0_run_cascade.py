@@ -109,6 +109,15 @@ def label_training_frame(
     atoms = canonicalize(atoms)
     return atoms
 
+
+def train_model(learner: BaseLearnableForcefield) -> bytes:
+    """currently just a stub that returns a model"""
+    calc = mace_mp('small', device='cpu', default_dtype="float32")
+    model = calc.models[0]
+    model_msg = learner.serialize_model(model)
+    return model_msg
+
+
 class Thinker(BaseThinker):
 
     def __init__(
@@ -121,7 +130,9 @@ class Thinker(BaseThinker):
         total_steps: int,
         n_workers: int,
         sample_frames: int,
-        start_train_frac: float
+        start_train_frac: float,
+        learner: BaseLearnableForcefield,
+        model_msg: bytes,
     ):
         """thinker
         initial_frames: initial conditions for md trajectories
@@ -157,14 +168,17 @@ class Thinker(BaseThinker):
             self.to_advance.put(i)
         self.sampled_from = set()  # which trajectories have new data in the training set
         self.start_training = Event()
-        self.training_complete = Event()
-
         # start with all sim workers
         self.rec.reallocate(None, 'sim', self.n_workers)
+        self.learner = learner
+        self.model_msg = model_msg
 
     @task_submitter(task_type='sim')
     def submit_dynamics(self):
         while True:
+            # spin wait if training is started
+            if self.start_training.is_set():
+                continue
             try:
                 traj_id = self.to_advance.get(block=True, timeout=1)
             except Empty:
@@ -190,7 +204,8 @@ class Thinker(BaseThinker):
                 traj_i=traj_id,
                 current_step=step_current,
                 chunk_i=chunk_i,
-                db_path=self.db_path
+                db_path=self.db_path,
+                model_msg=self.model_msg
             ),
             task_info=dict(
                 traj_id=traj_id,
@@ -313,11 +328,9 @@ class Thinker(BaseThinker):
         self.rec.release('sim', 1)
         atoms = result.value
         traj_id = result.task_info['traj_id']
-        
         # todo: wait until the model has been updated to do this.
         # maybe put these in a do-not-advance list and then clear that when
         # the model updates?
-        
         # indicate that we are updating the model from this trajectory
         self.logger.info(f'Marking {traj_id} as "sampled from"')
         self.sampled_from.add(result.task_info['traj_id'])
@@ -380,11 +393,27 @@ class Thinker(BaseThinker):
         for traj_id in self.sampled_from:
             self.to_advance.put(traj_id)
 
+        # launch the training task
+        self.queues.send_inputs(
+            topic='train',
+            method='train_model',
+            input_kwargs=dict(
+                learner=self.learner
+            ),
+        )
+
+    @result_processor(topic='train')
+    def process_model_result(self, result: Result):
+        """store the new model and release resources"""
+        # update the model
+        # todo: does this need a lock or anything?
+        self.model_msg = result.value
+
         # todo: think carefully about concurrency for this
         self.sampled_from = set()
         self.logger.info('Done training model')
-        self.rec.release('train', 1) # todo: is this right?
-        # todo: actually pass around a model
+        self.rec.release('train', 1)  # todo: is this right?
+
 
 class Auditor():
 
@@ -436,7 +465,13 @@ if __name__ == '__main__':
 
     # Set up Queues and TaskServer
     queues = PipeQueues(
-        topics=['dynamics', 'audit', 'frame_selection', 'label'],
+        topics=[
+            'dynamics',
+            'audit',
+            'frame_selection',
+            'label',
+            'train',
+        ],
         keep_inputs=False
     )
 
@@ -444,6 +479,13 @@ if __name__ == '__main__':
     initial_frames = []
     for s in args.init_strc:
         initial_frames.append(read(s, '-1'))
+
+    # set up learner
+    # todo: make this configurable via CLI
+    learner = MACEInterface()
+    calc = mace_mp('small', device='cpu', default_dtype="float32")
+    model = calc.models[0]
+    model_msg = learner.serialize_model(model)
 
     # Set up Thinker
     thinker = Thinker(
@@ -455,7 +497,9 @@ if __name__ == '__main__':
         advance_steps=args.advance_steps,
         total_steps=args.total_steps,
         sample_frames=1,
-        start_train_frac=args.start_train_frac
+        start_train_frac=args.start_train_frac,
+        learner=learner,
+        model_msg=model_msg
     )
     # Make a logger
     logger = logging.getLogger('main')
@@ -476,19 +520,11 @@ if __name__ == '__main__':
     dyn_kwargs = {'timestep': 1 * units.fs}
     run_kwargs = {}
 
-    # set up learner
-    # todo: make this configurable via CLI
-    learner = MACEInterface()
-    calc = mace_mp('small', device='cpu', default_dtype="float32")
-    model = calc.models[0]
-    model_msg = learner.serialize_model(model)
-
     # wrap run function
     advance_dynamics_partial = partial(
         advance_dynamics,
         learner=learner,
         # write_freq=1,  # todo: make an arg
-        model_msg=model_msg,  # todo: allow this to vary with the run
         dyn_class=dyn_class,
         dyn_kwargs=dyn_kwargs,
         run_kwargs=run_kwargs,
@@ -499,7 +535,6 @@ if __name__ == '__main__':
     calc_factory = partial(mace_mp, 'medium', device='cpu', default_type='float32')
     label_partial = partial(label_training_frame, calc_factory=calc_factory)
     update_wrapper(label_partial, label_training_frame)
-    
     # Start the workflow
     task_server = LocalTaskServer(
         queues=queues,
