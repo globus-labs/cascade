@@ -3,7 +3,6 @@ from pathlib import Path
 import logging
 import sys
 import os
-from typing import Sequence
 from queue import Queue, Empty
 from functools import partial, update_wrapper
 from dataclasses import dataclass
@@ -21,15 +20,13 @@ from colmena.thinker import (
 )
 import ase
 from ase import Atoms
-from ase.io import read, write
+from ase.io import read
 from ase.optimize.optimize import Dynamics
 from ase.md.verlet import VelocityVerlet
 from ase import units
-from ase.filters import Filter
 from ase.db import connect
 from ase.calculators.calculator import Calculator
 import numpy as np
-from glob import glob
 from mace.calculators import mace_mp
 
 from cascade.learning.base import BaseLearnableForcefield
@@ -44,7 +41,6 @@ def advance_dynamics(
     learner: BaseLearnableForcefield,
     model_msg: bytes,
     steps: int,
-    current_step: int,
     chunk_i: int,
     dyn_class: type[Dynamics],
     dyn_kwargs: dict[str, object],
@@ -53,7 +49,18 @@ def advance_dynamics(
     # callbacks: Sequence[tuple[type, int, dict[str, object]]] = (),
     # repeat: bool = False
 ) -> tuple[list[ase.Atoms], int]:
-    """Advance an MD trajectory by n_steps
+    """Advance an MD trajectory by steps
+
+    :atoms: starting atoms to advance
+    :db_path: ASE databse path to save the steps
+    :traj_i: index of this trajectory in the cascade run
+    :learner: used to construct the ML forcefield
+    :model_msg: bytes representation of the ML forcefield weights
+    :steps: how many steps to advance by
+    :chunk_i: the index of this chunk in the trajectory
+    :dyn_class: constructor for the dynamics to run this trajectory
+    :dyn_kwargs: passed to dyn_class
+    :run_kwargs: passed to dyn_class().run
     """
 
     # set up calculator
@@ -95,7 +102,9 @@ def select_training_frames(
     atoms: list[Atoms],
     n_frames: int
 ) -> list[Atoms]:
-    """Return a frame or frames for training"""
+    """Return a frame or frames for training
+    RIGHT NOW IS JUST A STUB
+    """
     return sample(atoms, n_frames)
 
 
@@ -103,6 +112,12 @@ def label_training_frame(
     atoms: Atoms,
     calc_factory: Callable[[], Calculator]
 ) -> Atoms:
+    """Assign a assign a label (forces) to a training frame (atoms)
+    by running a calculator.
+
+    :atoms: the training frame to label
+    :calc_factory: a callable that creates a calculator
+    """
     calc = calc_factory()
     atoms.calc = calc
     atoms.get_forces()
@@ -111,7 +126,9 @@ def label_training_frame(
 
 
 def train_model(learner: BaseLearnableForcefield) -> bytes:
-    """currently just a stub that returns a model"""
+    """Train a new model and return its bytes representaiton
+    CURRENTLY JUST A STUB
+    """
     calc = mace_mp('small', device='cpu', default_dtype="float32")
     model = calc.models[0]
     model_msg = learner.serialize_model(model)
@@ -134,7 +151,12 @@ class Thinker(BaseThinker):
         learner: BaseLearnableForcefield,
         model_msg: bytes,
     ):
-        """thinker
+        """Cascade Thinker
+
+        Runs cascade by advancing trajectories to total_steps, by advance_steps
+        at a time. After each advance, the trajectories are audited. If they fail
+        the audit, frames are sampled, labeled, and the model is updated
+
         initial_frames: initial conditions for md trajectories
         queues: for colmena
         run_dir: where to store logs and ase database
@@ -173,8 +195,12 @@ class Thinker(BaseThinker):
         self.learner = learner
         self.model_msg = model_msg
 
+        # keep track of how many finished
+        self.done_ctr = 0
+
     @task_submitter(task_type='sim')
     def submit_dynamics(self):
+        """Submit tasks to advance dynamics"""
         while True:
             # spin wait if training is started
             if self.start_training.is_set():
@@ -202,7 +228,6 @@ class Thinker(BaseThinker):
                 atoms=atoms,
                 steps=steps,
                 traj_i=traj_id,
-                current_step=step_current,
                 chunk_i=chunk_i,
                 db_path=self.db_path,
                 model_msg=self.model_msg
@@ -216,7 +241,7 @@ class Thinker(BaseThinker):
 
     @result_processor(topic='dynamics')
     def process_dynamics(self, result: Result):
-        """receive the results of dynamcis and launch an audit task"""
+        """Process the results of dynamcis and launch an audit on this trajectory"""
 
         # ensure dynamics ran successfully
         traj_id = result.task_info['traj_id']
@@ -252,6 +277,7 @@ class Thinker(BaseThinker):
 
     @result_processor(topic='audit')
     def process_audit(self, result: Result):
+        """If audit passes: put in advance queue, else put in selection queue"""
 
         if not result.success:
             self.logger.error('Task failed with traceback:\n' + result.failure_info.traceback)
@@ -277,17 +303,19 @@ class Thinker(BaseThinker):
         traj_done = self.traj_progress[traj_id] >= self.total_steps
         # mark this trajectory as available
         if not traj_done:
+            self.done_ctr += 1
             self.logger.info(f'Traj {traj_id} not finished, marking as available')
             self.to_advance.put(traj_id)
         else:
             self.logger.info(f'Traj {traj_id} finished')
         # check if all trajectories are finished
         if np.all(self.traj_progress[traj_id] >= self.total_steps):
-            self.logger.info(f'All trajectories finished, setting thinker to done')
+            self.logger.info('All trajectories finished, setting thinker to done')
             self.done.set()
 
     @task_submitter(task_type='sim')
     def submit_data_selection(self):
+        """Submit a trajectory chunk with a failed-audit for data selection"""
         while True:
             try:
                 traj_id = self.to_select.get(block=True, timeout=1)
@@ -320,7 +348,7 @@ class Thinker(BaseThinker):
 
     @result_processor(topic='frame_selection')
     def process_frame_selection(self, result: Result):
-
+        """Put selected frames into the labeling queue"""
         if not result.success:
             self.logger.error('Task failed with traceback:\n' + result.failure_info.traceback)
             raise RuntimeError(result.failure_info.exception)
@@ -342,7 +370,7 @@ class Thinker(BaseThinker):
 
     @task_submitter(task_type='sim')
     def submit_labeling(self):
-        """label a training example"""
+        """Submit frames from labeling queue to be labeled"""
         while True:
             try:
                 atoms = self.to_label.get(block=True, timeout=1)
@@ -362,6 +390,7 @@ class Thinker(BaseThinker):
 
     @result_processor(topic='label')
     def store_labeled_data(self, result: Result):
+        """Store labeled frames and check/decide if it is time to update model"""
         if not result.success:
             self.logger.error('Task failed with traceback:\n' + result.failure_info.traceback)
             raise RuntimeError(result.failure_info.exception)
@@ -374,7 +403,7 @@ class Thinker(BaseThinker):
 
         # check how many trajs have been sampled from
         n_sampled = len(self.sampled_from)
-        frac_sampled = n_sampled / self.n_traj
+        frac_sampled = n_sampled / (self.n_traj - self.done_ctr)  # is this threadsafe???
         logger.info(f'{n_sampled=}, {frac_sampled=}, {self.start_train_frac=}')
 
         # if we've sampled from enough trajectories and weve labeled everything
@@ -416,13 +445,14 @@ class Thinker(BaseThinker):
 
 
 class Auditor():
-
+    """Auditor base class"""
     def audit(self, traj: list[Atoms]) -> tuple[bool, float, Atoms]:
         raise NotImplementedError()
 
 
 @dataclass
 class DummyAuditor(Auditor):
+    """STUB: Randomly pass or fail with accept_rate"""
 
     accept_rate = 0.75
 
@@ -435,18 +465,25 @@ class DummyAuditor(Auditor):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--run-name', type=str, required=True)
-    parser.add_argument('--advance-steps', type=int, required=True)
-    parser.add_argument('--total-steps', type=int, required=True)
+    parser = argparse.ArgumentParser(
+        prog='Cascade',
+        description="""Launch a cascade job. Trajectories will be advanced under an ML surrogate 
+        in chunks of size <advance-steps> until they are all of length <total-steps>. 
+        When chunks from <start-train-frac> of the trajectories are marked as untrusted, the model will be updated.
+        """
+    )
+    parser.add_argument('--run-name', type=str, required=True, help='Name that appears in the run directory')
+    parser.add_argument('--advance-steps', type=int, required=True, help='How many steps to advance a trajectory at a time')
+    parser.add_argument('--total-steps', type=int, required=True, help='How long a trajectory should be')
     parser.add_argument(
         '--init-strc',
         type=str,
         nargs='+',
-        required=True
+        required=True,
+        help='Path(s) to starting structures for molecular dynamics. One trajectory will be run for each starting structure'
     )
-    parser.add_argument('--start-train-frac', type=float, default=1.)
-    parser.add_argument('--num-workers', type=int, default=8)
+    parser.add_argument('--start-train-frac', type=float, default=1., help='What fraction of trajectories have to have untrusted segments before training begins')
+    parser.add_argument('--num-workers', type=int, default=8, help='How many workers')
     #parser.add_argument('--model-file', type=str)
 
     args = parser.parse_args()
