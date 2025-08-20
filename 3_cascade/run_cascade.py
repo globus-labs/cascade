@@ -44,9 +44,9 @@ def advance_dynamics(
     chunk_i: int,
     dyn_class: type[Dynamics],
     dyn_kwargs: dict[str, object],
-    run_kwargs: dict[str, object] = None,
+    run_kwargs: dict[str, object] = {},
     # dyn_filter: tuple[type[Filter], dict[str, object]] | None = None,
-    # callbacks: Sequence[tuple[type, int, dict[str, object]]] = (),
+    # callbacks: Sequence[tuple[type, int, disct[str, object]]] = (),
     # repeat: bool = False
 ) -> tuple[list[ase.Atoms], int]:
     """Advance an MD trajectory by steps
@@ -77,6 +77,9 @@ def advance_dynamics(
 
         # set up writer
         def write_to_db():
+            # needs to be 64 bit for db read
+            f = atoms.calc.results['forces']
+            atoms.calc.results['forces'] = f.astype(np.float64)
             db.write(
                 atoms=atoms,
                 traj=traj_i,
@@ -212,12 +215,16 @@ class Thinker(BaseThinker):
                     return
             else:
                 break
-        self.logger.info(f'Submitting trajecotry {traj_id} for advancement')
-
         # calculate chunk index and how many steps to advance
         step_current = self.traj_progress[traj_id]
         steps = min(self.advance_steps, self.total_steps - step_current)
         chunk_i = int(step_current // self.advance_steps)
+
+        self.logger.info(
+            (f'Submitting trajecotry {traj_id} for advancement, '
+             f'current step: {step_current} '
+             f'steps to run: {steps} '
+             f'{chunk_i=}'))
 
         atoms = self.atoms[traj_id]
 
