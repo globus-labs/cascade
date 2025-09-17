@@ -467,7 +467,7 @@ class DummyAuditor(Auditor):
         """a stub of a real audit"""
         good = np.random.random() < self.accept_rate
         score = float(good)
-        atoms = traj[0] if good else traj[-1]
+        atoms = traj[-1] if good else traj[0]
         return good, score, atoms
 
 
