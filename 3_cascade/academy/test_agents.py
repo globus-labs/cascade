@@ -43,15 +43,12 @@ async def test_dynamics_engine(
 
     traj = await engine.advance_dynamics(
         atoms,
-        db_path='test.db',
-        traj_i=0,
-        chunk_i=0,
         learner=learner,
         model_msg=model_msg,
         steps=10,
         calc_factory=mace_mp,
         dyn_cls=VelocityVerlet,
-        dyn_kws={'timestep': 1 * units.fs},
+        dyn_kws={'timestep': 1*units.fs},
     )
 
     assert len(traj) == 11, "Didn't run correct number of steps"

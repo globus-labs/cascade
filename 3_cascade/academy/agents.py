@@ -11,6 +11,8 @@ from ase.calculators.calculator import Calculator
 from ase.optimize.optimize import Dynamics
 
 from cascade.learning.base import BaseLearnableForcefield
+from cascade.utils import canonicalize
+
 from base_agents import (
     Auditor, TrainingSampler, TrainingLabeler, ModelTrainer
 )
@@ -27,6 +29,31 @@ from base_agents import (
 #         pass
 
 
+class Writer(Agent):
+
+    @action
+    async def write(
+        self,
+        atoms: Atoms,
+        db_path: str,
+        traj_i: int
+    ):
+        pass
+        # print('connecting to db')
+        # with connect(db_path) as db:
+        #     print('done.')
+
+        #     # delete existing rows for this chunk (we are rerunning)
+        #     print('reading from db')
+        #     rows = db.select(chunk=chunk_i, traj=traj_i)
+        #     print('done.')
+        #     ids = [r.id for r in rows]
+        #     if ids is not None:
+        #         print('deleting old db entries')
+        #         db.delete(ids)
+        #         print('done.')
+
+
 class DynamicsEngine(Agent):
 
     def __init__(
@@ -38,12 +65,9 @@ class DynamicsEngine(Agent):
     async def advance_dynamics(
         self,
         atoms: Atoms,
-        db_path: str,
-        traj_i: int,
         learner: BaseLearnableForcefield,
         model_msg: bytes,
         steps: int,
-        chunk_i: int,
         calc_factory: Callable[[], Calculator],
         dyn_cls: type[Dynamics],
         dyn_kws: dict[str, object],
@@ -58,46 +82,25 @@ class DynamicsEngine(Agent):
         print('done.')
         atoms.calc = calc
 
-        print('connecting to db')
-        with connect(db_path) as db:
-            print('done.')
+        traj = []
 
-            # delete existing rows for this chunk (we are rerunning)
-            print('reading from db')
-            rows = db.select(chunk=chunk_i, traj=traj_i)
-            print('done.')
-            ids = [r.id for r in rows]
-            if ids is not None:
-                print('deleting old db entries')
-                db.delete(ids)
-                print('done.')
+        # set up writer
+        def write_to_list():
+            # needs to be 64 bit for db read
+            f = atoms.calc.results['forces']
+            atoms.calc.results['forces'] = f.astype(np.float64)
+            traj.append(canonicalize(atoms))
 
-            # set up writer
-            def write_to_db():
-                # needs to be 64 bit for db read
-                f = atoms.calc.results['forces']
-                atoms.calc.results['forces'] = f.astype(np.float64)
-                db.write(
-                    atoms=atoms,
-                    traj=traj_i,
-                    chunk=chunk_i,
-                )
-
-            # set up dynamics
-            dyn = dyn_cls(
-                atoms,
-                **dyn_kws
-            )
-            dyn.attach(write_to_db)
-            # run dynamics
-            print('running dynamics')
-            dyn.run(steps, **run_kws)
-            print('done.')
-
-            print('reading dynamics results.')
-            traj = db.select(traj=traj_i, chunk=chunk_i)
-            print('done.')
-            traj = [row.toatoms() for row in traj]
+        # set up dynamics
+        dyn = dyn_cls(
+            atoms,
+            **dyn_kws
+        )
+        dyn.attach(write_to_list)
+        # run dynamics
+        print('running dynamics')
+        dyn.run(steps, **run_kws)
+        print('done.')
         return traj
 
 
