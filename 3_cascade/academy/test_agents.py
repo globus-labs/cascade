@@ -59,13 +59,19 @@ async def test_dynamics_engine(
         mad = np.sum(np.abs(a.get_positions() - traj[0].get_positions()))
         assert mad > 0, "Positions didn't change at all"
 
+
 @pytest.mark.asyncio
 async def test_writer(
     atoms,
-    model_msg
+    model_msg,
+    tmp_path
 ):
 
-    # first create a traj to write
+    # create temporary db
+    db_path = tmp_path / 'test.db'
+    db_str = str(db_path)
+
+    # create a traj to write
     engine = DynamicsEngine()
     traj = await engine.advance_dynamics(
         atoms,
@@ -77,7 +83,20 @@ async def test_writer(
         dyn_kws={'timestep': 1*units.fs},
     )
 
-    writer = Writer(db_path='foo.db')
+    # write and assure we have the correct results
+    writer = Writer(db_path=db_str)
     await writer.write(traj, traj_i=0, chunk_i=0)
-    with connect('foo.db') as db:
+    with connect(db_str) as db:
         assert db.count() == 11
+
+@pytest.mark.asyncio
+async def test_dummy_auditor(
+    atoms,
+):
+    traj = [atoms.copy() for i in range(10)]
+    auditor = DummyAuditor()
+    good, score, frame = await auditor.audit_chunk(traj)
+    assert isinstance(good, bool)
+    assert isinstance(score, float)
+    assert isinstance(atoms, Atoms)
+
