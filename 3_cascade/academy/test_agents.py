@@ -6,13 +6,15 @@ from ase import Atoms
 from ase.md.verlet import VelocityVerlet
 from mace.calculators import mace_mp
 import numpy as np
+from ase.db import connect
 from ase import units
 
 from agents import (
     DynamicsEngine,
     DummyAuditor,
     DummySampler,
-    DummyTrainer
+    DummyTrainer,
+    Writer
 )
 
 from pytest import fixture
@@ -56,3 +58,26 @@ async def test_dynamics_engine(
         assert isinstance(a, Atoms)
         mad = np.sum(np.abs(a.get_positions() - traj[0].get_positions()))
         assert mad > 0, "Positions didn't change at all"
+
+@pytest.mark.asyncio
+async def test_writer(
+    atoms,
+    model_msg
+):
+
+    # first create a traj to write
+    engine = DynamicsEngine()
+    traj = await engine.advance_dynamics(
+        atoms,
+        learner=learner,
+        model_msg=model_msg,
+        steps=10,
+        calc_factory=mace_mp,
+        dyn_cls=VelocityVerlet,
+        dyn_kws={'timestep': 1*units.fs},
+    )
+
+    writer = Writer(db_path='foo.db')
+    await writer.write(traj, traj_i=0, chunk_i=0)
+    with connect('foo.db') as db:
+        assert db.count() == 11

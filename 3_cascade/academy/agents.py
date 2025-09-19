@@ -17,7 +17,6 @@ from base_agents import (
     Auditor, TrainingSampler, TrainingLabeler, ModelTrainer
 )
 
-
 # class CascadseCoordinator(Agent):
 
 #     def __init__(
@@ -30,28 +29,36 @@ from base_agents import (
 
 
 class Writer(Agent):
+    """some design questions:
+    
+    * should this thing maintain a connection for its lifetime?
+    * how parallel (if at all) should this be?
+    * should the chunk index just be in a kwargs? or some dataclass?
+    * should it figure out the pass index?
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
 
     @action
     async def write(
         self,
-        atoms: Atoms,
-        db_path: str,
-        traj_i: int
+        atoms: list[Atoms],
+        db_path: str = None,
+        **kwargs
     ):
-        pass
-        # print('connecting to db')
-        # with connect(db_path) as db:
-        #     print('done.')
+        """Write chunk of trajectory to a database
+        atoms: trajectory to write
+        db_path: overrides that passed to initializer
+        kwargs: passed to write for each frame
+        """
 
-        #     # delete existing rows for this chunk (we are rerunning)
-        #     print('reading from db')
-        #     rows = db.select(chunk=chunk_i, traj=traj_i)
-        #     print('done.')
-        #     ids = [r.id for r in rows]
-        #     if ids is not None:
-        #         print('deleting old db entries')
-        #         db.delete(ids)
-        #         print('done.')
+        # handle defaults
+        db_path = db_path if db_path is not None else self.db_path
+        print('connecting to db')
+        with connect(db_path) as db:
+            for a in atoms:
+                db.write(a, **kwargs)
 
 
 class DynamicsEngine(Agent):
