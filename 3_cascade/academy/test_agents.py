@@ -100,3 +100,19 @@ async def test_dummy_auditor(
     assert isinstance(score, float)
     assert isinstance(atoms, Atoms)
 
+@pytest.mark.asyncio
+async def test_dummy_sampler(
+    atoms
+):
+    traj = [atoms.copy() for i in range(10)]
+    sampler = DummySampler()
+    sample = await sampler.sample_frames(traj, 5)
+    assert len(sample) == 5
+
+@pytest.mark.asyncio
+async def test_dummy_trainer(
+    learner=learner
+):
+    trainer = DummyTrainer()
+    model_msg = await trainer.train_model(learner)
+    assert isinstance(model_msg, bytes)
