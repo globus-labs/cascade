@@ -36,9 +36,6 @@ from cascade.utils import canonicalize
 from model import AuditStatus
 
 from model import AdvanceSpec, TrajectoryChunk, Trajectory
-from base_agents import (
-    Auditor, TrainingSampler, TrainingLabeler, ModelTrainer, Database
-)
 
 
 class DummyDatabase(Agent):
@@ -48,7 +45,7 @@ class DummyDatabase(Agent):
         self,
         trajectories: list[Trajectory],
         retrain_len: int,
-        trainer: Handle[ModelTrainer],
+        trainer: Handle[DummyTrainer],
         dynamics_engine: Handle[DynamicsEngine]
     ):
 
@@ -69,7 +66,7 @@ class DummyDatabase(Agent):
     async def write_chunk(self, chunk: TrajectoryChunk):
         """Write chunks that have passed auditing and pass for advancement if not complete"""
         id = chunk.traj_id
-        self.logger.info(f'Writing chunk of len {len(chunk)} for trajectory {i}')
+        self.logger.info(f'Writing chunk of len {len(chunk)} for trajectory {id}')
         traj = self.trajectories[id]
         traj.add_chunk(chunk)
         atoms = chunk.atoms[-1]
@@ -109,6 +106,7 @@ class DummyDatabase(Agent):
         """Trigger a retrain event and add the right atoms back to the dynamics queue"""
         while not shutdown.is_set():
             if not self.retrain.wait(timeout=1):
+                sleep(1)
                 continue
             self.logger.info("Starting Retraining")
             # retrain model and update weights in dynamics engine
@@ -130,7 +128,8 @@ class DynamicsEngine(Agent):
 
     def __init__(
         self,
-        auditor: Handle["Auditor"],
+        init_specs: list[AdvanceSpec],
+        auditor: Handle[DummyAuditor],
         learner: BaseLearnableForcefield,
         weights: bytes,
         dyn_cls: type[Dynamics],
@@ -141,14 +140,17 @@ class DynamicsEngine(Agent):
 
         self.learner = learner
         self.weights = weights
+        self.auditor = auditor
         self.dyn_cls = dyn_cls
         self.device = device
         self.dyn_kws = dyn_kws
         self.run_kws = run_kws
 
-        self.model_version = 0  #todo: mt.2025.10.20 probably this should be persisted somewhere else
+        self.model_version = 0  # todo: mt.2025.10.20 probably this should be persisted somewhere else
 
         self.queue = Queue()
+        for spec in init_specs:
+            self.queue.put(spec)
         self.logger = logging.getLogger("DynamicsEnginie")
 
     @action
@@ -156,7 +158,7 @@ class DynamicsEngine(Agent):
         self.weights = weights
         self.model_version += 1
         self.logger.info(f"Received new weights, now on model version {self.model_version}")
-    
+
     @action
     async def submit(self, spec: AdvanceSpec):
         self.logger.debug("Received advance spec")
@@ -178,6 +180,7 @@ class DynamicsEngine(Agent):
             try:
                 spec = self.queue.get()
             except Queue.Empty:
+                sleep(1)
                 continue
 
             atoms = spec.atoms
@@ -210,10 +213,12 @@ class DynamicsEngine(Agent):
             # run dynamics
             self.logger.info(f"Running dynamics for chunk {chunk.chunk_id} of traj {chunk.traj_id}.")
             dyn.run(spec.steps, **run_kws)
+            del chunk.atoms[0]  # we have the initial conditions saved elsewhere
 
             # submit to auditor
             self.logger.info(f"Submitting audit for chunk {chunk.chunk_id} of traj {chunk.traj_id}.")
             await self.auditor.submit(chunk)
+            self.logger.info('Done.')
 
 
 class DummyAuditor(Agent):
@@ -221,8 +226,8 @@ class DummyAuditor(Agent):
     def __init__(
             self,
             accept_rate: float,
-            sampler: Handle["TrainingSampler"],
-            database: Handle["Database"]
+            sampler: Handle[DummySampler],
+            database: Handle[DummyDatabase]
     ):
 
         self.accept_rate = accept_rate
@@ -246,6 +251,7 @@ class DummyAuditor(Agent):
             try:
                 chunk = self.queue.get()
             except Queue.Empty:
+                sleep(1)
                 continue
 
             self.logger.info(f'Auditing chunk {chunk.chunk_id} of traj {chunk.traj_id}')
@@ -267,7 +273,7 @@ class DummySampler(Agent):
     def __init__(
         self,
         n_frames: int,
-        labeler: Handle[TrainingLabeler],
+        labeler: Handle[DummyLabeler],
         rng: np.random.Generator = None,
     ):
         self.rng = rng if rng else np.random.default_rng()
@@ -290,6 +296,7 @@ class DummySampler(Agent):
             try:
                 chunk = self.queue.get()
             except Queue.Empty:
+                sleep(1)
                 continue
 
             self.logger.info(f'Sampling frames from chunk {chunk.chunk_id} of traj {chunk.traj_id}')
@@ -303,7 +310,7 @@ class DummyLabeler(Agent):
 
     def __init__(
         self,
-        database: Handle[Database]
+        database: Handle[DummyDatabase]
     ):
         self.database = database
         self.queue = Queue()
@@ -319,6 +326,7 @@ class DummyLabeler(Agent):
             try:
                 frame = self.queue.get()
             except Queue.Empty:
+                sleep(1)
                 continue
             await self.database.write_training_frame(frame)
 
