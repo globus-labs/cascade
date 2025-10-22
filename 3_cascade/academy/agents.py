@@ -10,11 +10,16 @@ In addition to de-stubbing, we have the following todos:
 * make configuration of agents flexible, updatable (i.e., control parameters)
 * logging
 """
+from __future__ import annotations
 
 import asyncio
 from typing import Callable
 from collections import defaultdict
-from asyncio import Queue
+#from asyncio import Queue
+from queue import Queue
+from threading import Event
+from time import sleep
+import logging
 
 import numpy as np
 from numpy.random import sample
@@ -30,17 +35,18 @@ from cascade.learning.base import BaseLearnableForcefield
 from cascade.utils import canonicalize
 from model import AuditStatus
 
+from model import AdvanceSpec, TrajectoryChunk, Trajectory
 from base_agents import (
     Auditor, TrainingSampler, TrainingLabeler, ModelTrainer, Database
 )
 
 
 class DummyDatabase(Database):
-    """Not a real database, just something that will work for now"""
+    """Not a real database, just a stub with in-memory storage"""
 
     def __init__(
-        self, 
-        trajectories: list[Trajectories],
+        self,
+        trajectories: list[Trajectory],
         retrain_len: int,
         trainer: Handle[ModelTrainer],
         dynamics_engine: Handle[DynamicsEngine]
@@ -52,6 +58,8 @@ class DummyDatabase(Database):
         self.retrain_len = retrain_len
         self.trainer = trainer
         self.dynamics_engine = dynamics_engine
+        self.retrain = Event()
+        self.logger = logging.getLogger('Database')
 
     @property
     def all_done(self):
@@ -59,31 +67,56 @@ class DummyDatabase(Database):
 
     @action
     async def write_chunk(self, chunk: TrajectoryChunk):
+        """Write chunks that have passed auditing and pass for advancement if not complete"""
         id = chunk.traj_id
-        self.trajectories[traj_id].add_chunk(chunk)
+        self.logger.info(f'Writing chunk of len {len(chunk)} for trajectory {i}')
+        traj = self.trajectories[id]
+        traj.add_chunk(chunk)
+        atoms = chunk.atoms[-1]
+        if not traj.is_done():
+            advance_spec = AdvanceSpec(
+                atoms,
+                traj.id,
+                chunk.chunk_id+1
+            )
+            await self.dynamics_engine.submit(advance_spec)
 
     @action
     async def write_training_frame(self, frame: Atoms):
         # check here if we have exceeded the retrain length, then set event
         self.training_frames.append(frame)
-    
+        self.logger.info("Adding training frame")
+        if len(self.training_frames) >= self.retrain_len:
+            self.logger.info('Setting training event')
+            self.retrain.set()
+
     @action
     async def mark_sampled(self, traj_id: int):
+        self.logger.info(f"Adding {traj_id} to sampled trajectories")
         self.sampled_trajectories.add(traj_id)
 
     @loop
-    async def periodic_retrain(self, shutdown: asyncio.Event):
-        # run this thing on event (see the sc25 example)
+    async def monitor_completion(self, shutdown: asyncio.Event) -> None:
+        while not shutdown.is_set():
+            if self.all_done:
+                self.logger.info("All trajectories done, setting shutdown")
+                shutdown.set()
+            else:
+                sleep(1)
+
+    @loop
+    async def periodic_retrain(self, shutdown: asyncio.Event) -> None:
         """Trigger a retrain event and add the right atoms back to the dynamics queue"""
         while not shutdown.is_set():
-            if len(training_frames) <= self.retrain_len:
-                continue # sleep?
-            
+            if not self.retrain.wait(timeout=1):
+                continue
+            self.logger.info("Starting Retraining")
             # retrain model and update weights in dynamics engine
             weights = await self.trainer.retrain()
             await self.dynamics_engine.receive_weights(weights)
 
             # put the sampled trajectories back in the dynamics queue
+            self.logger.info("Clearing training set, submitting trajectories to advance")
             for traj_id in self.sampled_trajectories:
                 atoms = self.trajecotires[traj_id].chunks[-1].atoms[-1]
                 await self.dymamics_engine.submit(atoms)
@@ -91,7 +124,7 @@ class DummyDatabase(Database):
             # clear training data
             self.training_frames = []
             self.sampled_frames = set()
-                
+
 
 class DynamicsEngine(Agent):
 
@@ -116,49 +149,46 @@ class DynamicsEngine(Agent):
         self.model_version = 0  #todo: mt.2025.10.20 probably this should be persisted somewhere else
 
         self.queue = Queue()
-
+        self.logger = logging.getLogger("DynamicsEnginie")
 
     @action
-    async def receive_weights(self, weights:bytes) -> None:
+    async def receive_weights(self, weights: bytes) -> None:
         self.weights = weights
         self.model_version += 1
+        self.logger.info(f"Received new weights, now on model version {self.model_version}")
     
     @action
-    async def submit(chunk: TrajectoryChunk):
-        self.queue.put(chunk)
+    async def submit(self, spec: AdvanceSpec):
+        self.logger.debug("Received advance spec")
+        self.queue.put(spec)
 
     @loop
     async def advance_dynamics(
         self,
         shutdown: asyncio.Event
     ) -> None:
-    """Advance dynamics while there are trajectoires to advance
+        """Advance dynamics while there are trajectoires to advance
 
 
-    questions:
-        * should we have an update model method that locks?
-    """
-
+        questions:
+            * should we have an update model method that locks?
+        """
         while not shutdown.is_set():
 
             try:
-                old_chunk = self.queue.get()
+                spec = self.queue.get()
             except Queue.Empty:
                 continue
 
-            atoms = old_chunk.atoms[-1]
- 
-            print('making learner')
-            calc = learner.make_calculator(self.weights, device=self.device)
-            print('done.')
+            atoms = spec.atoms
+            calc = self.learner.make_calculator(self.weights, device=self.device)
             atoms.calc = calc
-
 
             chunk = TrajectoryChunk(
                 atoms=[],
-                model_version = self.model_version,
-                traj_id=old_chunk.traj_id,
-                chunk_id=old_chunk.chunk_id+1
+                model_version=self.model_version,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id
             )
 
             # set up dynamics
@@ -176,35 +206,34 @@ class DynamicsEngine(Agent):
                 atoms.calc.results['forces'] = f.astype(np.float64)
                 chunk.atoms.append(canonicalize(atoms))
             dyn.attach(write_to_list)
-            
+
             # run dynamics
-            print('running dynamics')
-            dyn.run(steps, **run_kws)
-            print('done.')
+            self.logger.info(f"Running dynamics for chunk {chunk.chunk_id} of traj {chunk.traj_id}.")
+            dyn.run(spec.steps, **run_kws)
 
             # submit to auditor
-            await auditor.submit(chunk)
+            self.logger.info(f"Submitting audit for chunk {chunk.chunk_id} of traj {chunk.traj_id}.")
+            await self.auditor.submit(chunk)
 
 
 class DummyAuditor(Auditor):
-    
+
     def __init__(
             self,
-            accept_rate: float = 1.,
+            accept_rate: float,
             sampler: Handle["TrainingSampler"],
-            dynamics_engine: Handle["DynamicsEngine"],
             database: Handle["Database"]
-        ):
+    ):
 
         self.accept_rate = accept_rate
         self.sampler = sampler
-        self.dynamics_engine = dynamics_engine
+        #self.dynamics_engine = dynamics_engine
         self.queue = Queue()
-
+        self.logger = logging.getLogger("Auditor")
 
     @action
-    def submit(self, TrajectoryChunk):
-        self.queue.put(TrajectoryChunk)
+    async def submit(self, chunk: TrajectoryChunk):
+        self.queue.put(chunk)
 
     @loop
     async def audit(
@@ -212,76 +241,86 @@ class DummyAuditor(Auditor):
         shutdown: asyncio.Event
     ) -> None:
         """a stub of a real audit"""
-        
+
         while not shutdown.is_set():
             try:
                 chunk = self.queue.get()
             except Queue.Empty:
                 continue
-            
+
+            self.logger.info(f'Auditing chunk {chunk.chunk_id} of traj {chunk.traj_id}')
             good = np.random.random() < self.accept_rate
-            score = float(good)
+            #  score = float(good)
             if good:
                 chunk.audit_status = AuditStatus.PASSED
-                # todo: check if done
-                await self.dynamics_engine.submit(chunk)
+                self.logger.info(f'Audit passed for chunk {chunk.chunk_id} of traj {chunk.traj_id}')
+                await self.database.submit(chunk)
             else:
                 chunk.audit_status = AuditStatus.FAILED
+                self.logger.info(f'Audit failed for chunk {chunk.chunk_id} of traj {chunk.traj_id}')
                 await self.database.mark_sampled(chunk.traj_id)
-                await self.training_sampler.submit(chunk)    
+                await self.training_sampler.submit(chunk)
+
 
 class DummySampler(TrainingSampler):
 
     def __init__(
         self,
         n_frames: int,
-        labeler: Handle[TrainingLabeler]
+        labeler: Handle[TrainingLabeler],
         rng: np.random.Generator = None,
     ):
         self.rng = rng if rng else np.random.default_rng()
         self.queue = Queue()
         self.labeler = labeler
         self.n_frames = n_frames
+        self.logger = logging.getLogger('Sampler')
+
+    @action
+    async def submit(self, chunk: TrajectoryChunk):
+        self.queue.put(chunk)
 
     @loop
-    async def sample(
+    async def sample_frames(
         self,
-        shudown: asyncio.Event
+        shutdown: asyncio.Event
     ) -> None:
         while not shutdown.is_set():
-            
+
             try:
                 chunk = self.queue.get()
             except Queue.Empty:
                 continue
-            
+
+            self.logger.info(f'Sampling frames from chunk {chunk.chunk_id} of traj {chunk.traj_id}')
             atoms = chunk.atoms
             frames = self.rng.choice(atoms, self.n_frames, replace=False)
             for frame in frames:
-                await labeler.submit_frame(frame)
+                await self.labeler.submit(frame)
+
 
 class DummyLabeler(TrainingLabeler):
 
     def __init__(
         self,
-        databse: Handle[Database]
+        database: Handle[Database]
     ):
         self.database = database
         self.queue = Queue()
 
     @action
-    async def submit_frame(self, frame: Atoms) -> None:
-
+    async def submit(self, frame: Atoms) -> None:
         self.queue.put(frame)
 
     @loop
     async def label_data(self, shutdown: asyncio.Event) -> None:
-        try:
-            frame = self.queue.get()
-        except Queue.Empty:
-            continue
-        
-        await database.write_training_frame(frame)
+
+        while not shutdown.is_set():
+            try:
+                frame = self.queue.get()
+            except Queue.Empty:
+                continue
+            await self.database.write_training_frame(frame)
 
 
 class DummyTrainer(ModelTrainer):

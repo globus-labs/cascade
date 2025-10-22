@@ -1,5 +1,5 @@
-import asyncio
 from __future__ import annotations
+import asyncio
 from queue import Queue
 
 from academy.agent import Agent, action, loop
@@ -40,7 +40,7 @@ class Database(Agent):
         raise NotImplementedError()
 
     @loop
-    async def periodic_retrain(self, shutdown: asyncio.Event):
+    async def periodic_retrain(self, shutdown: asyncio.Event) -> None:
         """Decide when to retrain, start retrain actions
 
         Monitors DB for accumulation of training data
@@ -73,7 +73,7 @@ class DynamicsEngine(Agent):
     async def submit(
         self,
         traj: Trajectory
-    )-> None:
+    ) -> None:
         """Push atoms onto the queue"""
         raise NotImplementedError()
 
@@ -124,7 +124,7 @@ class TrainingSampler(Agent):
 
     @loop
     async def sample(
-        self, 
+        self,
         shutdown: asyncio.Event
     ) -> None:
         """Pull off of queue and sample"""
@@ -142,7 +142,7 @@ class TrainingLabeler(Agent):
     def label_frames(
         self,
         shutdown: asyncio.Event
-    ):
+    ) -> None:
         """pull off of the queue and label
 
         should the training data just stay in memory?

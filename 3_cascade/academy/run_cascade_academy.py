@@ -1,6 +1,9 @@
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+from ase.io import read
 from academy.exchange import LocalExchangeFactory
 from academy.manager import Manager
-from concurrent.futures import ThreadPoolExecutor
 
 from agents import (
     DummyDatabase,
@@ -10,36 +13,44 @@ from agents import (
     DummyLabeler,
     DummyTrainer
 )
-
-from model import Trajectory
-
-from ase.io import read
+from model import Trajectory, AdvanceSpec
 
 
-# args
-init_strc = []
-target_length = 100
-retrain_len = 10
-n_sample_frames = 1
-accept_rate = 1.
-learner = None
-init_weights = None
-dyn_cls = None
-dyn_kws = {}
-run_kws = {}
+async def main():
 
-if __name__ == '__main__':
-    
+    # args
+    init_strc = ['../../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp'] * 2
+
+    target_length = 100
+    retrain_len = 10
+    n_sample_frames = 1
+    accept_rate = 1.
+    chunk_size = 10
+    learner = None
+    init_weights = None
+    dyn_cls = None
+    dyn_kws = {}
+    run_kws = {}
+
     # intial conditions, trajectories
-    initial_frames = []
+    initial_specs = []
     trajectories = []
     for i, s in enumerate(init_strc):
-        initial_frames.append(read(s, '-1'))
+        a = read(s, index=-1)
         trajectories.append(
             Trajectory(
+                init_atoms=a,
                 chunks=[],
                 target_length=target_length,
+                id=i,
+            )
+        )
+        initial_specs.append(
+            AdvanceSpec(
+                a,
                 traj_id=i,
+                chunk_id=0,
+                steps=chunk_size
             )
         )
 
@@ -50,12 +61,12 @@ if __name__ == '__main__':
     ) as manager:
 
         # register all agents with manager
-        db_reg = manager.register_agent(DummyDatabase)
-        trainer_reg = manager.register_agent(DummyTrainer)
-        labeler_reg = manager.register_agent(DummyLabeler)
-        sampler_reg = manager.register_agent(DummySampler)
-        auditor_reg = manager.register_agent(DummyAuditor)
-        dynamics_reg = manager.register_agent(DynamicsEngine)
+        db_reg = await manager.register_agent(DummyDatabase)
+        trainer_reg = await manager.register_agent(DummyTrainer)
+        labeler_reg = await manager.register_agent(DummyLabeler)
+        sampler_reg = await manager.register_agent(DummySampler)
+        auditor_reg = await manager.register_agent(DummyAuditor)
+        dynamics_reg = await manager.register_agent(DynamicsEngine)
 
         # get handles to all agents
         db_handle = manager.get_handle(db_reg)
@@ -66,39 +77,54 @@ if __name__ == '__main__':
         dynamics_handle = manager.get_handle(dynamics_reg)
 
         # launch all agents
-        manager.launch(
+        await manager.launch(
             db_handle,
-            trajectories,
-            retrain_len,
-            trainer_handle,
-            dynamics_handle
+            args=(
+                trajectories,
+                retrain_len,
+                trainer_handle,
+                dynamics_handle
+            )
         )
-
-        manager.launch(
-            trainer_handle,
-            learner
-        )
-
-        manager.launch(
-            sampler_handle,
-            n_sample_frames,
-            sampler_handle
-        )
-
-        manager.launch(
-            auditor_handle,
-            accept_rate,
-            sampler_handle,
+        await manager.launch(
             dynamics_handle,
-            db_handle
+            args=(
+                auditor_handle,
+                learner,
+                init_weights,
+                dyn_cls,
+                dyn_kws,
+                run_kws
+            )
+        )
+        await manager.launch(
+            trainer_handle,
+            args=(learner,)
+        )
+        await manager.launch(
+            labeler_handle,
+            args=(db_handle,)
+        )
+        await manager.launch(
+            sampler_handle,
+            args=(
+                n_sample_frames,
+                sampler_handle
+            )
+        )
+        await manager.launch(
+            auditor_handle,
+            args=(
+                accept_rate,
+                sampler_handle,
+                dynamics_handle,
+                db_handle
+            )
         )
 
-        manager.launch(
-            dynamics_handle,
-            auditor_handle,
-            learner,
-            init_weights,
-            dyn_cls,
-            dyn_kws,
-            run_kws
-        )
+        # seed with initial conditions
+        for spec in initial_specs:
+            await dynamics_handle.submit(spec)
+
+if __name__ == '__main__':
+    raise SystemExit(asyncio.run(main()))
