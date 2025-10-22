@@ -2,8 +2,10 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 from ase.io import read
+from ase import units
 from academy.exchange import LocalExchangeFactory
 from academy.manager import Manager
+from mace.calculators import mace_mp
 
 from agents import (
     DummyDatabase,
@@ -14,6 +16,8 @@ from agents import (
     DummyTrainer
 )
 from model import Trajectory, AdvanceSpec
+from cascade.learning.mace import MACEInterface
+from ase.md.verlet import VelocityVerlet
 
 
 async def main():
@@ -26,10 +30,12 @@ async def main():
     n_sample_frames = 1
     accept_rate = 1.
     chunk_size = 10
-    learner = None
-    init_weights = None
-    dyn_cls = None
-    dyn_kws = {}
+    learner = MACEInterface()
+    calc = mace_mp('small', device='cpu', default_dtype="float32")
+    model = calc.models[0]
+    init_weights = learner.serialize_model(model)
+    dyn_cls = VelocityVerlet
+    dyn_kws = {'timestep': 1*units.fs}
     run_kws = {}
 
     # intial conditions, trajectories
