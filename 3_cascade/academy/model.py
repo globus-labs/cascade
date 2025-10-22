@@ -72,7 +72,8 @@ class Trajectory:
     def __len__(self):
         return sum(len(chunk) for chunk in self.chunks)
 
-    def is_done(self):
+    @property
+    def done(self):
         return (
             len(self) >= self.target_length
             and
