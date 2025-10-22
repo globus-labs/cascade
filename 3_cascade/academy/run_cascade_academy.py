@@ -84,7 +84,7 @@ async def main():
 
         # launch all agents
         await manager.launch(
-            db_handle,
+            DummyDatabase,
             args=(
                 trajectories,
                 retrain_len,
@@ -93,7 +93,7 @@ async def main():
             )
         )
         await manager.launch(
-            dynamics_handle,
+            DynamicsEngine,
             args=(
                 auditor_handle,
                 learner,
@@ -104,26 +104,24 @@ async def main():
             )
         )
         await manager.launch(
-            trainer_handle,
-            args=(learner,)
+            DummyTrainer
         )
         await manager.launch(
-            labeler_handle,
+            DummyLabeler,
             args=(db_handle,)
         )
         await manager.launch(
-            sampler_handle,
+            DummySampler,
             args=(
                 n_sample_frames,
-                sampler_handle
+                labeler_handle
             )
         )
         await manager.launch(
-            auditor_handle,
+            DummyAuditor,
             args=(
                 accept_rate,
                 sampler_handle,
-                dynamics_handle,
                 db_handle
             )
         )
@@ -132,5 +130,8 @@ async def main():
         for spec in initial_specs:
             await dynamics_handle.submit(spec)
 
+        manager.wait(db_reg)
+
 if __name__ == '__main__':
-    raise SystemExit(asyncio.run(main()))
+    asyncio.run(main())
+
