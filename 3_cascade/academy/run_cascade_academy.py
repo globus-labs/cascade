@@ -1,11 +1,13 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import logging
 
 from ase.io import read
 from ase import units
 from academy.exchange import LocalExchangeFactory
-from academy.manager import Manager
 from mace.calculators import mace_mp
+from academy.manager import Manager
+from academy.logging import init_logging
 
 from agents import (
     DummyDatabase,
@@ -21,6 +23,8 @@ from ase.md.verlet import VelocityVerlet
 
 
 async def main():
+
+    init_logging(logging.INFO)
 
     # args
     init_strc = ['../../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp'] * 2
@@ -63,7 +67,7 @@ async def main():
     # initialize manager, exhcange
     async with await Manager.from_exchange_factory(
         factory=LocalExchangeFactory(),
-        executors=ThreadPoolExecutor(),
+        executors=ThreadPoolExecutor(max_workers=10),
     ) as manager:
 
         # register all agents with manager
@@ -90,32 +94,38 @@ async def main():
                 retrain_len,
                 trainer_handle,
                 dynamics_handle
-            )
+            ),
+            registration=db_reg
         )
         await manager.launch(
             DynamicsEngine,
             args=(
+                initial_specs,
                 auditor_handle,
                 learner,
                 init_weights,
                 dyn_cls,
                 dyn_kws,
                 run_kws
-            )
+            ),
+            registration=dynamics_reg
         )
         await manager.launch(
-            DummyTrainer
+            DummyTrainer,
+            registration=trainer_reg
         )
         await manager.launch(
             DummyLabeler,
-            args=(db_handle,)
+            args=(db_handle,),
+            registration=labeler_reg,
         )
         await manager.launch(
             DummySampler,
             args=(
                 n_sample_frames,
                 labeler_handle
-            )
+            ),
+            registration=sampler_reg,
         )
         await manager.launch(
             DummyAuditor,
@@ -123,15 +133,14 @@ async def main():
                 accept_rate,
                 sampler_handle,
                 db_handle
-            )
+            ),
+            registration=auditor_reg,
         )
 
-        # seed with initial conditions
-        for spec in initial_specs:
-            await dynamics_handle.submit(spec)
-
-        manager.wait(db_reg)
+        try:
+            await manager.wait([db_handle])
+        except KeyboardInterrupt:
+            await manager.shutdown([db_handle])
 
 if __name__ == '__main__':
     asyncio.run(main())
-
