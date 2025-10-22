@@ -41,7 +41,7 @@ from base_agents import (
 )
 
 
-class DummyDatabase(Database):
+class DummyDatabase(Agent):
     """Not a real database, just a stub with in-memory storage"""
 
     def __init__(
@@ -216,7 +216,7 @@ class DynamicsEngine(Agent):
             await self.auditor.submit(chunk)
 
 
-class DummyAuditor(Auditor):
+class DummyAuditor(Agent):
 
     def __init__(
             self,
@@ -262,7 +262,7 @@ class DummyAuditor(Auditor):
                 await self.training_sampler.submit(chunk)
 
 
-class DummySampler(TrainingSampler):
+class DummySampler(Agent):
 
     def __init__(
         self,
@@ -299,7 +299,7 @@ class DummySampler(TrainingSampler):
                 await self.labeler.submit(frame)
 
 
-class DummyLabeler(TrainingLabeler):
+class DummyLabeler(Agent):
 
     def __init__(
         self,
@@ -323,7 +323,7 @@ class DummyLabeler(TrainingLabeler):
             await self.database.write_training_frame(frame)
 
 
-class DummyTrainer(ModelTrainer):
+class DummyTrainer(Agent):
 
     @action
     async def train_model(
