@@ -13,29 +13,20 @@ In addition to de-stubbing, we have the following todos:
 from __future__ import annotations
 
 import asyncio
-from typing import Callable
-from collections import defaultdict
 from asyncio import Queue
-#from queue import Queue
 from threading import Event
-from time import sleep
 import logging
 
 import numpy as np
-from numpy.random import sample
 from ase import Atoms
-from ase.db import connect
 from academy.handle import Handle
 from academy.agent import Agent, action, loop
-from ase.calculators.calculator import Calculator
 from ase.optimize.optimize import Dynamics
 from mace.calculators import mace_mp
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.utils import canonicalize
-from model import AuditStatus
-
-from model import AdvanceSpec, TrajectoryChunk, Trajectory
+from model import AuditStatus, AdvanceSpec, TrajectoryChunk, Trajectory
 
 
 class DummyDatabase(Agent):

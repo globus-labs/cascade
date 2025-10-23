@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from pathlib import Path
 
 from ase import Atoms
 from ase.io import write
@@ -12,7 +11,6 @@ class AuditStatus(Enum):
     PENDING = auto()
     FAILED = auto()
     PASSED = auto()
-
 
 
 @dataclass

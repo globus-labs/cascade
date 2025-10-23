@@ -4,12 +4,13 @@ import logging
 
 from ase.io import read
 from ase import units
-from academy.exchange import LocalExchangeFactory
+from ase.md.verlet import VelocityVerlet
 from mace.calculators import mace_mp
+from academy.exchange import LocalExchangeFactory
 from academy.manager import Manager
 from academy.logging import init_logging
 
-from agents import (
+from cascade.agents.dummy import (
     DummyDatabase,
     DynamicsEngine,
     DummyAuditor,
@@ -17,9 +18,8 @@ from agents import (
     DummyLabeler,
     DummyTrainer
 )
-from model import Trajectory, AdvanceSpec
+from cascade.model import Trajectory, AdvanceSpec
 from cascade.learning.mace import MACEInterface
-from ase.md.verlet import VelocityVerlet
 
 
 async def main():
