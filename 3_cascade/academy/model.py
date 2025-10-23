@@ -10,8 +10,9 @@ from ase.io import write
 
 class AuditStatus(Enum):
     PENDING = auto()
-    PASSED = auto()
     FAILED = auto()
+    PASSED = auto()
+
 
 
 @dataclass
@@ -55,7 +56,7 @@ class TrajectoryChunk:
 @dataclass
 class Trajectory:
 
-    chunks: list["TrajecotryChunk"]
+    chunks: list[TrajectoryChunk]
 
     target_length: int
     """how long the trajectory should be"""
@@ -71,6 +72,10 @@ class Trajectory:
 
     def __len__(self):
         return sum(len(chunk) for chunk in self.chunks)
+
+    @property
+    def audit_status(self):
+        return self.chunks[-1].audit_status
 
     @property
     def done(self):

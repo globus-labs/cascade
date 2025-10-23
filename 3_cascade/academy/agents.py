@@ -15,8 +15,8 @@ from __future__ import annotations
 import asyncio
 from typing import Callable
 from collections import defaultdict
-#from asyncio import Queue
-from queue import Queue
+from asyncio import Queue
+#from queue import Queue
 from threading import Event
 from time import sleep
 import logging
@@ -44,12 +44,14 @@ class DummyDatabase(Agent):
     def __init__(
         self,
         trajectories: list[Trajectory],
+        chunk_size: int,
         retrain_len: int,
         trainer: Handle[DummyTrainer],
         dynamics_engine: Handle[DynamicsEngine]
     ):
 
         self.trajectories = trajectories
+        self.chunk_size = chunk_size
         self.training_frames = []
         self.sampled_trajectories = set()
         self.retrain_len = retrain_len
@@ -70,11 +72,12 @@ class DummyDatabase(Agent):
         traj = self.trajectories[id]
         traj.add_chunk(chunk)
         atoms = chunk.atoms[-1]
-        if not traj.is_done():
+        if not traj.done:
             advance_spec = AdvanceSpec(
                 atoms,
                 traj.id,
-                chunk.chunk_id+1
+                chunk.chunk_id+1,
+                self.chunk_size
             )
             await self.dynamics_engine.submit(advance_spec)
 
@@ -99,14 +102,14 @@ class DummyDatabase(Agent):
                 self.logger.info("All trajectories done, setting shutdown")
                 shutdown.set()
             else:
-                sleep(1)
+                await asyncio.sleep(1)
 
     @loop
     async def periodic_retrain(self, shutdown: asyncio.Event) -> None:
         """Trigger a retrain event and add the right atoms back to the dynamics queue"""
         while not shutdown.is_set():
             if not self.retrain.wait(timeout=1):
-                sleep(1)
+                await asyncio.sleep(1)
                 continue
             self.logger.info("Starting Retraining")
             # retrain model and update weights in dynamics engine
@@ -147,11 +150,15 @@ class DynamicsEngine(Agent):
         self.run_kws = run_kws
 
         self.model_version = 0  # todo: mt.2025.10.20 probably this should be persisted somewhere else
-
+        self.init_specs = init_specs
         self.queue = Queue()
-        for spec in init_specs:
-            self.queue.put(spec)
+
         self.logger = logging.getLogger("DynamicsEnginie")
+        super().__init__()
+
+    async def agent_on_startup(self):
+        for spec in self.init_specs:
+            await self.queue.put(spec)
 
     @action
     async def receive_weights(self, weights: bytes) -> None:
@@ -162,7 +169,7 @@ class DynamicsEngine(Agent):
     @action
     async def submit(self, spec: AdvanceSpec):
         self.logger.debug("Received advance spec")
-        self.queue.put(spec)
+        await self.queue.put(spec)
 
     @loop
     async def advance_dynamics(
@@ -177,11 +184,7 @@ class DynamicsEngine(Agent):
         """
         while not shutdown.is_set():
 
-            try:
-                spec = self.queue.get()
-            except Queue.Empty:
-                sleep(1)
-                continue
+            spec = await self.queue.get()
 
             atoms = spec.atoms
             calc = self.learner.make_calculator(self.weights, device=self.device)
@@ -232,13 +235,14 @@ class DummyAuditor(Agent):
 
         self.accept_rate = accept_rate
         self.sampler = sampler
-        #self.dynamics_engine = dynamics_engine
+        self.database = database
         self.queue = Queue()
         self.logger = logging.getLogger("Auditor")
 
     @action
     async def submit(self, chunk: TrajectoryChunk):
-        self.queue.put(chunk)
+        self.logger.debug(f'Receieved chunk {chunk.chunk_id} from traj {chunk.traj_id}')
+        await self.queue.put(chunk)
 
     @loop
     async def audit(
@@ -248,19 +252,14 @@ class DummyAuditor(Agent):
         """a stub of a real audit"""
 
         while not shutdown.is_set():
-            try:
-                chunk = self.queue.get()
-            except Queue.Empty:
-                sleep(1)
-                continue
-
+            chunk = await self.queue.get()
             self.logger.info(f'Auditing chunk {chunk.chunk_id} of traj {chunk.traj_id}')
             good = np.random.random() < self.accept_rate
             #  score = float(good)
             if good:
                 chunk.audit_status = AuditStatus.PASSED
                 self.logger.info(f'Audit passed for chunk {chunk.chunk_id} of traj {chunk.traj_id}')
-                await self.database.submit(chunk)
+                await self.database.write_chunk(chunk)
             else:
                 chunk.audit_status = AuditStatus.FAILED
                 self.logger.info(f'Audit failed for chunk {chunk.chunk_id} of traj {chunk.traj_id}')
@@ -284,7 +283,7 @@ class DummySampler(Agent):
 
     @action
     async def submit(self, chunk: TrajectoryChunk):
-        self.queue.put(chunk)
+        await self.queue.put(chunk)
 
     @loop
     async def sample_frames(
@@ -293,11 +292,7 @@ class DummySampler(Agent):
     ) -> None:
         while not shutdown.is_set():
 
-            try:
-                chunk = self.queue.get()
-            except Queue.Empty:
-                sleep(1)
-                continue
+            chunk = await self.queue.get()
 
             self.logger.info(f'Sampling frames from chunk {chunk.chunk_id} of traj {chunk.traj_id}')
             atoms = chunk.atoms
@@ -317,17 +312,13 @@ class DummyLabeler(Agent):
 
     @action
     async def submit(self, frame: Atoms) -> None:
-        self.queue.put(frame)
+        await self.queue.put(frame)
 
     @loop
     async def label_data(self, shutdown: asyncio.Event) -> None:
 
         while not shutdown.is_set():
-            try:
-                frame = self.queue.get()
-            except Queue.Empty:
-                sleep(1)
-                continue
+            frame = await self.queue.get()
             await self.database.write_training_frame(frame)
 
 

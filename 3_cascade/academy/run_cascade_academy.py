@@ -24,13 +24,13 @@ from ase.md.verlet import VelocityVerlet
 
 async def main():
 
-    init_logging(logging.INFO)
+    init_logging(logging.DEBUG)
 
     # args
     init_strc = ['../../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp'] * 2
 
-    target_length = 100
-    retrain_len = 10
+    target_length = 10
+    retrain_len = 100000
     n_sample_frames = 1
     accept_rate = 1.
     chunk_size = 10
@@ -86,14 +86,24 @@ async def main():
         auditor_handle = manager.get_handle(auditor_reg)
         dynamics_handle = manager.get_handle(dynamics_reg)
 
+        handles = [
+            db_handle,
+            trainer_handle,
+            labeler_handle,
+            sampler_handle,
+            auditor_handle,
+            dynamics_handle
+        ]
+
         # launch all agents
         await manager.launch(
             DummyDatabase,
             args=(
                 trajectories,
+                chunk_size,
                 retrain_len,
                 trainer_handle,
-                dynamics_handle
+                dynamics_handle,
             ),
             registration=db_reg
         )
@@ -140,7 +150,8 @@ async def main():
         try:
             await manager.wait([db_handle])
         except KeyboardInterrupt:
-            await manager.shutdown([db_handle])
+            for handle in handles:
+                await manager.shutdown(handle, blocking=False)
 
 if __name__ == '__main__':
     asyncio.run(main())
