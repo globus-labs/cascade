@@ -8,6 +8,7 @@ from ase.io import write
 
 
 class AuditStatus(Enum):
+    """Whether a trajectory chunk has been audited, or if it has passed/failed"""
     PENDING = auto()
     FAILED = auto()
     PASSED = auto()
@@ -15,11 +16,19 @@ class AuditStatus(Enum):
 
 @dataclass
 class AdvanceSpec:
+    """The minimum information requred to create a trajectory chunk
 
+    This is passed to the DynamicsEngine to advance a trajectory, that is, to
+    create a trajectory chunk
+    """
     atoms: Atoms
+    """The initial conditions of the chunk"""
     traj_id: int
+    """Associated trajectory"""
     chunk_id: int
+    """Associated chunk"""
     steps: int
+    """How many steps to advance for"""
 
 
 @dataclass
@@ -53,8 +62,10 @@ class TrajectoryChunk:
 
 @dataclass
 class Trajectory:
+    """A trajectory composed of chunks"""
 
     chunks: list[TrajectoryChunk]
+    """The chunks"""
 
     target_length: int
     """how long the trajectory should be"""
