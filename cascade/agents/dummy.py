@@ -26,7 +26,7 @@ from mace.calculators import mace_mp
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.utils import canonicalize
-from model import AuditStatus, AdvanceSpec, TrajectoryChunk, Trajectory
+from cascade.model import AuditStatus, AdvanceSpec, TrajectoryChunk, Trajectory
 
 
 class DummyDatabase(Agent):
