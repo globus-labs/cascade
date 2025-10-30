@@ -8,7 +8,7 @@ from ase.io import write
 
 
 class AuditStatus(Enum):
-    """Whether a trajectory chunk has been audited, or if it has passed/failed"""
+    """Whether a trajectory chunk is awaiting or has passed/failed an audit"""
     PENDING = auto()
     FAILED = auto()
     PASSED = auto()
@@ -16,19 +16,19 @@ class AuditStatus(Enum):
 
 @dataclass
 class AdvanceSpec:
-    """The minimum information requred to create a trajectory chunk
-
-    This is passed to the DynamicsEngine to advance a trajectory, that is, to
+    """Trajectory advancement specification.
+    
+    This is bare minimum information to pass for the dynamics engine
     create a trajectory chunk
     """
     atoms: Atoms
-    """The initial conditions of the chunk"""
+    """Initial atoms for the trajectory chunk"""
     traj_id: int
-    """Associated trajectory"""
+    """Which trajectory"""
     chunk_id: int
-    """Associated chunk"""
+    """Which chunk"""
     steps: int
-    """How many steps to advance for"""
+    """How many steps to run dynamics for"""
 
 
 @dataclass
@@ -62,7 +62,7 @@ class TrajectoryChunk:
 
 @dataclass
 class Trajectory:
-    """A trajectory composed of chunks"""
+    """A trajectory, composed of TrajectoryChunks"""
 
     chunks: list[TrajectoryChunk]
     """The chunks"""
@@ -75,6 +75,13 @@ class Trajectory:
 
     init_atoms: Atoms
     """Initial frame"""
+
+    @property
+    def trajectory(self):
+        out = []
+        for chunk in self.chunks:
+            out.extend(chunk)
+        return out
 
     def add_chunk(self, chunk: list[Atoms]):
         self.chunks.append(chunk)
@@ -93,7 +100,3 @@ class Trajectory:
             and
             self.audit_status == AuditStatus.PASSED
         )
-
-    def write(self):
-        for a in self.atoms:
-            write(self.path, a)

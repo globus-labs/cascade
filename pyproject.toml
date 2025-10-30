@@ -23,7 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    "ase>3.22",
+    "ase>3.22", academy-py
 ]
 
 [tool.setuptools.packages.find]

@@ -1,4 +1,5 @@
 import asyncio
+import argparse
 from concurrent.futures import ThreadPoolExecutor
 import logging
 
@@ -20,6 +21,30 @@ from cascade.agents.dummy import (
 )
 from cascade.model import Trajectory, AdvanceSpec
 from cascade.learning.mace import MACEInterface
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--log-level',
+        type=str,
+        default='INFO',
+        help='Logging levl'
+    )
+    parser.add_argument(
+        '--initial-structures',
+        nargs='+',
+        help='Initial structures to start dynamics'
+    )
+
+    parser.add_argument(
+        '--chunk-size',
+        type=int,
+        default=10,
+        help='Initial chunk size'
+    )
+    args = parser.parse_args()
+    return args
 
 
 async def main():
