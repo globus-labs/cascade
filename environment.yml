@@ -19,6 +19,7 @@ dependencies:
       - scikit-learn>=1
       - jupyterlab
       - pandas
-
-      # ML side
-      - -e .[mace,chgnet,ani]
+      - colmena
+      - sigfig
+      - academy-py
+      - -e .[mace,chgnet,ani,test]
