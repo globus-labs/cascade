@@ -2,6 +2,10 @@ import asyncio
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import logging
+import datetime
+import hashlib
+import json
+import pathlib
 
 import ase
 from ase.io import read
@@ -19,6 +23,14 @@ from cascade.agents.dummy import (
     DummySampler,
     DummyLabeler,
     DummyTrainer
+)
+from cascade.agents.config import (
+    DatabaseConfig,
+    DynamicsEngineConfig,
+    AuditorConfig,
+    SamplerConfig,
+    LabelerConfig,
+    TrainerConfig
 )
 from cascade.model import Trajectory, AdvanceSpec
 from cascade.learning.mace import MACEInterface
@@ -115,11 +127,27 @@ def get_dynamics_cls(cls_name: str) -> type[ase.md.md.MolecularDynamics]:
 
 
 async def main():
-
-    init_logging(logging.DEBUG)
-
-    # args
+    
+    # parse arguments
     args = parse_args()
+
+    # Set up run directory, 
+    params = args.__dict__.copy()
+    start_time = datetime.datetime.utcnow().strftime("%d%b%y%H%M%S")
+    params_hash = hashlib.sha256(json.dumps(params).encode()).hexdigest()[:6]
+    run_dir = pathlib.Path("run") / (
+        f"run-{start_time}-{params_hash}"
+    )
+    run_dir.mkdir(parents=True)
+
+    # Save the run parameters to disk
+    (run_dir / "params.json").write_text(json.dumps(params))
+    logfile = run_dir / "runtime.log"
+
+    logger = init_logging(level=args.log_level, logfile=logfile)
+    logger.info("Loaded run params")
+    logger.info("Created run directory: %s", run_dir)
+    
     init_strc = args.initial_structures
     learner = get_learner(args.learner)
     init_weights = learner.serialize_model(learner.get_model(mace_mp('small').models[0]))
@@ -177,13 +205,34 @@ async def main():
             dynamics_handle
         ]
 
+        # create config objects
+        db_config = DatabaseConfig(
+            trajectories=trajectories,
+            chunk_size=args.chunk_size,
+            retrain_len=args.retrain_len
+        )
+        dynamics_config = DynamicsEngineConfig(
+            init_specs=initial_specs,
+            learner=learner,
+            weights=init_weights,
+            dyn_cls=get_dynamics_cls(args.dyn_cls),
+            dyn_kws={'timestep': args.dt_fs * units.fs, 'loginterval': args.loginterval},
+            run_kws={}
+        )
+        auditor_config = AuditorConfig(
+            accept_rate=args.accept_rate
+        )
+        sampler_config = SamplerConfig(
+            n_frames=args.n_sample_frames
+        )
+        labeler_config = LabelerConfig()
+        trainer_config = TrainerConfig()
+
         # launch all agents
         await manager.launch(
             DummyDatabase,
             args=(
-                trajectories,
-                args.chunk_size,
-                args.retrain_len,
+                db_config,
                 trainer_handle,
                 dynamics_handle,
             ),
@@ -192,20 +241,15 @@ async def main():
         await manager.launch(
             DynamicsEngine,
             args=(
-                initial_specs,
+                dynamics_config,
                 auditor_handle,
-                learner,
-                init_weights,
-                get_dynamics_cls(args.dyn_cls),
-                {'timestep': args.dt_fs * units.fs, 'loginterval': args.loginterval},
-                {},
             ),
             registration=dynamics_reg
         )
         await manager.launch(
             DummyAuditor,
             args=(
-                args.accept_rate,
+                auditor_config,
                 sampler_handle,
                 db_handle
             ),
@@ -214,18 +258,22 @@ async def main():
         await manager.launch(
             DummySampler,
             args=(
-                args.n_sample_frames,
+                sampler_config,
                 labeler_handle
             ),
             registration=sampler_reg,
         )
         await manager.launch(
             DummyLabeler,
-            args=(db_handle,),
+            args=(
+                labeler_config,
+                db_handle
+            ),
             registration=labeler_reg,
         )
         await manager.launch(
             DummyTrainer,
+            args=(trainer_config,),
             registration=trainer_reg
         )        
 

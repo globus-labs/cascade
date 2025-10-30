@@ -4,9 +4,6 @@ Everything here is a stub
 
 In addition to de-stubbing, we have the following todos:
 * thread/process safety for queues, model updates
-* rewrite for concurrent, high performance DB backend
-* data model improvements
-* add parallelism within agents with parsl
 * make configuration of agents flexible, updatable (i.e., control parameters)
 * logging
 """
@@ -18,6 +15,7 @@ from threading import Event
 import logging
 
 import numpy as np
+import ase
 from ase import Atoms
 from academy.handle import Handle
 from academy.agent import Agent, action, loop
@@ -27,6 +25,14 @@ from mace.calculators import mace_mp
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.utils import canonicalize
 from cascade.model import AuditStatus, AdvanceSpec, TrajectoryChunk, Trajectory
+from cascade.agents.config import (
+    DatabaseConfig,
+    DynamicsEngineConfig,
+    AuditorConfig,
+    SamplerConfig,
+    LabelerConfig,
+    TrainerConfig
+)
 
 
 class DummyDatabase(Agent):
@@ -34,18 +40,14 @@ class DummyDatabase(Agent):
 
     def __init__(
         self,
-        trajectories: list[Trajectory],
-        chunk_size: int,
-        retrain_len: int,
+        config: DatabaseConfig,
         trainer: Handle[DummyTrainer],
         dynamics_engine: Handle[DynamicsEngine]
     ):
 
-        self.trajectories = trajectories
-        self.chunk_size = chunk_size
+        self.config = config
         self.training_frames = []
         self.sampled_trajectories = set()
-        self.retrain_len = retrain_len
         self.trainer = trainer
         self.dynamics_engine = dynamics_engine
         self.retrain = Event()
@@ -53,14 +55,14 @@ class DummyDatabase(Agent):
 
     @property
     def all_done(self):
-        return all(t.done for t in self.trajectories)
+        return all(t.done for t in self.config.trajectories)
 
     @action
     async def write_chunk(self, chunk: TrajectoryChunk):
         """Write chunks that have passed auditing and pass for advancement if not complete"""
         id = chunk.traj_id
         self.logger.info(f'Writing chunk of len {len(chunk)} for trajectory {id}')
-        traj = self.trajectories[id]
+        traj = self.config.trajectories[id]
         traj.add_chunk(chunk)
         atoms = chunk.atoms[-1]
         if not traj.done:
@@ -68,7 +70,7 @@ class DummyDatabase(Agent):
                 atoms,
                 traj.id,
                 chunk.chunk_id+1,
-                self.chunk_size
+                self.config.chunk_size
             )
             await self.dynamics_engine.submit(advance_spec)
 
@@ -77,7 +79,7 @@ class DummyDatabase(Agent):
         # check here if we have exceeded the retrain length, then set event
         self.training_frames.append(frame)
         self.logger.info("Adding training frame")
-        if len(self.training_frames) >= self.retrain_len:
+        if len(self.training_frames) >= self.config.retrain_len:
             self.logger.info('Setting training event')
             self.retrain.set()
 
@@ -110,45 +112,33 @@ class DummyDatabase(Agent):
             # put the sampled trajectories back in the dynamics queue
             self.logger.info("Clearing training set, submitting trajectories to advance")
             for traj_id in self.sampled_trajectories:
-                atoms = self.trajecotires[traj_id].chunks[-1].atoms[-1]
-                await self.dymamics_engine.submit(atoms)
+                atoms = self.config.trajectories[traj_id].chunks[-1].atoms[-1]
+                await self.dynamics_engine.submit(atoms)
 
             # clear training data
             self.training_frames = []
-            self.sampled_frames = set()
+            self.sampled_trajectories = set()
 
 
 class DynamicsEngine(Agent):
 
     def __init__(
         self,
-        init_specs: list[AdvanceSpec],
-        auditor: Handle[DummyAuditor],
-        learner: BaseLearnableForcefield,
-        weights: bytes,
-        dyn_cls: type[Dynamics],
-        dyn_kws: dict[str, object],
-        run_kws: dict[str, object],
-        device: str = 'cpu'
+        config: DynamicsEngineConfig,
+        auditor: Handle[DummyAuditor]
     ):
 
-        self.learner = learner
-        self.weights = weights
+        self.config = config
         self.auditor = auditor
-        self.dyn_cls = dyn_cls
-        self.device = device
-        self.dyn_kws = dyn_kws
-        self.run_kws = run_kws
-
+        self.weights = config.weights  # This needs to be mutable
         self.model_version = 0  # todo: mt.2025.10.20 probably this should be persisted somewhere else
-        self.init_specs = init_specs
         self.queue = Queue()
 
         self.logger = logging.getLogger("DynamicsEnginie")
         super().__init__()
 
     async def agent_on_startup(self):
-        for spec in self.init_specs:
+        for spec in self.config.init_specs:
             await self.queue.put(spec)
 
     @action
@@ -178,7 +168,7 @@ class DynamicsEngine(Agent):
             spec = await self.queue.get()
 
             atoms = spec.atoms
-            calc = self.learner.make_calculator(self.weights, device=self.device)
+            calc = self.config.learner.make_calculator(self.weights, device=self.config.device)
             atoms.calc = calc
 
             chunk = TrajectoryChunk(
@@ -189,9 +179,9 @@ class DynamicsEngine(Agent):
             )
 
             # set up dynamics
-            dyn_kws = self.dyn_kws or {}
-            run_kws = self.run_kws or {}
-            dyn = self.dyn_cls(
+            dyn_kws = self.config.dyn_kws or {}
+            run_kws = self.config.run_kws or {}
+            dyn = self.config.dyn_cls(
                 atoms,
                 **dyn_kws
             )
@@ -219,12 +209,12 @@ class DummyAuditor(Agent):
 
     def __init__(
             self,
-            accept_rate: float,
+            config: AuditorConfig,
             sampler: Handle[DummySampler],
             database: Handle[DummyDatabase]
     ):
 
-        self.accept_rate = accept_rate
+        self.config = config
         self.sampler = sampler
         self.database = database
         self.queue = Queue()
@@ -245,7 +235,7 @@ class DummyAuditor(Agent):
         while not shutdown.is_set():
             chunk = await self.queue.get()
             self.logger.info(f'Auditing chunk {chunk.chunk_id} of traj {chunk.traj_id}')
-            good = np.random.random() < self.accept_rate
+            good = np.random.random() < self.config.accept_rate
             #  score = float(good)
             if good:
                 chunk.audit_status = AuditStatus.PASSED
@@ -255,21 +245,20 @@ class DummyAuditor(Agent):
                 chunk.audit_status = AuditStatus.FAILED
                 self.logger.info(f'Audit failed for chunk {chunk.chunk_id} of traj {chunk.traj_id}')
                 await self.database.mark_sampled(chunk.traj_id)
-                await self.training_sampler.submit(chunk)
+                await self.sampler.submit(chunk)
 
 
 class DummySampler(Agent):
 
     def __init__(
         self,
-        n_frames: int,
-        labeler: Handle[DummyLabeler],
-        rng: np.random.Generator = None,
+        config: SamplerConfig,
+        labeler: Handle[DummyLabeler]
     ):
-        self.rng = rng if rng else np.random.default_rng()
+        self.config = config
+        self.rng = config.rng if config.rng else np.random.default_rng()
         self.queue = Queue()
         self.labeler = labeler
-        self.n_frames = n_frames
         self.logger = logging.getLogger('Sampler')
 
     @action
@@ -287,7 +276,7 @@ class DummySampler(Agent):
 
             self.logger.info(f'Sampling frames from chunk {chunk.chunk_id} of traj {chunk.traj_id}')
             atoms = chunk.atoms
-            frames = self.rng.choice(atoms, self.n_frames, replace=False)
+            frames = self.rng.choice(atoms, self.config.n_frames, replace=False)
             for frame in frames:
                 await self.labeler.submit(frame)
 
@@ -296,8 +285,10 @@ class DummyLabeler(Agent):
 
     def __init__(
         self,
+        config: LabelerConfig,
         database: Handle[DummyDatabase]
     ):
+        self.config = config
         self.database = database
         self.queue = Queue()
 
@@ -315,6 +306,12 @@ class DummyLabeler(Agent):
 
 class DummyTrainer(Agent):
 
+    def __init__(
+        self,
+        config: TrainerConfig
+    ):
+        self.config = config
+
     @action
     async def train_model(
         self,
@@ -324,3 +321,12 @@ class DummyTrainer(Agent):
         model = calc.models[0]
         model_msg = learner.serialize_model(model)
         return model_msg
+
+    @action
+    async def retrain(self) -> bytes:
+        """Alias for train_model"""
+        calc = mace_mp('small', device='cpu', default_dtype="float32")
+        model = calc.models[0]
+        # Return dummy weights as bytes
+        import pickle
+        return pickle.dumps(model)
