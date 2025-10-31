@@ -441,7 +441,7 @@ class TrajectoryDB:
         run_id: str,
         traj_id: int,
         chunk_id: int
-    ) -> Optional[DBTrajectoryChunk]:
+    ) -> Optional[dict]:
         """Get the latest (most recent) chunk attempt for a given chunk
         
         Args:
@@ -450,15 +450,26 @@ class TrajectoryDB:
             chunk_id: Chunk identifier
             
         Returns:
-            DBTrajectoryChunk instance or None if not found
+            Dict with chunk metadata or None if not found
         """
         with self.session() as sess:
             # Get the latest attempt by ordering by attempt_index descending
-            return sess.query(DBTrajectoryChunk).filter_by(
+            chunk = sess.query(DBTrajectoryChunk).filter_by(
                 run_id=run_id,
                 traj_id=traj_id,
                 chunk_id=chunk_id
             ).order_by(DBTrajectoryChunk.attempt_index.desc()).first()
+            
+            if not chunk:
+                return None
+                
+            # Return scalar values to avoid detached instance issues
+            return {
+                'attempt_index': chunk.attempt_index,
+                'model_version': chunk.model_version,
+                'audit_status': chunk.audit_status,
+                'n_frames': chunk.n_frames
+            }
     
     def is_trajectory_done(
         self,

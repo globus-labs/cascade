@@ -308,7 +308,7 @@ class DummyAuditor(CascadeAgent):
                 run_id=self.config.run_id,
                 traj_id=chunk_spec.traj_id,
                 chunk_id=chunk_spec.chunk_id,
-                attempt_index=db_chunk.attempt_index,
+                attempt_index=db_chunk['attempt_index'],
                 audit_status=new_status
             )
             
@@ -326,7 +326,7 @@ class DummyAuditor(CascadeAgent):
                         run_id=self.config.run_id,
                         traj_id=chunk_spec.traj_id,
                         chunk_id=chunk_spec.chunk_id,
-                        attempt_index=db_chunk.attempt_index,
+                        attempt_index=db_chunk['attempt_index'],
                         ase_db=self._db
                     )
                     
@@ -393,7 +393,7 @@ class DummySampler(CascadeAgent):
                 run_id=self.config.run_id,
                 traj_id=chunk_spec.traj_id,
                 chunk_id=chunk_spec.chunk_id,
-                attempt_index=db_chunk.attempt_index
+                attempt_index=db_chunk['attempt_index']
             ))
             
             if not frames:
@@ -413,7 +413,7 @@ class DummySampler(CascadeAgent):
             for frame, ase_db_id in zip(sampled_frames, sampled_frame_ids):
                 training_frame = TrainingFrame(
                     atoms=frame,
-                    model_version=db_chunk.model_version
+                    model_version=db_chunk['model_version']
                 )
                 await self.labeler.submit(training_frame, ase_db_id)
 
