@@ -17,7 +17,7 @@ from academy.manager import Manager
 from academy.logging import init_logging
 
 from cascade.agents.dummy import (
-    DummyDatabase,
+    DatabaseMonitor,
     DynamicsEngine,
     DummyAuditor,
     DummySampler,
@@ -26,6 +26,7 @@ from cascade.agents.dummy import (
 )
 from cascade.agents.config import (
     DatabaseConfig,
+    DatabaseMonitorConfig,
     DynamicsEngineConfig,
     AuditorConfig,
     SamplerConfig,
@@ -34,6 +35,7 @@ from cascade.agents.config import (
 )
 from cascade.model import Trajectory, AdvanceSpec
 from cascade.learning.mace import MACEInterface
+from cascade.agents.db_orm import TrajectoryDB
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,6 +111,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help='Log interval in steps'
     )
+    parser.add_argument(
+        '--db-url',
+        type=str,
+        default='postgresql://ase:pw@localhost:5432/cascade',
+        help='Database URL'
+    )
     args = parser.parse_args()
 
     return args
@@ -133,10 +141,11 @@ async def main():
 
     # Set up run directory, 
     params = args.__dict__.copy()
-    start_time = datetime.datetime.utcnow().strftime("%d%b%y%H%M%S")
+    start_time = datetime.datetime.utcnow().strftime("%Y.%m.%d-%H:%M:%S")
     params_hash = hashlib.sha256(json.dumps(params).encode()).hexdigest()[:6]
+    run_id = f"{start_time}-{params_hash}"
     run_dir = pathlib.Path("run") / (
-        f"run-{start_time}-{params_hash}"
+        f"run-{run_id}"
     )
     run_dir.mkdir(parents=True)
 
@@ -152,19 +161,22 @@ async def main():
     learner = get_learner(args.learner)
     init_weights = learner.serialize_model(learner.get_model(mace_mp('small').models[0]))
 
-    # intial conditions, trajectories
-    initial_specs = []
-    trajectories = []
+    # Initialize trajectories in the database
+    traj_db = TrajectoryDB(args.db_url)
+    traj_db.create_tables()
     for i, s in enumerate(init_strc):
         a = read(s, index=-1)
-        trajectories.append(
-            Trajectory(
-                init_atoms=a,
-                chunks=[],
-                target_length=args.target_length,
-                id=i,
-            )
+        traj_db.initialize_trajectory(
+            run_id=run_id,
+            traj_id=i,
+            target_length=args.target_length,
+            init_atoms=a
         )
+
+    # intial conditions, trajectories
+    initial_specs = []
+    for i, s in enumerate(init_strc):
+        a = read(s, index=-1)
         initial_specs.append(
             AdvanceSpec(
                 a,
@@ -174,14 +186,14 @@ async def main():
             )
         )
 
-    # initialize manager, exhcange
+    # initialize manager, exchange
     async with await Manager.from_exchange_factory(
         factory=LocalExchangeFactory(),
         executors=ThreadPoolExecutor(max_workers=10),
     ) as manager:
 
         # register all agents with manager
-        db_reg = await manager.register_agent(DummyDatabase)
+        db_reg = await manager.register_agent(DatabaseMonitor)
         trainer_reg = await manager.register_agent(DummyTrainer)
         labeler_reg = await manager.register_agent(DummyLabeler)
         sampler_reg = await manager.register_agent(DummySampler)
@@ -206,12 +218,15 @@ async def main():
         ]
 
         # create config objects
-        db_config = DatabaseConfig(
-            trajectories=trajectories,
-            chunk_size=args.chunk_size,
-            retrain_len=args.retrain_len
+        db_config = DatabaseMonitorConfig(
+            run_id=run_id,
+            db_url=args.db_url,
+            retrain_len=args.retrain_len,
+            target_length=args.target_length
         )
         dynamics_config = DynamicsEngineConfig(
+            run_id=run_id,
+            db_url=args.db_url,
             init_specs=initial_specs,
             learner=learner,
             weights=init_weights,
@@ -220,17 +235,22 @@ async def main():
             run_kws={}
         )
         auditor_config = AuditorConfig(
-            accept_rate=args.accept_rate
+            run_id=run_id,
+            db_url=args.db_url,
+            accept_rate=args.accept_rate,
+            chunk_size=args.chunk_size
         )
         sampler_config = SamplerConfig(
+            run_id=run_id,
+            db_url=args.db_url,
             n_frames=args.n_sample_frames
         )
-        labeler_config = LabelerConfig()
-        trainer_config = TrainerConfig()
+        labeler_config = LabelerConfig(run_id=run_id, db_url=args.db_url)
+        trainer_config = TrainerConfig(run_id=run_id, db_url=args.db_url, learner=learner)
 
         # launch all agents
         await manager.launch(
-            DummyDatabase,
+            DatabaseMonitor,
             args=(
                 db_config,
                 trainer_handle,
@@ -251,7 +271,7 @@ async def main():
             args=(
                 auditor_config,
                 sampler_handle,
-                db_handle
+                dynamics_handle
             ),
             registration=auditor_reg,
         )
@@ -265,10 +285,7 @@ async def main():
         )
         await manager.launch(
             DummyLabeler,
-            args=(
-                labeler_config,
-                db_handle
-            ),
+            args=(labeler_config,),
             registration=labeler_reg,
         )
         await manager.launch(
