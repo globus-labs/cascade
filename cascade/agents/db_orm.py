@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 from typing import Optional
 
+import numpy as np
 import ase
 from ase import Atoms
 from sqlalchemy import (
@@ -23,8 +24,7 @@ from sqlalchemy import (
     JSON,
     UniqueConstraint,
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker, Session
+from sqlalchemy.orm import relationship, sessionmaker, Session, declarative_base
 from cascade.model import AuditStatus, TrajectoryChunk, Trajectory
 
 Base = declarative_base()
@@ -291,6 +291,8 @@ class TrajectoryDB:
             
             # If chunk passed, increment chunks_completed on trajectory
             if audit_status == AuditStatus.PASSED:
+                # Flush to ensure the updated status is visible in queries
+                sess.flush()
                 # Check if this is the latest passed chunk
                 latest_passed = sess.query(func.max(DBTrajectoryChunk.chunk_id)).filter_by(
                     run_id=run_id,
@@ -310,7 +312,7 @@ class TrajectoryDB:
         self,
         run_id: str,
         traj_id: int
-    ) -> list[DBTrajectoryChunk]:
+    ) -> list[dict]:
         """Get all passed chunks for a trajectory, ordered by chunk_id
         
         Args:
@@ -318,7 +320,7 @@ class TrajectoryDB:
             traj_id: Trajectory identifier
             
         Returns:
-            List of DBTrajectoryChunk instances for passed chunks
+            List of dicts with chunk metadata for passed chunks
         """
         with self.session() as sess:
             chunks = sess.query(DBTrajectoryChunk).filter_by(
@@ -327,7 +329,19 @@ class TrajectoryDB:
                 audit_status=AuditStatus.PASSED
             ).order_by(DBTrajectoryChunk.chunk_id).all()
             
-            return chunks
+            # Return scalar values to avoid detached instance issues
+            return [
+                {
+                    'run_id': chunk.run_id,
+                    'traj_id': chunk.traj_id,
+                    'chunk_id': chunk.chunk_id,
+                    'attempt_index': chunk.attempt_index,
+                    'model_version': chunk.model_version,
+                    'audit_status': chunk.audit_status,
+                    'n_frames': chunk.n_frames
+                }
+                for chunk in chunks
+            ]
     
     def get_trajectory_chunks_atoms(
         self,
@@ -357,8 +371,8 @@ class TrajectoryDB:
             frames = list(ase_db.select(
                 run_id=run_id,
                 traj_id=traj_id,
-                chunk_id=chunk.chunk_id,
-                attempt_index=chunk.attempt_index
+                chunk_id=chunk['chunk_id'],
+                attempt_index=chunk['attempt_index']
             ))
             # Sort by some order if needed (e.g., id or custom key)
             frames.sort(key=lambda row: row.id)
@@ -370,7 +384,7 @@ class TrajectoryDB:
         self,
         run_id: str,
         traj_id: int
-    ) -> Optional[DBTrajectory]:
+    ) -> Optional[dict]:
         """Get trajectory by run_id and traj_id
         
         Args:
@@ -378,13 +392,26 @@ class TrajectoryDB:
             traj_id: Trajectory identifier
             
         Returns:
-            DBTrajectory instance or None if not found
+            Dict with trajectory metadata or None if not found
         """
         with self.session() as sess:
-            return sess.query(DBTrajectory).filter_by(
+            traj = sess.query(DBTrajectory).filter_by(
                 run_id=run_id,
                 traj_id=traj_id
             ).first()
+            
+            if not traj:
+                return None
+            
+            return {
+                'run_id': traj.run_id,
+                'traj_id': traj.traj_id,
+                'target_length': traj.target_length,
+                'chunks_completed': traj.chunks_completed,
+                'init_atoms_json': traj.init_atoms_json,
+                'created_at': traj.created_at,
+                'updated_at': traj.updated_at
+            }
     
     def get_next_attempt_index(
         self,
@@ -416,7 +443,7 @@ class TrajectoryDB:
         traj_id: int,
         chunk_id: int,
         attempt_index: int
-    ) -> Optional[DBTrajectoryChunk]:
+    ) -> Optional[dict]:
         """Get a specific chunk attempt
         
         Args:
@@ -426,15 +453,28 @@ class TrajectoryDB:
             attempt_index: Attempt index
             
         Returns:
-            DBTrajectoryChunk instance or None if not found
+            Dict with chunk metadata or None if not found
         """
         with self.session() as sess:
-            return sess.query(DBTrajectoryChunk).filter_by(
+            chunk = sess.query(DBTrajectoryChunk).filter_by(
                 run_id=run_id,
                 traj_id=traj_id,
                 chunk_id=chunk_id,
                 attempt_index=attempt_index
             ).first()
+            
+            if not chunk:
+                return None
+            
+            return {
+                'run_id': chunk.run_id,
+                'traj_id': chunk.traj_id,
+                'chunk_id': chunk.chunk_id,
+                'attempt_index': chunk.attempt_index,
+                'model_version': chunk.model_version,
+                'audit_status': chunk.audit_status,
+                'n_frames': chunk.n_frames
+            }
     
     def get_latest_chunk_attempt(
         self,
@@ -628,4 +668,131 @@ class TrajectoryDB:
             return sess.query(DBTrainingFrame).filter_by(
                 run_id=run_id
             ).count()
+    
+    def get_sampled_traj_ids(
+        self,
+        run_id: str,
+        ase_db
+    ) -> set[int]:
+        """Get unique trajectory IDs that have training frames sampled from them
+        
+        Args:
+            run_id: Run identifier
+            ase_db: ASE database connection to query frames from
+            
+        Returns:
+            Set of unique trajectory IDs from sampled frames
+        """
+        with self.session() as sess:
+            training_frames = sess.query(DBTrainingFrame).filter_by(
+                run_id=run_id
+            ).all()
+            
+            if not training_frames:
+                return set()
+            
+            # Extract ASE DB IDs while session is still active
+            ase_db_ids = [tf.ase_db_id for tf in training_frames]
+            
+            # Get unique trajectory IDs from ASE DB
+            unique_traj_ids = set()
+            for ase_db_id in ase_db_ids:
+                try:
+                    row = ase_db.get(ase_db_id)
+                    traj_id = row.get('traj_id')
+                    if traj_id is not None:
+                        unique_traj_ids.add(traj_id)
+                except KeyError:
+                    # Frame might have been deleted from ASE DB
+                    continue
+            
+            return unique_traj_ids
+    
+    def get_latest_chunk_id(
+        self,
+        run_id: str,
+        traj_id: int
+    ) -> Optional[int]:
+        """Get the latest chunk ID for a trajectory
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            
+        Returns:
+            Latest chunk ID or None if no chunks exist
+        """
+        with self.session() as sess:
+            # Get the maximum chunk_id for this trajectory
+            max_chunk_id = sess.query(func.max(DBTrajectoryChunk.chunk_id)).filter_by(
+                run_id=run_id,
+                traj_id=traj_id
+            ).scalar()
+            
+            return max_chunk_id
+    
+    def get_latest_passed_chunk(
+        self,
+        run_id: str,
+        traj_id: int
+    ) -> Optional[dict]:
+        """Get the latest passed chunk for a trajectory
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            
+        Returns:
+            Dict with chunk metadata or None if no passed chunks exist
+        """
+        with self.session() as sess:
+            chunk = sess.query(DBTrajectoryChunk).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                audit_status=AuditStatus.PASSED
+            ).order_by(DBTrajectoryChunk.chunk_id.desc()).first()
+            
+            if not chunk:
+                return None
+            
+            return {
+                'chunk_id': chunk.chunk_id,
+                'attempt_index': chunk.attempt_index,
+                'model_version': chunk.model_version,
+                'audit_status': chunk.audit_status,
+                'n_frames': chunk.n_frames
+            }
+    
+    def get_initial_atoms(
+        self,
+        run_id: str,
+        traj_id: int
+    ) -> Optional[Atoms]:
+        """Get the initial atoms for a trajectory
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            
+        Returns:
+            Atoms object for initial conditions or None if not found
+        """
+        traj = self.get_trajectory(run_id, traj_id)
+        if not traj or not traj['init_atoms_json']:
+            return None
+        
+        # Reconstruct Atoms from JSON
+        atoms_json = traj['init_atoms_json']
+        atoms = Atoms(
+            positions=np.array(atoms_json['positions']),
+            numbers=np.array(atoms_json['numbers'])
+        )
+        
+        if atoms_json.get('cell') is not None:
+            atoms.cell = np.array(atoms_json['cell'])
+        
+        if atoms_json.get('pbc') is not None:
+            atoms.pbc = np.array(atoms_json['pbc'])
+        
+        return atoms
 

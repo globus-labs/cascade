@@ -222,7 +222,8 @@ async def main():
             run_id=run_id,
             db_url=args.db_url,
             retrain_len=args.retrain_len,
-            target_length=args.target_length
+            target_length=args.target_length,
+            chunk_size=args.chunk_size
         )
         dynamics_config = DynamicsEngineConfig(
             run_id=run_id,

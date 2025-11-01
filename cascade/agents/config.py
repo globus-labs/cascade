@@ -68,4 +68,5 @@ class DatabaseMonitorConfig(CascadeAgentConfig):
     """Configuration for DatabaseMonitor agent"""
     retrain_len: int
     target_length: int
+    chunk_size: int
 
