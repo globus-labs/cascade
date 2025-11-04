@@ -2,6 +2,7 @@ import asyncio
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import logging
+import warnings
 import datetime
 import hashlib
 import json
@@ -11,6 +12,10 @@ import ase
 from ase.io import read
 from ase import units
 from ase.md.verlet import VelocityVerlet
+
+# Suppress FutureWarning about torch.load weights_only parameter from MACE
+warnings.filterwarnings("ignore", category=FutureWarning, module="mace.calculators")
+
 from mace.calculators import mace_mp
 from academy.exchange import LocalExchangeFactory
 from academy.manager import Manager
@@ -68,6 +73,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100000,
         help='Retrain length'
+    )
+    parser.add_argument(
+        '--retrain-fraction',
+        type=float,
+        default=0.5,
+        help='Fraction of active trajectories that must be sampled from to trigger retraining'
+    )
+    parser.add_argument(
+        '--retrain-min-frames',
+        type=int,
+        default=10,
+        help='Minimum number of frames before fraction-based retraining can trigger'
     )
     parser.add_argument(
         '--n-sample-frames',
@@ -166,12 +183,15 @@ async def main():
     traj_db.create_tables()
     for i, s in enumerate(init_strc):
         a = read(s, index=-1)
-        traj_db.initialize_trajectory(
+        logger.info(f"Initializing traj {i} with {len(a)} atoms")
+        success = traj_db.initialize_trajectory(
             run_id=run_id,
             traj_id=i,
             target_length=args.target_length,
             init_atoms=a
         )
+        if not success:
+            logger.error(f"Failed to initialize traj {i} in database")
 
     # intial conditions, trajectories
     initial_specs = []
@@ -223,7 +243,9 @@ async def main():
             db_url=args.db_url,
             retrain_len=args.retrain_len,
             target_length=args.target_length,
-            chunk_size=args.chunk_size
+            chunk_size=args.chunk_size,
+            retrain_fraction=args.retrain_fraction,
+            retrain_min_frames=args.retrain_min_frames
         )
         dynamics_config = DynamicsEngineConfig(
             run_id=run_id,
