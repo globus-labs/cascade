@@ -6,16 +6,24 @@ and chunk metadata alongside the ASE database for individual frames.
 from __future__ import annotations
 
 import contextlib
-from typing import Optional
+import logging
+from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 import ase
 from ase import Atoms
+
+if TYPE_CHECKING:
+    # Only import ORM classes for type checking, not at runtime
+    pass  # ORM classes are defined in this module
+
+logger = logging.getLogger(__name__)
 from sqlalchemy import (
     create_engine,
     Column,
     Integer,
     String,
+    Boolean,
     Enum as SQLEnum,
     DateTime,
     ForeignKey,
@@ -23,6 +31,7 @@ from sqlalchemy import (
     Text,
     JSON,
     UniqueConstraint,
+    inspect,
 )
 from sqlalchemy.orm import relationship, sessionmaker, Session, declarative_base
 from cascade.model import AuditStatus, TrajectoryChunk, Trajectory
@@ -39,6 +48,7 @@ class DBTrajectory(Base):
     traj_id = Column(Integer, nullable=False)
     target_length = Column(Integer, nullable=False)
     chunks_completed = Column(Integer, default=0, nullable=False)
+    done = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -118,6 +128,22 @@ class TrajectoryDB:
     def create_tables(self):
         """Create all tables if they don't exist"""
         Base.metadata.create_all(self.engine)
+        self._add_missing_columns()
+    
+    def _add_missing_columns(self):
+        """Add any missing columns to existing tables (for schema migrations)"""
+        from sqlalchemy import text
+        
+        # Check if 'done' column exists in trajectories table
+        inspector = inspect(self.engine)
+        if 'trajectories' in inspector.get_table_names():
+            columns = [col['name'] for col in inspector.get_columns('trajectories')]
+            if 'done' not in columns:
+                with self.engine.connect() as conn:
+                    # Add the 'done' column with default False
+                    conn.execute(text("ALTER TABLE trajectories ADD COLUMN done BOOLEAN NOT NULL DEFAULT FALSE"))
+                    conn.commit()
+                    logger.info("Added 'done' column to trajectories table")
     
     @contextlib.contextmanager
     def session(self):
@@ -138,7 +164,7 @@ class TrajectoryDB:
         traj_id: int,
         target_length: int,
         init_atoms: Atoms
-    ) -> DBTrajectory:
+    ) -> bool:
         """Initialize a new trajectory in the database
         
         Args:
@@ -148,37 +174,41 @@ class TrajectoryDB:
             init_atoms: Initial atoms structure
             
         Returns:
-            DBTrajectory instance
+            True if successful, False otherwise
         """
-        with self.session() as sess:
-            # Check if trajectory already exists
-            existing = sess.query(DBTrajectory).filter_by(
-                run_id=run_id,
-                traj_id=traj_id
-            ).first()
-            
-            if existing:
-                return existing
-            
-            # Convert atoms to JSON-serializable format
-            init_atoms_json = {
-                'positions': init_atoms.get_positions().tolist(),
-                'numbers': init_atoms.get_atomic_numbers().tolist(),
-                'cell': init_atoms.get_cell().tolist() if init_atoms.cell is not None else None,
-                'pbc': init_atoms.get_pbc().tolist() if init_atoms.pbc is not None else None,
-            }
-            
-            db_traj = DBTrajectory(
-                run_id=run_id,
-                traj_id=traj_id,
-                target_length=target_length,
-                chunks_completed=0,
-                init_atoms_json=init_atoms_json
-            )
-            sess.add(db_traj)
-            sess.flush()
-            sess.refresh(db_traj)
-            return db_traj
+        try:
+            with self.session() as sess:
+                # Check if trajectory already exists
+                existing = sess.query(DBTrajectory).filter_by(
+                    run_id=run_id,
+                    traj_id=traj_id
+                ).first()
+                
+                if existing:
+                    # Idempotent - trajectory already exists
+                    return True
+                
+                # Convert atoms to JSON-serializable format
+                init_atoms_json = {
+                    'positions': init_atoms.get_positions().tolist(),
+                    'numbers': init_atoms.get_atomic_numbers().tolist(),
+                    'cell': init_atoms.get_cell().tolist() if init_atoms.cell is not None else None,
+                    'pbc': init_atoms.get_pbc().tolist() if init_atoms.pbc is not None else None,
+                }
+                
+                db_traj = DBTrajectory(
+                    run_id=run_id,
+                    traj_id=traj_id,
+                    target_length=target_length,
+                    chunks_completed=0,
+                    init_atoms_json=init_atoms_json
+                )
+                sess.add(db_traj)
+                sess.flush()
+                return True
+        except Exception as e:
+            logger.error(f"Failed to initialize trajectory {traj_id} for run {run_id}: {e}")
+            return False
     
     def add_chunk_attempt(
         self,
@@ -189,7 +219,7 @@ class TrajectoryDB:
         n_frames: int,
         audit_status: AuditStatus = AuditStatus.PENDING,
         attempt_index: Optional[int] = None
-    ) -> DBTrajectoryChunk:
+    ) -> bool:
         """Add a new chunk attempt to the database
         
         Args:
@@ -202,59 +232,62 @@ class TrajectoryDB:
             attempt_index: Attempt index (auto-incremented if None)
             
         Returns:
-            DBTrajectoryChunk instance
+            True if successful, False otherwise
         """
-        with self.session() as sess:
-            # Get the trajectory
-            db_traj = sess.query(DBTrajectory).filter_by(
-                run_id=run_id,
-                traj_id=traj_id
-            ).first()
-            
-            if not db_traj:
-                raise ValueError(f"Trajectory {traj_id} not found for run {run_id}")
-            
-            # Determine attempt index if not provided
-            if attempt_index is None:
-                existing_attempts = sess.query(DBTrajectoryChunk).filter_by(
+        try:
+            with self.session() as sess:
+                # Get the trajectory
+                db_traj = sess.query(DBTrajectory).filter_by(
+                    run_id=run_id,
+                    traj_id=traj_id
+                ).first()
+                
+                if not db_traj:
+                    logger.error(f"Trajectory {traj_id} not found for run {run_id}")
+                    return False
+                
+                # Determine attempt index if not provided
+                if attempt_index is None:
+                    existing_attempts = sess.query(DBTrajectoryChunk).filter_by(
+                        run_id=run_id,
+                        traj_id=traj_id,
+                        chunk_id=chunk_id
+                    ).count()
+                    attempt_index = existing_attempts
+                
+                # Check if this exact attempt already exists
+                existing = sess.query(DBTrajectoryChunk).filter_by(
                     run_id=run_id,
                     traj_id=traj_id,
-                    chunk_id=chunk_id
-                ).count()
-                attempt_index = existing_attempts
-            
-            # Check if this exact attempt already exists
-            existing = sess.query(DBTrajectoryChunk).filter_by(
-                run_id=run_id,
-                traj_id=traj_id,
-                chunk_id=chunk_id,
-                attempt_index=attempt_index
-            ).first()
-            
-            if existing:
-                # Update existing attempt
-                existing.model_version = model_version
-                existing.audit_status = audit_status
-                existing.n_frames = n_frames
+                    chunk_id=chunk_id,
+                    attempt_index=attempt_index
+                ).first()
+                
+                if existing:
+                    # Update existing attempt
+                    existing.model_version = model_version
+                    existing.audit_status = audit_status
+                    existing.n_frames = n_frames
+                    sess.flush()
+                    return True
+                
+                # Create new chunk attempt
+                db_chunk = DBTrajectoryChunk(
+                    run_id=run_id,
+                    trajectory_id=db_traj.id,
+                    traj_id=traj_id,
+                    chunk_id=chunk_id,
+                    attempt_index=attempt_index,
+                    model_version=model_version,
+                    audit_status=audit_status,
+                    n_frames=n_frames
+                )
+                sess.add(db_chunk)
                 sess.flush()
-                sess.refresh(existing)
-                return existing
-            
-            # Create new chunk attempt
-            db_chunk = DBTrajectoryChunk(
-                run_id=run_id,
-                trajectory_id=db_traj.id,
-                traj_id=traj_id,
-                chunk_id=chunk_id,
-                attempt_index=attempt_index,
-                model_version=model_version,
-                audit_status=audit_status,
-                n_frames=n_frames
-            )
-            sess.add(db_chunk)
-            sess.flush()
-            sess.refresh(db_chunk)
-            return db_chunk
+                return True
+        except Exception as e:
+            logger.error(f"Failed to add chunk attempt for traj {traj_id}, chunk {chunk_id}, attempt {attempt_index}: {e}")
+            return False
     
     def update_chunk_audit_status(
         self,
@@ -307,6 +340,16 @@ class TrajectoryDB:
                     ).first()
                     if traj:
                         traj.chunks_completed = latest_passed + 1  # +1 because chunk_id is 0-indexed
+                        
+                        # Check if trajectory is done
+                        passed_chunks = sess.query(DBTrajectoryChunk).filter_by(
+                            run_id=run_id,
+                            traj_id=traj_id,
+                            audit_status=AuditStatus.PASSED
+                        ).all()
+                        total_frames = sum(chunk.n_frames for chunk in passed_chunks)
+                        if total_frames >= traj.target_length:
+                            traj.done = True
     
     def get_passed_chunks(
         self,
@@ -534,18 +577,8 @@ class TrajectoryDB:
             if not traj:
                 return False
             
-            # Get all passed chunks and calculate total frames
-            passed_chunks = sess.query(DBTrajectoryChunk).filter_by(
-                run_id=run_id,
-                traj_id=traj_id,
-                audit_status=AuditStatus.PASSED
-            ).all()
-            
-            total_frames = sum(chunk.n_frames for chunk in passed_chunks)
-            
-            # Trajectory is done if we have at least target_length frames
-            # and the latest chunk passed (ensured by update_chunk_audit_status)
-            return total_frames >= traj.target_length
+            # Return the stored done flag
+            return traj.done
     
     def get_last_frame_from_chunk(
         self,
@@ -795,4 +828,287 @@ class TrajectoryDB:
             atoms.pbc = np.array(atoms_json['pbc'])
         
         return atoms
+    
+    def count_active_trajs_with_samples(
+        self,
+        run_id: str,
+        ase_db: ase.database.connect
+    ) -> tuple[int, int]:
+        """Count active trajectories and those with sampled training frames
+        
+        Args:
+            run_id: Run identifier
+            ase_db: ASE database connection to query frames from
+            
+        Returns:
+            Tuple of (total_active_trajectories, active_trajectories_with_samples)
+        """
+        # Get training frames and trajectories outside the session to avoid deadlocks
+        with self.session() as sess:
+            # Get all trajectories for this run
+            all_trajectories = sess.query(DBTrajectory).filter_by(
+                run_id=run_id
+            ).all()
+            
+            # Get all training frames for this run
+            training_frames = sess.query(DBTrainingFrame).filter_by(
+                run_id=run_id
+            ).all()
+            
+            # Extract ASE DB IDs while session is active
+            ase_db_ids = [tf.ase_db_id for tf in training_frames]
+            
+            # Extract trajectory info while session is active to avoid DetachedInstanceError
+            trajectory_info = [
+                {'traj_id': traj.traj_id, 'target_length': traj.target_length, 'done': traj.done}
+                for traj in all_trajectories
+            ]
+        
+        # Get unique trajectory IDs from sampled frames (outside session to avoid deadlock)
+        sampled_traj_ids = set()
+        for ase_db_id in ase_db_ids:
+            try:
+                row = ase_db.get(ase_db_id)
+                traj_id = row.get('traj_id')
+                if traj_id is not None:
+                    sampled_traj_ids.add(traj_id)
+            except KeyError:
+                # Frame might have been deleted from ASE DB
+                continue
+        
+        # Now check which trajectories are active and have samples
+        active_count = 0
+        active_with_samples_count = 0
+        
+        for traj_info in trajectory_info:
+            # Check if trajectory is active (not done)
+            if not traj_info['done']:
+                active_count += 1
+                # Check if this trajectory has been sampled from
+                if traj_info['traj_id'] in sampled_traj_ids:
+                    active_with_samples_count += 1
+        
+        return (active_count, active_with_samples_count)
+    
+    def list_runs(self) -> list[dict]:
+        """List all unique runs in the database with metadata
+        
+        Returns:
+            List of dicts with run metadata, sorted by first_created (newest first).
+            Each dict contains:
+                - run_id: Run identifier
+                - first_created: Earliest trajectory creation time in this run
+                - last_updated: Latest trajectory update time in this run
+                - n_trajectories: Total number of trajectories
+                - n_done_trajectories: Number of completed trajectories
+        """
+        with self.session() as sess:
+            # Query distinct run_ids and aggregate statistics
+            runs = sess.query(
+                DBTrajectory.run_id,
+                func.min(DBTrajectory.created_at).label('first_created'),
+                func.max(DBTrajectory.updated_at).label('last_updated'),
+                func.count(DBTrajectory.id).label('n_trajectories'),
+                func.sum(func.cast(DBTrajectory.done, Integer)).label('n_done_trajectories')
+            ).group_by(DBTrajectory.run_id).all()
+            
+            result = []
+            for run in runs:
+                result.append({
+                    'run_id': run.run_id,
+                    'first_created': run.first_created,
+                    'last_updated': run.last_updated,
+                    'n_trajectories': run.n_trajectories,
+                    'n_done_trajectories': run.n_done_trajectories or 0
+                })
+            
+            # Sort by first_created, newest first
+            result.sort(key=lambda x: x['first_created'] or '', reverse=True)
+            return result
+    
+    def list_run_summary(self, run_id: str) -> Optional[dict]:
+        """Get summary statistics for a specific run
+        
+        Args:
+            run_id: Run identifier
+            
+        Returns:
+            Dict with run summary statistics or None if run doesn't exist.
+            Contains:
+                - run_id: Run identifier
+                - n_trajectories: Total number of trajectories
+                - n_done: Number of completed trajectories
+                - n_active: Number of active (not done) trajectories
+                - total_chunks: Total number of chunk records (all attempts)
+                - total_passed_chunks: Count of chunks with audit_status=PASSED
+                - total_failed_chunks: Count of chunks with audit_status=FAILED
+                - total_pending_chunks: Count of chunks with audit_status=PENDING
+                - total_training_frames: Count of training frames
+                - first_created: Earliest trajectory creation time
+                - last_updated: Latest trajectory update time
+        """
+        with self.session() as sess:
+            # Check if run exists
+            run_exists = sess.query(DBTrajectory).filter_by(run_id=run_id).first()
+            if not run_exists:
+                return None
+            
+            # Get trajectory statistics
+            traj_stats = sess.query(
+                func.count(DBTrajectory.id).label('n_trajectories'),
+                func.sum(func.cast(DBTrajectory.done, Integer)).label('n_done'),
+                func.min(DBTrajectory.created_at).label('first_created'),
+                func.max(DBTrajectory.updated_at).label('last_updated')
+            ).filter_by(run_id=run_id).first()
+            
+            # Get chunk statistics
+            chunk_stats = sess.query(
+                func.count(DBTrajectoryChunk.id).label('total_chunks'),
+                func.sum(func.cast(DBTrajectoryChunk.audit_status == AuditStatus.PASSED, Integer)).label('total_passed'),
+                func.sum(func.cast(DBTrajectoryChunk.audit_status == AuditStatus.FAILED, Integer)).label('total_failed'),
+                func.sum(func.cast(DBTrajectoryChunk.audit_status == AuditStatus.PENDING, Integer)).label('total_pending')
+            ).filter_by(run_id=run_id).first()
+            
+            # Get training frame count
+            training_frame_count = sess.query(func.count(DBTrainingFrame.id)).filter_by(
+                run_id=run_id
+            ).scalar() or 0
+            
+            return {
+                'run_id': run_id,
+                'n_trajectories': traj_stats.n_trajectories or 0,
+                'n_done': traj_stats.n_done or 0,
+                'n_active': (traj_stats.n_trajectories or 0) - (traj_stats.n_done or 0),
+                'total_chunks': chunk_stats.total_chunks or 0,
+                'total_passed_chunks': chunk_stats.total_passed or 0,
+                'total_failed_chunks': chunk_stats.total_failed or 0,
+                'total_pending_chunks': chunk_stats.total_pending or 0,
+                'total_training_frames': training_frame_count,
+                'first_created': traj_stats.first_created,
+                'last_updated': traj_stats.last_updated
+            }
+    
+    def list_trajectory_summary(self, run_id: str, traj_id: int) -> Optional[dict]:
+        """Get detailed statistics for a specific trajectory
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            
+        Returns:
+            Dict with trajectory summary statistics or None if trajectory doesn't exist.
+            Contains:
+                - run_id, traj_id, target_length, chunks_completed, done
+                - created_at, updated_at
+                - n_chunk_attempts: Total number of chunk attempt records
+                - n_unique_chunks: Number of unique chunk_id values
+                - chunk_breakdown: Dict mapping chunk_id to:
+                    - n_attempts: Number of attempts for this chunk
+                    - latest_status: Audit status of the latest attempt
+                    - latest_attempt_index: The attempt_index of the latest attempt
+                - status_counts: Dict with counts of PENDING, PASSED, FAILED attempts
+        """
+        with self.session() as sess:
+            # Get trajectory
+            traj = sess.query(DBTrajectory).filter_by(
+                run_id=run_id,
+                traj_id=traj_id
+            ).first()
+            
+            if not traj:
+                return None
+            
+            # Extract trajectory data while session is active
+            traj_data = {
+                'run_id': traj.run_id,
+                'traj_id': traj.traj_id,
+                'target_length': traj.target_length,
+                'chunks_completed': traj.chunks_completed,
+                'done': traj.done,
+                'created_at': traj.created_at,
+                'updated_at': traj.updated_at
+            }
+            
+            # Get all chunks for this trajectory
+            chunks = sess.query(DBTrajectoryChunk).filter_by(
+                run_id=run_id,
+                traj_id=traj_id
+            ).order_by(DBTrajectoryChunk.chunk_id, DBTrajectoryChunk.attempt_index).all()
+            
+            # Extract chunk data while session is active
+            chunk_data = []
+            for chunk in chunks:
+                chunk_data.append({
+                    'chunk_id': chunk.chunk_id,
+                    'attempt_index': chunk.attempt_index,
+                    'audit_status': chunk.audit_status
+                })
+        
+        # Process chunk data outside session
+        n_chunk_attempts = len(chunk_data)
+        unique_chunk_ids = set(c['chunk_id'] for c in chunk_data)
+        n_unique_chunks = len(unique_chunk_ids)
+        
+        # Build chunk breakdown
+        chunk_breakdown = {}
+        for chunk_id in unique_chunk_ids:
+            chunk_attempts = [c for c in chunk_data if c['chunk_id'] == chunk_id]
+            # Latest attempt is the one with highest attempt_index
+            latest = max(chunk_attempts, key=lambda x: x['attempt_index'])
+            # Convert AuditStatus enum to string name
+            latest_status = latest['audit_status']
+            if hasattr(latest_status, 'name'):
+                latest_status_str = latest_status.name
+            else:
+                latest_status_str = str(latest_status)
+            chunk_breakdown[chunk_id] = {
+                'n_attempts': len(chunk_attempts),
+                'latest_status': latest_status_str,
+                'latest_attempt_index': latest['attempt_index']
+            }
+        
+        # Count statuses
+        status_counts = {
+            'PENDING': sum(1 for c in chunk_data if c['audit_status'] == AuditStatus.PENDING),
+            'PASSED': sum(1 for c in chunk_data if c['audit_status'] == AuditStatus.PASSED),
+            'FAILED': sum(1 for c in chunk_data if c['audit_status'] == AuditStatus.FAILED)
+        }
+        
+        return {
+            **traj_data,
+            'n_chunk_attempts': n_chunk_attempts,
+            'n_unique_chunks': n_unique_chunks,
+            'chunk_breakdown': chunk_breakdown,
+            'status_counts': status_counts
+        }
+    
+    def list_trajectories_in_run(self, run_id: str) -> list[dict]:
+        """List all trajectories in a run with basic info
+        
+        Args:
+            run_id: Run identifier
+            
+        Returns:
+            List of dicts with trajectory metadata, sorted by traj_id.
+            Each dict contains:
+                - traj_id, target_length, chunks_completed, done
+                - created_at, updated_at
+        """
+        with self.session() as sess:
+            trajectories = sess.query(DBTrajectory).filter_by(
+                run_id=run_id
+            ).order_by(DBTrajectory.traj_id).all()
+            
+            result = []
+            for traj in trajectories:
+                result.append({
+                    'traj_id': traj.traj_id,
+                    'target_length': traj.target_length,
+                    'chunks_completed': traj.chunks_completed,
+                    'done': traj.done,
+                    'created_at': traj.created_at,
+                    'updated_at': traj.updated_at
+                })
+            
+            return result
 

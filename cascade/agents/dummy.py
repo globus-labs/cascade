@@ -42,89 +42,6 @@ from cascade.agents.config import (
 from cascade.agents.db_orm import TrajectoryDB
 
 
-# class DummyDatabase(Agent):
-#     """Not a real database, just a stub with in-memory storage"""
-
-#     def __init__(
-#         self,
-#         config: DatabaseConfig,
-#         trainer: Handle[DummyTrainer],
-#         dynamics_engine: Handle[DynamicsEngine]
-#     ):
-
-#         self.config = config
-#         self.training_frames = []
-#         self.sampled_trajectories = set()
-#         self.trainer = trainer
-#         self.dynamics_engine = dynamics_engine
-#         self.retrain = Event()
-#         self.logger = logging.getLogger('Database')
-
-#     @property
-#     def all_done(self):
-#         return all(t.done for t in self.config.trajectories)
-
-#     @action
-#     async def write_chunk(self, chunk: TrajectoryChunk):
-#         """Write chunks that have passed auditing and pass for advancement if not complete"""
-#         id = chunk.traj_id
-#         self.logger.info(f'Writing chunk of len {len(chunk)} for trajectory {id}')
-#         traj = self.config.trajectories[id]
-#         traj.add_chunk(chunk)
-#         atoms = chunk.atoms[-1]
-#         if not traj.done:
-#             advance_spec = AdvanceSpec(
-#                 atoms,
-#                 traj.id,
-#                 chunk.chunk_id+1,
-#                 self.config.chunk_size
-#             )
-#             await self.dynamics_engine.submit(advance_spec)
-
-#     @action
-#     async def write_training_frame(self, frame: Atoms):
-#         # check here if we have exceeded the retrain length, then set event
-#         self.training_frames.append(frame)
-#         self.logger.info("Adding training frame")
-#         if len(self.training_frames) >= self.config.retrain_len:
-#             self.logger.info('Setting training event')
-#             self.retrain.set()
-
-#     @action
-#     async def mark_sampled(self, traj_id: int):
-#         self.logger.info(f"Adding {traj_id} to sampled trajectories")
-#         self.sampled_trajectories.add(traj_id)
-
-#     @loop
-#     async def monitor_completion(self, shutdown: asyncio.Event) -> None:
-#         while not shutdown.is_set():
-#             if self.all_done:
-#                 self.logger.info("All trajectories done, setting shutdown")
-#                 shutdown.set()
-#             else:
-#                 await asyncio.sleep(1)
-
-#     @loop
-#     async def periodic_retrain(self, shutdown: asyncio.Event) -> None:
-#         """Trigger a retrain event and add the right atoms back to the dynamics queue"""
-#         while not shutdown.is_set():
-#             if not self.retrain.wait(timeout=1):
-#                 await asyncio.sleep(1)
-#                 continue
-#             self.logger.info("Starting Retraining")
-#             # retrain model and update weights in dynamics engine
-#             weights = await self.trainer.retrain()
-#             await self.dynamics_engine.receive_weights(weights)
-
-#             # put the sampled trajectories back in the dynamics queue
-#             self.logger.info("Clearing training set, submitting trajectories to advance")
-#             for traj_id in self.sampled_trajectories:
-#                 atoms = self.config.trajectories[traj_id].chunks[-1].atoms[-1]
-#                 await self.dynamics_engine.submit(atoms)
-
-#             # clear training data
-#             self.training_frames = []
-#             self.sampled_trajectories = set()
 
 ChunkSpec = namedtuple('ChunkSpec', ['traj_id', 'chunk_id'])
 TrainingFrame = namedtuple('TrainingFrame', ['atoms', 'model_version'])
@@ -236,13 +153,11 @@ class DynamicsEngine(CascadeAgent):
             del chunk.atoms[0]  # we have the initial conditions saved elsewhere
 
             # Calculate number of frames from steps and loginterval
-            # Frames are written at: 0, loginterval, 2*loginterval, ...
-            # After removing initial frame: n_frames = steps // loginterval
-            loginterval = dyn_kws.get('loginterval', 1)
+            loginterval = dyn_kws.get('loginterval') # None default -> 1
             n_frames = spec.steps // loginterval
 
             # Record chunk metadata in ORM
-            db_chunk = self._traj_db.add_chunk_attempt(
+            success = self._traj_db.add_chunk_attempt(
                 run_id=self.config.run_id,
                 traj_id=chunk.traj_id,
                 chunk_id=chunk.chunk_id,
@@ -251,12 +166,14 @@ class DynamicsEngine(CascadeAgent):
                 audit_status=AuditStatus.PENDING,
                 attempt_index=attempt_index
             )
-            self.logger.info(f"Recorded chunk {chunk.chunk_id} of traj {chunk.traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
+            if success:
+                self.logger.info(f"Recorded chunk {chunk.chunk_id} of traj {chunk.traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
+            else:
+                self.logger.error(f"Failed to record chunk {chunk.chunk_id} of traj {chunk.traj_id} in database")
 
             # submit to auditor
             self.logger.info(f"Submitting audit for chunk {chunk.chunk_id} of traj {chunk.traj_id}.")
             await self.auditor.submit(ChunkSpec(traj_id=chunk.traj_id, chunk_id=chunk.chunk_id))
-            self.logger.info('Done.')
 
 
 class DummyAuditor(CascadeAgent):
@@ -343,7 +260,8 @@ class DummyAuditor(CascadeAgent):
                     else:
                         self.logger.warning(f"No frames found for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}")
                 else:
-                    self.logger.info(f"Trajectory {chunk_spec.traj_id} is complete")
+                    self.logger.info(f"Traj {chunk_spec.traj_id} is complete")
+                #todo: mt.2025.11.04 flatten this logic
             else:
                 self.logger.info(f'Audit failed for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
                 # Submit failed chunk to sampler
@@ -437,13 +355,28 @@ class DummyLabeler(CascadeAgent):
         while not shutdown.is_set():
             training_frame, ase_db_id = await self.queue.get()
             
+            # Get trajectory and chunk info from ASE DB
+            try:
+                row = self._db.get(ase_db_id)
+                traj_id = row.get('traj_id', '?')
+                chunk_id = row.get('chunk_id', '?')
+                attempt_index = row.get('attempt_index', '?')
+            except Exception as e:
+                self.logger.warning(f"Could not get traj/chunk info for ASE DB ID {ase_db_id}: {e}")
+                traj_id = '?'
+                chunk_id = '?'
+                attempt_index = '?'
+            
             # Write the training frame to the ORM database
             self._traj_db.add_training_frame(
                 run_id=self.config.run_id,
                 ase_db_id=ase_db_id,
                 model_version_sampled_from=training_frame.model_version
             )
-            self.logger.info(f"Added training frame with model version {training_frame.model_version} to database")
+            self.logger.info(
+                f"Added training frame to database: traj={traj_id}, chunk={chunk_id}, "
+                f"attempt={attempt_index}, model_version={training_frame.model_version}"
+            )
 
 
 class DummyTrainer(CascadeAgent):
@@ -452,7 +385,7 @@ class DummyTrainer(CascadeAgent):
     async def train_model(
         self,
     ) -> bytes:
-        calc = mace_mp('small', device='cpu', default_dtype="float32")
+        calc = mace_mp('small', device='cpu', default_dtype="float32") #todo: mt.2025.11.04 this should be configurable
         model = calc.models[0]
         model_msg = self.config.learner.serialize_model(model)
         return model_msg
@@ -477,24 +410,16 @@ class DatabaseMonitor(CascadeAgent):
         """Monitor if all trajectories are done and set shutdown"""
         while not shutdown.is_set():
             # Check if all trajectories are complete
-            all_done = True
-            # We need to query all trajectories for this run and check if they're done
-            with self._traj_db.session() as sess:
-                from cascade.agents.db_orm import DBTrajectory
-                trajectories = sess.query(DBTrajectory).filter_by(
-                    run_id=self.config.run_id
-                ).all()
-                
-                for traj in trajectories:
-                    if not self._traj_db.is_trajectory_done(
-                        run_id=self.config.run_id,
-                        traj_id=traj.traj_id
-                    ):
-                        all_done = False
-                        break
+            trajectories = self._traj_db.list_trajectories_in_run(self.config.run_id)
             
-            if all_done and len(trajectories) > 0:
-                self.logger.info("All trajectories done, setting shutdown")
+            if len(trajectories) == 0:
+                await asyncio.sleep(1)
+                continue
+            
+            all_done = all(traj['done'] for traj in trajectories)
+            
+            if all_done:
+                self.logger.info("All trajs done, setting shutdown")
                 shutdown.set()
                 return
             else:
@@ -503,14 +428,48 @@ class DatabaseMonitor(CascadeAgent):
     @loop
     async def periodic_retrain(self, shutdown: asyncio.Event) -> None:
         """Monitor for enough training frames and trigger retraining"""
+        self.logger.info("periodic_retrain loop started")
         while not shutdown.is_set():
             # Check if we have enough new training frames
             current_count = self._traj_db.count_training_frames(self.config.run_id)
             new_frames = current_count - self.last_train_count
             
-            if new_frames >= self.config.retrain_len:
-                self.logger.info(f"Training frame count: current={current_count}, last_train={self.last_train_count}, new={new_frames}, threshold={self.config.retrain_len}")
-                self.logger.info(f"Starting retraining with {new_frames} new frames (threshold: {self.config.retrain_len})")
+            # Check fraction-based condition
+            try:
+                total_active, active_with_samples = self._traj_db.count_active_trajs_with_samples(
+                    run_id=self.config.run_id,
+                    ase_db=self._db
+                )
+                sampled_fraction = active_with_samples / total_active if total_active > 0 else 0.0
+                
+                self.logger.info(
+                    f"Retrain check: new={new_frames}, active={total_active}, sampled={active_with_samples}, "
+                    f"fraction={sampled_fraction:.2%}"
+                )
+            except Exception as e:
+                self.logger.error(f"Error in count_active_trajs_with_samples: {e}", exc_info=True)
+                total_active = 0
+                active_with_samples = 0
+                sampled_fraction = 0.0
+            
+            # Determine which condition triggered retraining
+            absolute_condition = new_frames >= self.config.retrain_len
+            fraction_condition = sampled_fraction >= self.config.retrain_fraction
+            should_retrain = absolute_condition or fraction_condition
+            
+            if should_retrain:
+                trigger_reason = []
+                if absolute_condition:
+                    trigger_reason.append(f"absolute threshold ({new_frames} >= {self.config.retrain_len})")
+                if fraction_condition:
+                    trigger_reason.append(f"fraction threshold ({sampled_fraction:.2%} >= {self.config.retrain_fraction:.2%})")
+                
+                self.logger.info(
+                    f"Training frame count: current={current_count}, last_train={self.last_train_count}, "
+                    f"new={new_frames}, active_trajs={total_active}, sampled_trajs={active_with_samples}, "
+                    f"fraction={sampled_fraction:.2%}"
+                )
+                self.logger.info(f"Starting retraining triggered by: {', '.join(trigger_reason)}")
 
                 # Train model and update weights in dynamics engine
                 weights = await self.trainer.train_model()
@@ -521,7 +480,7 @@ class DatabaseMonitor(CascadeAgent):
                     run_id=self.config.run_id,
                     ase_db=self._db
                 )
-                self.logger.info(f"Found {len(sampled_traj_ids)} sampled trajectory IDs: {sampled_traj_ids}")
+                self.logger.info(f"Found {len(sampled_traj_ids)} sampled traj IDs: {sampled_traj_ids}")
                 
                 # For each trajectory we sampled from, resubmit from last passed chunk
                 for traj_id in sampled_traj_ids:
@@ -552,7 +511,7 @@ class DatabaseMonitor(CascadeAgent):
                                 steps=self.config.chunk_size
                             )
                             await self.dynamics_engine.submit(next_spec)
-                            self.logger.info(f"Resubmitted trajectory {traj_id}, chunk {latest_passed['chunk_id'] + 1}")
+                            self.logger.info(f"Resubmitted traj {traj_id}, chunk {latest_passed['chunk_id'] + 1}")
                         else:
                             self.logger.warning(f"Traj {traj_id}: No last frame found for chunk {latest_passed['chunk_id']}")
                     else:
@@ -570,11 +529,12 @@ class DatabaseMonitor(CascadeAgent):
                                 steps=self.config.chunk_size
                             )
                             await self.dynamics_engine.submit(next_spec)
-                            self.logger.info(f"Resubmitted trajectory {traj_id} from initial conditions, chunk 0")
+                            self.logger.info(f"Resubmitted traj {traj_id} from initial conditions, chunk 0")
                         else:
                             self.logger.warning(f"Traj {traj_id}: No initial atoms found")
                 
                 self.last_train_count = current_count
                 self.logger.info(f"Retraining complete, resetting frame count to {self.last_train_count}")
             else:
+                self.logger.debug(f"Retraining not triggered, sleeping for 5 seconds")
                 await asyncio.sleep(5)

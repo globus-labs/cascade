@@ -13,6 +13,15 @@ class AuditStatus(Enum):
     FAILED = auto()
     PASSED = auto()
 
+@dataclass
+class TrajectorySpec:
+    run_id: hash
+    """Specification for a trajectory"""
+    atoms: Atoms
+    """Initial atoms for the trajectory"""
+    traj_id: int
+    """Which trajectory"""
+    chunk_id: int
 
 @dataclass
 class AdvanceSpec:

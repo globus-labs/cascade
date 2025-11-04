@@ -69,4 +69,6 @@ class DatabaseMonitorConfig(CascadeAgentConfig):
     retrain_len: int
     target_length: int
     chunk_size: int
+    retrain_fraction: float = 0.5
+    retrain_min_frames: int = 10
 
