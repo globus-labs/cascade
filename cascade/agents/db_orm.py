@@ -12,6 +12,7 @@ from typing import Optional, TYPE_CHECKING
 import numpy as np
 import ase
 from ase import Atoms
+from ase.calculators.singlepoint import SinglePointCalculator
 
 if TYPE_CHECKING:
     # Only import ORM classes for type checking, not at runtime
@@ -32,11 +33,15 @@ from sqlalchemy import (
     JSON,
     UniqueConstraint,
     inspect,
+    Index,
 )
 from sqlalchemy.orm import relationship, sessionmaker, Session, declarative_base
 from cascade.model import AuditStatus, TrajectoryChunk, Trajectory
 
 Base = declarative_base()
+
+# Standard ASE calculator properties supported by SinglePointCalculator
+ASE_STANDARD_PROPERTIES = {'energy', 'forces', 'stress', 'dipole', 'charges', 'magmom', 'magmoms', 'free_energy'}
 
 
 class DBTrajectory(Base):
@@ -93,22 +98,97 @@ class DBTrajectoryChunk(Base):
         return f"<DBTrajectoryChunk(run_id={self.run_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt={self.attempt_index}, status={self.audit_status})>"
 
 
+class DBFrame(Base):
+    """ORM model for individual atomic frames"""
+    __tablename__ = 'frames'
+    
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String, nullable=False, index=True)
+    traj_id = Column(Integer, nullable=False, index=True)
+    chunk_id = Column(Integer, nullable=False, index=True)
+    attempt_index = Column(Integer, nullable=False)
+    frame_index = Column(Integer, nullable=False)
+    
+    # Atomic structure (positions, numbers, cell, pbc)
+    atoms_data = Column(JSON, nullable=False)
+    
+    # Calculator results (forces, energy, stress, etc.)
+    calc_results = Column(JSON, nullable=True)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    __table_args__ = (
+        Index('idx_frame_lookup', 'run_id', 'traj_id', 'chunk_id', 'attempt_index', 'frame_index'),
+    )
+    
+    def __repr__(self):
+        return f"<DBFrame(run_id={self.run_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt={self.attempt_index}, frame={self.frame_index})>"
+
+
 class DBTrainingFrame(Base):
     """ORM model for training frames"""
     __tablename__ = 'training_frames'
 
     id = Column(Integer, primary_key=True)
     run_id = Column(String, nullable=False, index=True)
-    ase_db_id = Column(Integer, nullable=False, index=True)
+    frame_id = Column(Integer, ForeignKey('frames.id'), nullable=False)
     model_version_sampled_from = Column(Integer, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint('run_id', 'ase_db_id', name='uq_training_frame_run_ase'),
+        UniqueConstraint('run_id', 'frame_id', name='uq_training_frame_run_frame'),
     )
 
     def __repr__(self):
-        return f"<DBTrainingFrame(run_id={self.run_id}, ase_db_id={self.ase_db_id}, model_version={self.model_version_sampled_from})>"
+        return f"<DBTrainingFrame(run_id={self.run_id}, frame_id={self.frame_id}, model_version={self.model_version_sampled_from})>"
+
+
+# Serialization helpers
+def atoms_to_dict(atoms: Atoms) -> dict:
+    """Serialize Atoms to dictionary"""
+    return {
+        'positions': atoms.get_positions().tolist(),
+        'numbers': atoms.get_atomic_numbers().tolist(),
+        'cell': atoms.get_cell().tolist() if atoms.cell is not None else None,
+        'pbc': atoms.get_pbc().tolist() if atoms.pbc is not None else None,
+    }
+
+def dict_to_atoms(data: dict) -> Atoms:
+    """Deserialize Atoms from dictionary"""
+    atoms = Atoms(
+        positions=np.array(data['positions']),
+        numbers=data['numbers'],
+        cell=np.array(data['cell']) if data['cell'] is not None else None,
+        pbc=np.array(data['pbc']) if data['pbc'] is not None else None,
+    )
+    return atoms
+
+def calc_results_to_dict(calc_results: dict) -> dict:
+    """Serialize calculator results - only standard ASE properties
+    
+    Filters out non-standard properties (like MACE's 'node_energy') that
+    SinglePointCalculator doesn't support.
+    """
+    results = {}
+    for key, value in calc_results.items():
+        # Only store standard ASE properties
+        if key not in ASE_STANDARD_PROPERTIES:
+            continue
+        if isinstance(value, np.ndarray):
+            results[key] = value.tolist()
+        elif isinstance(value, (int, float)):
+            results[key] = float(value)
+    return results
+
+def dict_to_calc_results(data: dict) -> dict:
+    """Deserialize calculator results"""
+    results = {}
+    for key, value in data.items():
+        if isinstance(value, list):
+            results[key] = np.array(value)
+        else:
+            results[key] = value
+    return results
 
 
 class TrajectoryDB:
@@ -134,9 +214,11 @@ class TrajectoryDB:
         """Add any missing columns to existing tables (for schema migrations)"""
         from sqlalchemy import text
         
-        # Check if 'done' column exists in trajectories table
         inspector = inspect(self.engine)
-        if 'trajectories' in inspector.get_table_names():
+        table_names = inspector.get_table_names()
+        
+        # Check if 'done' column exists in trajectories table
+        if 'trajectories' in table_names:
             columns = [col['name'] for col in inspector.get_columns('trajectories')]
             if 'done' not in columns:
                 with self.engine.connect() as conn:
@@ -144,6 +226,40 @@ class TrajectoryDB:
                     conn.execute(text("ALTER TABLE trajectories ADD COLUMN done BOOLEAN NOT NULL DEFAULT FALSE"))
                     conn.commit()
                     logger.info("Added 'done' column to trajectories table")
+        
+        # Migrate training_frames table from ase_db_id to frame_id
+        if 'training_frames' in table_names:
+            columns = [col['name'] for col in inspector.get_columns('training_frames')]
+            if 'ase_db_id' in columns and 'frame_id' not in columns:
+                with self.engine.connect() as conn:
+                    # For prototyping: clear existing training_frames data since we can't map ase_db_id to frame_id
+                    result = conn.execute(text("SELECT COUNT(*) FROM training_frames"))
+                    count = result.scalar()
+                    if count > 0:
+                        logger.warning(f"Clearing {count} existing training_frames records during schema migration")
+                        conn.execute(text("DELETE FROM training_frames"))
+                    
+                    # Drop old constraint if it exists
+                    try:
+                        conn.execute(text("ALTER TABLE training_frames DROP CONSTRAINT IF EXISTS uq_training_frame_run_ase"))
+                        conn.commit()
+                    except Exception:
+                        pass  # Constraint might not exist or have different name
+                    
+                    # Drop old column
+                    conn.execute(text("ALTER TABLE training_frames DROP COLUMN ase_db_id"))
+                    
+                    # Add new column with NOT NULL
+                    conn.execute(text("ALTER TABLE training_frames ADD COLUMN frame_id INTEGER NOT NULL"))
+                    
+                    # Add foreign key constraint
+                    conn.execute(text("ALTER TABLE training_frames ADD CONSTRAINT fk_training_frames_frame_id FOREIGN KEY (frame_id) REFERENCES frames(id)"))
+                    
+                    # Add new unique constraint
+                    conn.execute(text("ALTER TABLE training_frames ADD CONSTRAINT uq_training_frame_run_frame UNIQUE (run_id, frame_id)"))
+                    
+                    conn.commit()
+                    logger.info("Migrated training_frames table from ase_db_id to frame_id")
     
     @contextlib.contextmanager
     def session(self):
@@ -389,18 +505,13 @@ class TrajectoryDB:
     def get_trajectory_chunks_atoms(
         self,
         run_id: str,
-        traj_id: int,
-        ase_db: ase.database.connect
+        traj_id: int
     ) -> list[Atoms]:
         """Get all atoms from passed chunks for a trajectory
-        
-        This queries the ASE database for all frames matching the passed chunks
-        and returns them as a list of Atoms objects.
         
         Args:
             run_id: Run identifier
             traj_id: Trajectory identifier
-            ase_db: ASE database connection to query frames from
             
         Returns:
             List of Atoms objects from all passed chunks, in order
@@ -409,17 +520,19 @@ class TrajectoryDB:
         
         all_atoms = []
         for chunk in chunks:
-            # Query ASE DB for all frames in this chunk and attempt
-            # Passed chunks are the specific attempt that passed, so we query by attempt_index
-            frames = list(ase_db.select(
+            frames = self.get_frames(
                 run_id=run_id,
                 traj_id=traj_id,
                 chunk_id=chunk['chunk_id'],
                 attempt_index=chunk['attempt_index']
-            ))
-            # Sort by some order if needed (e.g., id or custom key)
-            frames.sort(key=lambda row: row.id)
-            all_atoms.extend([row.toatoms() for row in frames])
+            )
+            
+            for frame_data in frames:
+                atoms = dict_to_atoms(frame_data['atoms_data'])
+                if frame_data['calc_results']:
+                    results = dict_to_calc_results(frame_data['calc_results'])
+                    atoms.calc = SinglePointCalculator(atoms, **results)
+                all_atoms.append(atoms)
         
         return all_atoms
     
@@ -585,8 +698,7 @@ class TrajectoryDB:
         run_id: str,
         traj_id: int,
         chunk_id: int,
-        attempt_index: int,
-        ase_db: ase.database.connect
+        attempt_index: int
     ) -> Optional[Atoms]:
         """Get the last frame from a chunk
         
@@ -595,75 +707,171 @@ class TrajectoryDB:
             traj_id: Trajectory identifier
             chunk_id: Chunk identifier
             attempt_index: Attempt index for this chunk
-            ase_db: ASE database connection to query frames from
             
         Returns:
             Atoms object for the last frame, or None if no frames found
         """
-        # Query ASE DB for all frames in this chunk and attempt
-        frames = list(ase_db.select(
-            run_id=run_id,
-            traj_id=traj_id,
-            chunk_id=chunk_id,
-            attempt_index=attempt_index
-        ))
+        with self.session() as sess:
+            frame = sess.query(DBFrame).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index
+            ).order_by(DBFrame.frame_index.desc()).first()
+            
+            if not frame:
+                return None
+            
+            atoms = dict_to_atoms(frame.atoms_data)
+            if frame.calc_results:
+                results = dict_to_calc_results(frame.calc_results)
+                atoms.calc = SinglePointCalculator(atoms, **results)
+            return atoms
+    
+    def write_frame(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int,
+        frame_index: int,
+        atoms: Atoms
+    ) -> bool:
+        """Write a single frame to the database
         
-        if not frames:
-            return None
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index
+            frame_index: Frame index within the chunk
+            atoms: Atoms object with calculator attached
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with self.session() as sess:
+                frame = DBFrame(
+                    run_id=run_id,
+                    traj_id=traj_id,
+                    chunk_id=chunk_id,
+                    attempt_index=attempt_index,
+                    frame_index=frame_index,
+                    atoms_data=atoms_to_dict(atoms),
+                    calc_results=calc_results_to_dict(atoms.calc.results) if (atoms.calc and hasattr(atoms.calc, 'results') and atoms.calc.results) else None
+                )
+                sess.add(frame)
+                sess.flush()
+                return True
+        except Exception as e:
+            logger.error(f"Failed to write frame: {e}")
+            return False
+
+    def get_frames(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int
+    ) -> list[dict]:
+        """Get all frames for a chunk attempt
         
-        # Sort by id to ensure proper ordering
-        frames.sort(key=lambda row: row.id)
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index
+            
+        Returns:
+            List of dicts with frame data (id, frame_index, atoms_data, calc_results)
+        """
+        with self.session() as sess:
+            frames = sess.query(DBFrame).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index
+            ).order_by(DBFrame.frame_index).all()
+            
+            return [
+                {
+                    'id': frame.id,
+                    'frame_index': frame.frame_index,
+                    'atoms_data': frame.atoms_data,
+                    'calc_results': frame.calc_results
+                }
+                for frame in frames
+            ]
+
+    def get_frame_by_id(self, frame_id: int) -> Optional[Atoms]:
+        """Get a single frame by ID and return as Atoms object
         
-        # Return the last frame
-        return frames[-1].toatoms()
+        Args:
+            frame_id: Frame ID
+            
+        Returns:
+            Atoms object with calculator attached, or None if not found
+        """
+        with self.session() as sess:
+            frame = sess.query(DBFrame).filter_by(id=frame_id).first()
+            if not frame:
+                return None
+            
+            atoms = dict_to_atoms(frame.atoms_data)
+            if frame.calc_results:
+                results = dict_to_calc_results(frame.calc_results)
+                atoms.calc = SinglePointCalculator(atoms, **results)
+            return atoms
     
     def add_training_frame(
         self,
         run_id: str,
-        ase_db_id: int,
+        frame_id: int,
         model_version_sampled_from: int
-    ) -> DBTrainingFrame:
+    ) -> bool:
         """Add a training frame to the database
         
         Args:
             run_id: Run identifier
-            ase_db_id: ID of the frame in the ASE database
+            frame_id: ID of the frame in the frames table
             model_version_sampled_from: Model version that generated this frame
             
         Returns:
-            DBTrainingFrame instance
+            True if successful, False otherwise
         """
-        with self.session() as sess:
-            # Check if training frame already exists
-            existing = sess.query(DBTrainingFrame).filter_by(
-                run_id=run_id,
-                ase_db_id=ase_db_id
-            ).first()
-            
-            if existing:
-                return existing
-            
-            # Create new training frame entry
-            db_training_frame = DBTrainingFrame(
-                run_id=run_id,
-                ase_db_id=ase_db_id,
-                model_version_sampled_from=model_version_sampled_from
-            )
-            sess.add(db_training_frame)
-            sess.flush()
-            sess.refresh(db_training_frame)
-            return db_training_frame
+        try:
+            with self.session() as sess:
+                # Check if training frame already exists
+                existing = sess.query(DBTrainingFrame).filter_by(
+                    run_id=run_id,
+                    frame_id=frame_id
+                ).first()
+                
+                if existing:
+                    return True
+                
+                # Create new training frame entry
+                db_training_frame = DBTrainingFrame(
+                    run_id=run_id,
+                    frame_id=frame_id,
+                    model_version_sampled_from=model_version_sampled_from
+                )
+                sess.add(db_training_frame)
+                sess.flush()
+                return True
+        except Exception as e:
+            logger.error(f"Failed to add training frame: {e}")
+            return False
     
     def get_training_frames(
         self,
-        run_id: str,
-        ase_db: ase.database.connect
+        run_id: str
     ) -> list[Atoms]:
         """Get all training frames for a run
         
         Args:
             run_id: Run identifier
-            ase_db: ASE database connection to query frames from
             
         Returns:
             List of Atoms objects from all training frames
@@ -676,15 +884,16 @@ class TrajectoryDB:
             if not training_frames:
                 return []
             
-            # Get actual Atoms objects from ASE DB
+            # Get actual Atoms objects from frames table
             atoms_list = []
             for tf in training_frames:
-                try:
-                    row = ase_db.get(tf.ase_db_id)
-                    atoms_list.append(row.toatoms())
-                except KeyError:
-                    # Frame might have been deleted from ASE DB
-                    continue
+                frame = sess.query(DBFrame).filter_by(id=tf.frame_id).first()
+                if frame:
+                    atoms = dict_to_atoms(frame.atoms_data)
+                    if frame.calc_results:
+                        results = dict_to_calc_results(frame.calc_results)
+                        atoms.calc = SinglePointCalculator(atoms, **results)
+                    atoms_list.append(atoms)
             
             return atoms_list
     
@@ -704,14 +913,12 @@ class TrajectoryDB:
     
     def get_sampled_traj_ids(
         self,
-        run_id: str,
-        ase_db
+        run_id: str
     ) -> set[int]:
         """Get unique trajectory IDs that have training frames sampled from them
         
         Args:
             run_id: Run identifier
-            ase_db: ASE database connection to query frames from
             
         Returns:
             Set of unique trajectory IDs from sampled frames
@@ -724,22 +931,15 @@ class TrajectoryDB:
             if not training_frames:
                 return set()
             
-            # Extract ASE DB IDs while session is still active
-            ase_db_ids = [tf.ase_db_id for tf in training_frames]
+            # Get unique trajectory IDs from frames table via join
+            frames = sess.query(DBFrame.traj_id).join(
+                DBTrainingFrame,
+                DBFrame.id == DBTrainingFrame.frame_id
+            ).filter(
+                DBTrainingFrame.run_id == run_id
+            ).distinct().all()
             
-            # Get unique trajectory IDs from ASE DB
-            unique_traj_ids = set()
-            for ase_db_id in ase_db_ids:
-                try:
-                    row = ase_db.get(ase_db_id)
-                    traj_id = row.get('traj_id')
-                    if traj_id is not None:
-                        unique_traj_ids.add(traj_id)
-                except KeyError:
-                    # Frame might have been deleted from ASE DB
-                    continue
-            
-            return unique_traj_ids
+            return {f[0] for f in frames}
     
     def get_latest_chunk_id(
         self,
@@ -831,64 +1031,45 @@ class TrajectoryDB:
     
     def count_active_trajs_with_samples(
         self,
-        run_id: str,
-        ase_db: ase.database.connect
+        run_id: str
     ) -> tuple[int, int]:
         """Count active trajectories and those with sampled training frames
         
         Args:
             run_id: Run identifier
-            ase_db: ASE database connection to query frames from
             
         Returns:
             Tuple of (total_active_trajectories, active_trajectories_with_samples)
         """
-        # Get training frames and trajectories outside the session to avoid deadlocks
         with self.session() as sess:
-            # Get all trajectories for this run
-            all_trajectories = sess.query(DBTrajectory).filter_by(
-                run_id=run_id
+            # Get all trajectories for this run that are not done
+            active_trajectories = sess.query(DBTrajectory).filter_by(
+                run_id=run_id,
+                done=False
             ).all()
             
-            # Get all training frames for this run
-            training_frames = sess.query(DBTrainingFrame).filter_by(
-                run_id=run_id
-            ).all()
+            total_active = len(active_trajectories)
             
-            # Extract ASE DB IDs while session is active
-            ase_db_ids = [tf.ase_db_id for tf in training_frames]
+            if total_active == 0:
+                return (0, 0)
             
-            # Extract trajectory info while session is active to avoid DetachedInstanceError
-            trajectory_info = [
-                {'traj_id': traj.traj_id, 'target_length': traj.target_length, 'done': traj.done}
-                for traj in all_trajectories
-            ]
-        
-        # Get unique trajectory IDs from sampled frames (outside session to avoid deadlock)
-        sampled_traj_ids = set()
-        for ase_db_id in ase_db_ids:
-            try:
-                row = ase_db.get(ase_db_id)
-                traj_id = row.get('traj_id')
-                if traj_id is not None:
-                    sampled_traj_ids.add(traj_id)
-            except KeyError:
-                # Frame might have been deleted from ASE DB
-                continue
-        
-        # Now check which trajectories are active and have samples
-        active_count = 0
-        active_with_samples_count = 0
-        
-        for traj_info in trajectory_info:
-            # Check if trajectory is active (not done)
-            if not traj_info['done']:
-                active_count += 1
-                # Check if this trajectory has been sampled from
-                if traj_info['traj_id'] in sampled_traj_ids:
-                    active_with_samples_count += 1
-        
-        return (active_count, active_with_samples_count)
+            # Get unique trajectory IDs that have training frames
+            sampled_traj_ids = sess.query(DBFrame.traj_id).join(
+                DBTrainingFrame,
+                DBFrame.id == DBTrainingFrame.frame_id
+            ).filter(
+                DBTrainingFrame.run_id == run_id
+            ).distinct().all()
+            
+            sampled_traj_id_set = {t[0] for t in sampled_traj_ids}
+            
+            # Count how many active trajectories have been sampled from
+            active_with_samples = sum(
+                1 for traj in active_trajectories
+                if traj.traj_id in sampled_traj_id_set
+            )
+            
+            return (total_active, active_with_samples)
     
     def list_runs(self) -> list[dict]:
         """List all unique runs in the database with metadata

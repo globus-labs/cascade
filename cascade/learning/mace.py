@@ -413,4 +413,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
             model_path = Path(tmp) / 'model.pt'
             model_path.write_bytes(self.serialize_model(model_msg))
 
-            return MACECalculator(model_paths=[model_path], device=device, compile_mode=None)
+            # Use "default" compile_mode instead of None to recompile FX traces
+            # This avoids "module is not installed as a submodule" errors when
+            # loading serialized models that had FX-compiled functions
+            return MACECalculator(model_paths=[model_path], device=device, compile_mode="default")

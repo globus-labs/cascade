@@ -19,7 +19,6 @@ from collections import namedtuple
 
 import numpy as np
 import ase
-from ase.db import connect
 from ase import Atoms
 from academy.handle import Handle
 from academy.agent import Agent, action, loop
@@ -39,7 +38,8 @@ from cascade.agents.config import (
     TrainerConfig,
     DatabaseMonitorConfig
 )
-from cascade.agents.db_orm import TrajectoryDB
+from cascade.agents.db_orm import TrajectoryDB, atoms_to_dict, dict_to_atoms, dict_to_calc_results, DBFrame
+from ase.calculators.singlepoint import SinglePointCalculator
 
 
 
@@ -56,11 +56,6 @@ class CascadeAgent(Agent):
         self.config = config
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    @cached_property
-    def _db(self):
-        """An ASE database object for writing individual frames"""
-        return connect(self.config.db_url)
-    
     @cached_property
     def _traj_db(self) -> TrajectoryDB:
         """A TrajectoryDB object for managing trajectory and chunk metadata"""
@@ -129,6 +124,9 @@ class DynamicsEngine(CascadeAgent):
                 chunk_id=chunk.chunk_id
             )
 
+            # Track frame index
+            frame_index = 0
+
             # set up dynamics
             dyn_kws = self.config.dyn_kws or {}
             run_kws = self.config.run_kws or {}
@@ -139,12 +137,23 @@ class DynamicsEngine(CascadeAgent):
 
             # set up writer
             def write_to_db():
+                nonlocal frame_index
                 # needs to be 64 bit for db read
                 f = atoms.calc.results['forces']
                 atoms.calc.results['forces'] = f.astype(np.float64)
                 canonical_atoms = canonicalize(atoms)
                 chunk.atoms.append(canonical_atoms)
-                self._db.write(canonical_atoms, chunk_id=chunk.chunk_id, traj_id=chunk.traj_id, run_id=self.config.run_id, attempt_index=attempt_index)
+                
+                # Write frame to SQLAlchemy database
+                self._traj_db.write_frame(
+                    run_id=self.config.run_id,
+                    traj_id=chunk.traj_id,
+                    chunk_id=chunk.chunk_id,
+                    attempt_index=attempt_index,
+                    frame_index=frame_index,
+                    atoms=canonical_atoms
+                )
+                frame_index += 1
             dyn.attach(write_to_db)
 
             # run dynamics
@@ -243,8 +252,7 @@ class DummyAuditor(CascadeAgent):
                         run_id=self.config.run_id,
                         traj_id=chunk_spec.traj_id,
                         chunk_id=chunk_spec.chunk_id,
-                        attempt_index=db_chunk['attempt_index'],
-                        ase_db=self._db
+                        attempt_index=db_chunk['attempt_index']
                     )
                     
                     if last_frame:
@@ -306,34 +314,40 @@ class DummySampler(CascadeAgent):
                 self.logger.warning(f"No chunk attempt found for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}")
                 continue
             
-            # Get frames from ASE database for this chunk and attempt
-            frames = list(self._db.select(
+            # Get frames from SQLAlchemy database for this chunk and attempt
+            frames_data = self._traj_db.get_frames(
                 run_id=self.config.run_id,
                 traj_id=chunk_spec.traj_id,
                 chunk_id=chunk_spec.chunk_id,
                 attempt_index=db_chunk['attempt_index']
-            ))
+            )
             
-            if not frames:
+            if not frames_data:
                 self.logger.warning(f"No frames found for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}")
                 continue
             
             # Convert to Atoms objects
-            atoms_list = [row.toatoms() for row in frames]
+            atoms_list = []
+            for frame_data in frames_data:
+                atoms = dict_to_atoms(frame_data['atoms_data'])
+                if frame_data['calc_results']:
+                    results = dict_to_calc_results(frame_data['calc_results'])
+                    atoms.calc = SinglePointCalculator(atoms, **results)
+                atoms_list.append(atoms)
             
             # Sample frames
             n_sample = min(self.config.n_frames, len(atoms_list))
             indices = self.rng.choice(len(atoms_list), size=n_sample, replace=False)
             sampled_frames = [atoms_list[i] for i in indices]
-            sampled_frame_ids = [frames[i].id for i in indices]
+            sampled_frame_ids = [frames_data[i]['id'] for i in indices]
             
-            # Submit frames with their model version and ASE DB IDs
-            for frame, ase_db_id in zip(sampled_frames, sampled_frame_ids):
+            # Submit frames with their model version and frame IDs
+            for frame, frame_id in zip(sampled_frames, sampled_frame_ids):
                 training_frame = TrainingFrame(
                     atoms=frame,
                     model_version=db_chunk['model_version']
                 )
-                await self.labeler.submit(training_frame, ase_db_id)
+                await self.labeler.submit(training_frame, frame_id)
 
 
 class DummyLabeler(CascadeAgent):
@@ -346,37 +360,57 @@ class DummyLabeler(CascadeAgent):
         self.queue = Queue()
 
     @action
-    async def submit(self, training_frame: TrainingFrame, ase_db_id: int) -> None:
-        await self.queue.put((training_frame, ase_db_id))
+    async def submit(self, training_frame: TrainingFrame, frame_id: int) -> None:
+        await self.queue.put((training_frame, frame_id))
 
     @loop
     async def label_data(self, shutdown: asyncio.Event) -> None:
 
         while not shutdown.is_set():
-            training_frame, ase_db_id = await self.queue.get()
+            training_frame, frame_id = await self.queue.get()
             
-            # Get trajectory and chunk info from ASE DB
+            # Get trajectory and chunk info from frame
             try:
-                row = self._db.get(ase_db_id)
-                traj_id = row.get('traj_id', '?')
-                chunk_id = row.get('chunk_id', '?')
-                attempt_index = row.get('attempt_index', '?')
+                frame = self._traj_db.get_frame_by_id(frame_id)
+                if frame:
+                    # Get frame metadata from database
+                    with self._traj_db.session() as sess:
+                        from cascade.agents.db_orm import DBFrame
+                        db_frame = sess.query(DBFrame).filter_by(id=frame_id).first()
+                        if db_frame:
+                            traj_id = db_frame.traj_id
+                            chunk_id = db_frame.chunk_id
+                            attempt_index = db_frame.attempt_index
+                        else:
+                            traj_id = '?'
+                            chunk_id = '?'
+                            attempt_index = '?'
+                else:
+                    traj_id = '?'
+                    chunk_id = '?'
+                    attempt_index = '?'
             except Exception as e:
-                self.logger.warning(f"Could not get traj/chunk info for ASE DB ID {ase_db_id}: {e}")
+                self.logger.warning(f"Could not get traj/chunk info for frame ID {frame_id}: {e}")
                 traj_id = '?'
                 chunk_id = '?'
                 attempt_index = '?'
             
             # Write the training frame to the ORM database
-            self._traj_db.add_training_frame(
+            success = self._traj_db.add_training_frame(
                 run_id=self.config.run_id,
-                ase_db_id=ase_db_id,
+                frame_id=frame_id,
                 model_version_sampled_from=training_frame.model_version
             )
-            self.logger.info(
-                f"Added training frame to database: traj={traj_id}, chunk={chunk_id}, "
-                f"attempt={attempt_index}, model_version={training_frame.model_version}"
-            )
+            if success:
+                self.logger.info(
+                    f"Added training frame to database: traj={traj_id}, chunk={chunk_id}, "
+                    f"attempt={attempt_index}, model_version={training_frame.model_version}"
+                )
+            else:
+                self.logger.error(
+                    f"Failed to add training frame to database: traj={traj_id}, chunk={chunk_id}, "
+                    f"attempt={attempt_index}, model_version={training_frame.model_version}"
+                )
 
 
 class DummyTrainer(CascadeAgent):
@@ -437,8 +471,7 @@ class DatabaseMonitor(CascadeAgent):
             # Check fraction-based condition
             try:
                 total_active, active_with_samples = self._traj_db.count_active_trajs_with_samples(
-                    run_id=self.config.run_id,
-                    ase_db=self._db
+                    run_id=self.config.run_id
                 )
                 sampled_fraction = active_with_samples / total_active if total_active > 0 else 0.0
                 
@@ -477,8 +510,7 @@ class DatabaseMonitor(CascadeAgent):
                 
                 # Get trajectories we sampled frames from and resubmit them
                 sampled_traj_ids = self._traj_db.get_sampled_traj_ids(
-                    run_id=self.config.run_id,
-                    ase_db=self._db
+                    run_id=self.config.run_id
                 )
                 self.logger.info(f"Found {len(sampled_traj_ids)} sampled traj IDs: {sampled_traj_ids}")
                 
@@ -497,8 +529,7 @@ class DatabaseMonitor(CascadeAgent):
                             run_id=self.config.run_id,
                             traj_id=traj_id,
                             chunk_id=latest_passed['chunk_id'],
-                            attempt_index=latest_passed['attempt_index'],
-                            ase_db=self._db
+                            attempt_index=latest_passed['attempt_index']
                         )
                         self.logger.info(f"Traj {traj_id}: last_frame = {last_frame is not None}")
                         
