@@ -153,7 +153,7 @@ class DynamicsEngine(CascadeAgent):
             del chunk.atoms[0]  # we have the initial conditions saved elsewhere
 
             # Calculate number of frames from steps and loginterval
-            loginterval = dyn_kws.get('loginterval') # None default -> 1
+            loginterval = dyn_kws.get('loginterval', 1)
             n_frames = spec.steps // loginterval
 
             # Record chunk metadata in ORM
@@ -368,11 +368,27 @@ class DummyLabeler(CascadeAgent):
                 attempt_index = '?'
             
             # Write the training frame to the ORM database
-            self._traj_db.add_training_frame(
-                run_id=self.config.run_id,
-                ase_db_id=ase_db_id,
-                model_version_sampled_from=training_frame.model_version
-            )
+            # Extract traj_id, chunk_id, attempt_index from ASE DB row
+            try:
+                traj_id_int = int(traj_id) if traj_id != '?' else None
+                chunk_id_int = int(chunk_id) if chunk_id != '?' else None
+                attempt_index_int = int(attempt_index) if attempt_index != '?' else None
+                
+                if traj_id_int is None or chunk_id_int is None or attempt_index_int is None:
+                    self.logger.warning(f"Could not parse chunk info for ASE DB ID {ase_db_id}, skipping training frame")
+                    continue
+                
+                self._traj_db.add_training_frame(
+                    run_id=self.config.run_id,
+                    ase_db_id=ase_db_id,
+                    model_version_sampled_from=training_frame.model_version,
+                    traj_id=traj_id_int,
+                    chunk_id=chunk_id_int,
+                    attempt_index=attempt_index_int
+                )
+            except (ValueError, TypeError) as e:
+                self.logger.warning(f"Could not parse chunk info for ASE DB ID {ase_db_id}: {e}, skipping training frame")
+                continue
             self.logger.info(
                 f"Added training frame to database: traj={traj_id}, chunk={chunk_id}, "
                 f"attempt={attempt_index}, model_version={training_frame.model_version}"
@@ -404,6 +420,7 @@ class DatabaseMonitor(CascadeAgent):
         self.trainer = trainer
         self.dynamics_engine = dynamics_engine
         self.last_train_count = 0
+        self.current_training_round = 0
 
     @loop
     async def monitor_completion(self, shutdown: asyncio.Event) -> None:
@@ -464,77 +481,121 @@ class DatabaseMonitor(CascadeAgent):
                 if fraction_condition:
                     trigger_reason.append(f"fraction threshold ({sampled_fraction:.2%} >= {self.config.retrain_fraction:.2%})")
                 
+                # Increment training round
+                self.current_training_round += 1
+                
                 self.logger.info(
+                    f"Starting retraining (round {self.current_training_round}) triggered by: {', '.join(trigger_reason)}\n"
                     f"Training frame count: current={current_count}, last_train={self.last_train_count}, "
                     f"new={new_frames}, active_trajs={total_active}, sampled_trajs={active_with_samples}, "
                     f"fraction={sampled_fraction:.2%}"
                 )
-                self.logger.info(f"Starting retraining triggered by: {', '.join(trigger_reason)}")
+
+                # Mark all unmarked training frames with the current training round
+                frames_marked = self._traj_db.mark_training_frames_for_round(
+                    run_id=self.config.run_id,
+                    training_round=self.current_training_round
+                )
+                self.logger.info(f"Marked {frames_marked} training frames for round {self.current_training_round}")
 
                 # Train model and update weights in dynamics engine
                 weights = await self.trainer.train_model()
                 await self.dynamics_engine.receive_weights(weights)
                 
-                # Get trajectories we sampled frames from and resubmit them
-                sampled_traj_ids = self._traj_db.get_sampled_traj_ids(
+                # Get unique chunks that generated frames in this training round
+                chunks_to_resubmit = self._traj_db.get_chunks_from_training_round(
                     run_id=self.config.run_id,
-                    ase_db=self._db
+                    training_round=self.current_training_round
                 )
-                self.logger.info(f"Found {len(sampled_traj_ids)} sampled traj IDs: {sampled_traj_ids}")
                 
-                # For each trajectory we sampled from, resubmit from last passed chunk
-                for traj_id in sampled_traj_ids:
-                    # Get the latest passed chunk to resume from
-                    latest_passed = self._traj_db.get_latest_passed_chunk(
-                        run_id=self.config.run_id,
-                        traj_id=traj_id
-                    )
-                    self.logger.info(f"Traj {traj_id}: latest_passed = {latest_passed}")
+                self.logger.info(f"Found {len(chunks_to_resubmit)} unique chunks to resubmit from training round {self.current_training_round}")
+                
+                # Resubmit only the chunks that were used in this training round
+                # These should all be FAILED chunks - resubmit the SAME chunk_id (will create new attempt)
+                for chunk_info in chunks_to_resubmit:
+                    traj_id = chunk_info['traj_id']
+                    chunk_id = chunk_info['chunk_id']
+                    attempt_index = chunk_info['attempt_index']
                     
-                    if latest_passed:
-                        # Get the last frame from this passed chunk
-                        last_frame = self._traj_db.get_last_frame_from_chunk(
+                    # Verify the chunk status (should be FAILED, but warn if not)
+                    chunk_attempt = self._traj_db.get_chunk_attempt(
+                        run_id=self.config.run_id,
+                        traj_id=traj_id,
+                        chunk_id=chunk_id,
+                        attempt_index=attempt_index
+                    )
+                    
+                    if chunk_attempt and chunk_attempt['audit_status'] != AuditStatus.FAILED:
+                        self.logger.warning(
+                            f"Traj {traj_id}: Chunk {chunk_id}, attempt {attempt_index} has status "
+                            f"{chunk_attempt['audit_status']}, expected FAILED. Resubmitting anyway."
+                        )
+                    
+                    # Check if a newer attempt for this chunk already exists
+                    latest_attempt = self._traj_db.get_latest_chunk_attempt(
+                        run_id=self.config.run_id,
+                        traj_id=traj_id,
+                        chunk_id=chunk_id
+                    )
+                    
+                    if latest_attempt and latest_attempt['attempt_index'] > attempt_index:
+                        self.logger.info(
+                            f"Traj {traj_id}: Chunk {chunk_id} already has a newer attempt "
+                            f"(attempt {latest_attempt['attempt_index']} > {attempt_index}), skipping resubmission"
+                        )
+                        continue
+                    
+                    # Get the starting frame for resubmission:
+                    # - If chunk_id > 0: use first frame of previous chunk (chunk_id - 1)
+                    # - If chunk_id == 0: use initial frame from trajectory
+                    if chunk_id > 0:
+                        # Get the latest attempt of the previous chunk
+                        # Since chunk N exists, chunk N-1 must have passed, so the latest attempt should be the passed one
+                        prev_chunk_attempt = self._traj_db.get_latest_chunk_attempt(
                             run_id=self.config.run_id,
                             traj_id=traj_id,
-                            chunk_id=latest_passed['chunk_id'],
-                            attempt_index=latest_passed['attempt_index'],
+                            chunk_id=chunk_id - 1
+                        )
+                        
+                        if not prev_chunk_attempt:
+                            self.logger.warning(
+                                f"Traj {traj_id}: No previous chunk {chunk_id - 1} found, skipping resubmission"
+                            )
+                            continue
+                        
+                        # Get last frame of previous chunk
+                        start_frame = self._traj_db.get_last_frame_from_chunk(
+                            run_id=self.config.run_id,
+                            traj_id=traj_id,
+                            chunk_id=chunk_id - 1,
+                            attempt_index=prev_chunk_attempt['attempt_index'],
                             ase_db=self._db
                         )
-                        self.logger.info(f"Traj {traj_id}: last_frame = {last_frame is not None}")
-                        
-                        if last_frame:
-                            # Submit to retry the latest chunk (which failed)
-                            next_spec = AdvanceSpec(
-                                atoms=last_frame,
-                                traj_id=traj_id,
-                                chunk_id=latest_passed['chunk_id'] + 1,
-                                steps=self.config.chunk_size
-                            )
-                            await self.dynamics_engine.submit(next_spec)
-                            self.logger.info(f"Resubmitted traj {traj_id}, chunk {latest_passed['chunk_id'] + 1}")
-                        else:
-                            self.logger.warning(f"Traj {traj_id}: No last frame found for chunk {latest_passed['chunk_id']}")
                     else:
-                        # No passed chunks - start from initial conditions
-                        self.logger.info(f"Traj {traj_id}: No latest passed chunk, using initial conditions")
-                        init_atoms = self._traj_db.get_initial_atoms(
+                        # chunk_id == 0: use initial trajectory frame
+                        start_frame = self._traj_db.get_initial_trajectory_frame(
                             run_id=self.config.run_id,
                             traj_id=traj_id
                         )
-                        if init_atoms:
-                            next_spec = AdvanceSpec(
-                                atoms=init_atoms,
-                                traj_id=traj_id,
-                                chunk_id=0,
-                                steps=self.config.chunk_size
-                            )
-                            await self.dynamics_engine.submit(next_spec)
-                            self.logger.info(f"Resubmitted traj {traj_id} from initial conditions, chunk 0")
-                        else:
-                            self.logger.warning(f"Traj {traj_id}: No initial atoms found")
+                    
+                    if start_frame:
+                        # Resubmit the SAME chunk_id (dynamics engine will create a new attempt)
+                        retry_spec = AdvanceSpec(
+                            atoms=start_frame,
+                            traj_id=traj_id,
+                            chunk_id=chunk_id,  # Same chunk_id, not chunk_id + 1
+                            steps=self.config.chunk_size
+                        )
+                        await self.dynamics_engine.submit(retry_spec)
+                        self.logger.info(f"Resubmitted traj {traj_id}, chunk {chunk_id} for retry (from attempt {attempt_index})")
+                    else:
+                        self.logger.warning(
+                            f"Traj {traj_id}: No starting frame found for chunk {chunk_id} "
+                            f"({'initial trajectory' if chunk_id == 0 else f'previous chunk {chunk_id - 1}'})"
+                        )
                 
                 self.last_train_count = current_count
-                self.logger.info(f"Retraining complete, resetting frame count to {self.last_train_count}")
+                self.logger.info(f"Retraining complete, setting frame count to {self.last_train_count}")
             else:
                 self.logger.debug(f"Retraining not triggered, sleeping for 5 seconds")
                 await asyncio.sleep(5)
