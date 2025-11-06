@@ -33,7 +33,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import relationship, sessionmaker, Session, declarative_base
-from cascade.model import AuditStatus, TrajectoryChunk, Trajectory
+from cascade.model import AuditStatus
 
 Base = declarative_base()
 
@@ -90,6 +90,24 @@ class DBTrajectoryChunk(Base):
 
     def __repr__(self):
         return f"<DBTrajectoryChunk(run_id={self.run_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt={self.attempt_index}, status={self.audit_status})>"
+
+
+class DBModelVersion(Base):
+    """ORM model for tracking model versions and their file locations"""
+    __tablename__ = 'model_versions'
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String, nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    file_path = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'version', name='uq_model_version_run_version'),
+    )
+
+    def __repr__(self):
+        return f"<DBModelVersion(run_id={self.run_id}, version={self.version}, file_path={self.file_path})>"
 
 
 class DBTrainingFrame(Base):
@@ -1316,6 +1334,130 @@ class TrajectoryDB:
                 })
             
             return result
+    
+    def save_model_weights(
+        self,
+        run_id: str,
+        weights: bytes,
+        weights_dir: str
+    ) -> int:
+        """Save model weights to disk and record in database
+        
+        This method uses an atomic write pattern:
+        1. Write to temporary file
+        2. Verify file was written correctly
+        3. Atomically rename to final location
+        4. Write to database (transaction ensures atomicity)
+        
+        Args:
+            run_id: Run identifier
+            weights: Model weights as bytes
+            weights_dir: Base directory for storing weights
+            
+        Returns:
+            Version number of the saved model
+            
+        Raises:
+            IOError: If file write/verification fails
+            Exception: If database write fails
+        """
+        import tempfile
+        import os
+        import hashlib
+        
+        # Get next version number
+        with self.session() as sess:
+            max_version = sess.query(func.max(DBModelVersion.version)).filter_by(
+                run_id=run_id
+            ).scalar()
+            next_version = (max_version or 0) + 1
+        
+        # Prepare final path (weights_dir already points to the run's weights directory)
+        os.makedirs(weights_dir, exist_ok=True)
+        final_path = os.path.join(weights_dir, f"model_v{next_version}.pth")
+        
+        # Write to temporary file
+        temp_fd, temp_path = tempfile.mkstemp(dir=weights_dir, suffix='.tmp')
+        try:
+            with os.fdopen(temp_fd, 'wb') as f:
+                f.write(weights)
+                f.flush()
+                os.fsync(f.fileno())  # Ensure written to disk
+            
+            # Verify file was written correctly
+            if not os.path.exists(temp_path):
+                raise IOError(f"Temporary file {temp_path} does not exist after write")
+            
+            file_size = os.path.getsize(temp_path)
+            if file_size != len(weights):
+                raise IOError(f"File size mismatch: expected {len(weights)}, got {file_size}")
+            
+            # Verify checksum
+            with open(temp_path, 'rb') as f:
+                checksum = hashlib.md5(f.read()).hexdigest()
+            expected_checksum = hashlib.md5(weights).hexdigest()
+            if checksum != expected_checksum:
+                raise IOError(f"Checksum mismatch for {temp_path}")
+            
+            # Atomic rename (atomic on Unix, near-atomic on Windows)
+            os.rename(temp_path, final_path)
+            
+            # Verify final file exists
+            if not os.path.exists(final_path):
+                raise IOError(f"Final file {final_path} does not exist after rename")
+            
+            # Write to database (transaction ensures atomicity)
+            with self.session() as sess:
+                db_version = DBModelVersion(
+                    run_id=run_id,
+                    version=next_version,
+                    file_path=final_path
+                )
+                sess.add(db_version)
+                sess.flush()  # Ensure it's committed
+            
+            logger.info(f"Saved model weights version {next_version} to {final_path}")
+            return next_version
+            
+        except Exception as e:
+            # Cleanup on failure
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+            if os.path.exists(final_path):
+                try:
+                    os.remove(final_path)
+                except:
+                    pass
+            logger.error(f"Failed to save model weights: {e}")
+            raise
+    
+    def get_latest_model_version(
+        self,
+        run_id: str
+    ) -> Optional[dict]:
+        """Get the latest model version for a run
+        
+        Args:
+            run_id: Run identifier
+            
+        Returns:
+            Dict with 'version' and 'file_path', or None if no models exist
+        """
+        with self.session() as sess:
+            version = sess.query(DBModelVersion).filter_by(
+                run_id=run_id
+            ).order_by(DBModelVersion.version.desc()).first()
+            
+            if not version:
+                return None
+            
+            return {
+                'version': version.version,
+                'file_path': version.file_path
+            }
     
     def list_trajectories_in_run(self, run_id: str) -> list[dict]:
         """List all trajectories in a run with basic info

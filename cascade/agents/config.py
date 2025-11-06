@@ -61,6 +61,8 @@ class LabelerConfig(CascadeAgentConfig):
 class TrainerConfig(CascadeAgentConfig):
     """Configuration for DummyTrainer agent"""
     learner: BaseLearnableForcefield
+    weights_dir: str
+    """Directory for storing model weights"""
 
 
 @dataclass

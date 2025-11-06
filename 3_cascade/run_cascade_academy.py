@@ -38,7 +38,7 @@ from cascade.agents.config import (
     LabelerConfig,
     TrainerConfig
 )
-from cascade.model import Trajectory, AdvanceSpec
+from cascade.model import AdvanceSpec
 from cascade.learning.mace import MACEInterface
 from cascade.agents.db_orm import TrajectoryDB
 
@@ -269,7 +269,14 @@ async def main():
             n_frames=args.n_sample_frames
         )
         labeler_config = LabelerConfig(run_id=run_id, db_url=args.db_url)
-        trainer_config = TrainerConfig(run_id=run_id, db_url=args.db_url, learner=learner)
+        # Set weights directory to {run_dir}/weights
+        weights_dir = str(run_dir / "weights")
+        trainer_config = TrainerConfig(
+            run_id=run_id,
+            db_url=args.db_url,
+            learner=learner,
+            weights_dir=weights_dir
+        )
 
         # launch all agents
         await manager.launch(

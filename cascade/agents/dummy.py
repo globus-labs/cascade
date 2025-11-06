@@ -28,7 +28,7 @@ from mace.calculators import mace_mp
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.utils import canonicalize
-from cascade.model import AuditStatus, AdvanceSpec, TrajectoryChunk, Trajectory
+from cascade.model import AuditStatus, AdvanceSpec
 from cascade.agents.config import (
     CascadeAgentConfig,
     DatabaseConfig,
@@ -84,30 +84,51 @@ class DynamicsEngine(CascadeAgent):
     async def agent_on_startup(self):
         for spec in self.config.init_specs:
             await self.queue.put(spec)
-
-    @action
-    async def receive_weights(self, weights: bytes) -> None:
-        self.weights = weights
-        self.model_version += 1
-        self.logger.info(f"Received new weights, now on model version {self.model_version}")
+        
+        # Try to load latest model version from database on startup
+        latest = self._traj_db.get_latest_model_version(self.config.run_id)
+        if latest:
+            try:
+                with open(latest['file_path'], 'rb') as f:
+                    self.weights = f.read()
+                self.model_version = latest['version']
+                self.logger.info(f"Loaded model weights version {self.model_version} on startup")
+            except Exception as e:
+                self.logger.warning(f"Failed to load latest model weights on startup: {e}, using initial weights")
 
     @action
     async def submit(self, spec: AdvanceSpec):
         self.logger.debug("Received advance spec")
         await self.queue.put(spec)
 
+    def _check_and_load_new_weights(self):
+        """Check for new model version and load if available"""
+        latest = self._traj_db.get_latest_model_version(self.config.run_id)
+        
+        if latest and latest['version'] > self.model_version:
+            try:
+                with open(latest['file_path'], 'rb') as f:
+                    new_weights = f.read()
+                # Verify file is not empty
+                if len(new_weights) > 0:
+                    self.weights = new_weights
+                    self.model_version = latest['version']
+                    self.logger.info(f"Loaded new model weights: version {self.model_version}")
+                else:
+                    self.logger.warning(f"Model weights file is empty for version {latest['version']}, skipping")
+            except Exception as e:
+                # This should be rare since DB guarantees file exists
+                self.logger.error(f"Failed to load weights file: {e}, continuing with old version")
+
     @loop
     async def advance_dynamics(
         self,
         shutdown: asyncio.Event
     ) -> None:
-        """Advance dynamics while there are trajectoires to advance
-
-
-        questions:
-            * should we have an update model method that locks?
-        """
+        """Advance dynamics while there are trajectoires to advance"""
         while not shutdown.is_set():
+            # Check for new model version before processing each chunk
+            self._check_and_load_new_weights()
 
             spec = await self.queue.get()
 
@@ -115,18 +136,12 @@ class DynamicsEngine(CascadeAgent):
             calc = self.config.learner.make_calculator(self.weights, device=self.config.device)
             atoms.calc = calc
 
-            chunk = TrajectoryChunk(
-                atoms=[],
-                model_version=self.model_version,
-                traj_id=spec.traj_id,
-                chunk_id=spec.chunk_id
-            )
 
             # Get attempt index before writing frames
             attempt_index = self._traj_db.get_next_attempt_index(
                 run_id=self.config.run_id,
-                traj_id=chunk.traj_id,
-                chunk_id=chunk.chunk_id
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id
             )
 
             # set up dynamics
@@ -143,14 +158,18 @@ class DynamicsEngine(CascadeAgent):
                 f = atoms.calc.results['forces']
                 atoms.calc.results['forces'] = f.astype(np.float64)
                 canonical_atoms = canonicalize(atoms)
-                chunk.atoms.append(canonical_atoms)
-                self._db.write(canonical_atoms, chunk_id=chunk.chunk_id, traj_id=chunk.traj_id, run_id=self.config.run_id, attempt_index=attempt_index)
+                self._db.write(
+                    canonical_atoms, 
+                    chunk_id=spec.chunk_id, 
+                    traj_id=spec.traj_id,
+                    run_id=self.config.run_id,
+                    attempt_index=attempt_index
+                )
+            
             dyn.attach(write_to_db)
-
             # run dynamics
-            self.logger.info(f"Running dynamics for chunk {chunk.chunk_id} of traj {chunk.traj_id}.")
+            self.logger.info(f"Running dynamics for chunk {spec.chunk_id} of traj {spec.traj_id}.")
             dyn.run(spec.steps, **run_kws)
-            del chunk.atoms[0]  # we have the initial conditions saved elsewhere
 
             # Calculate number of frames from steps and loginterval
             loginterval = dyn_kws.get('loginterval', 1)
@@ -159,21 +178,21 @@ class DynamicsEngine(CascadeAgent):
             # Record chunk metadata in ORM
             success = self._traj_db.add_chunk_attempt(
                 run_id=self.config.run_id,
-                traj_id=chunk.traj_id,
-                chunk_id=chunk.chunk_id,
-                model_version=chunk.model_version,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                model_version=self.model_version,
                 n_frames=n_frames,
                 audit_status=AuditStatus.PENDING,
                 attempt_index=attempt_index
             )
             if success:
-                self.logger.info(f"Recorded chunk {chunk.chunk_id} of traj {chunk.traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
+                self.logger.info(f"Recorded chunk {spec.chunk_id} of traj {spec.traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
             else:
-                self.logger.error(f"Failed to record chunk {chunk.chunk_id} of traj {chunk.traj_id} in database")
+                self.logger.error(f"Failed to record chunk {spec.chunk_id} of traj {spec.traj_id} in database")
 
             # submit to auditor
-            self.logger.info(f"Submitting audit for chunk {chunk.chunk_id} of traj {chunk.traj_id}.")
-            await self.auditor.submit(ChunkSpec(traj_id=chunk.traj_id, chunk_id=chunk.chunk_id))
+            self.logger.info(f"Submitting audit for chunk {spec.chunk_id} of traj {spec.traj_id}.")
+            await self.auditor.submit(ChunkSpec(traj_id=spec.traj_id, chunk_id=spec.chunk_id))
 
 
 class DummyAuditor(CascadeAgent):
@@ -400,11 +419,25 @@ class DummyTrainer(CascadeAgent):
     @action
     async def train_model(
         self,
-    ) -> bytes:
+    ) -> int:
+        """Train model, write weights to disk, and update database
+        
+        Returns:
+            Model version number if successful, raises exception on failure
+        """
         calc = mace_mp('small', device='cpu', default_dtype="float32") #todo: mt.2025.11.04 this should be configurable
         model = calc.models[0]
-        model_msg = self.config.learner.serialize_model(model)
-        return model_msg
+        weights = self.config.learner.serialize_model(model)
+        
+        # Write to disk and update database
+        version = self._traj_db.save_model_weights(
+            run_id=self.config.run_id,
+            weights=weights,
+            weights_dir=self.config.weights_dir
+        )
+        
+        self.logger.info(f"Trained and saved model version {version}")
+        return version
 
 
 class DatabaseMonitor(CascadeAgent):
@@ -498,9 +531,9 @@ class DatabaseMonitor(CascadeAgent):
                 )
                 self.logger.info(f"Marked {frames_marked} training frames for round {self.current_training_round}")
 
-                # Train model and update weights in dynamics engine
-                weights = await self.trainer.train_model()
-                await self.dynamics_engine.receive_weights(weights)
+                # Train model (writes to disk and updates database)
+                version = await self.trainer.train_model()
+                self.logger.info(f"Training complete, model version {version} is now available")
                 
                 # Get unique chunks that generated frames in this training round
                 chunks_to_resubmit = self._traj_db.get_chunks_from_training_round(
