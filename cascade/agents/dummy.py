@@ -28,7 +28,7 @@ from mace.calculators import mace_mp
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.utils import canonicalize
-from cascade.model import AuditStatus, AdvanceSpec, TrajectoryChunk, Trajectory
+from cascade.model import AuditStatus, AdvanceSpec
 from cascade.agents.config import (
     CascadeAgentConfig,
     DatabaseConfig,
@@ -115,18 +115,11 @@ class DynamicsEngine(CascadeAgent):
             calc = self.config.learner.make_calculator(self.weights, device=self.config.device)
             atoms.calc = calc
 
-            chunk = TrajectoryChunk(
-                atoms=[],
-                model_version=self.model_version,
-                traj_id=spec.traj_id,
-                chunk_id=spec.chunk_id
-            )
-
             # Get attempt index before writing frames
             attempt_index = self._traj_db.get_next_attempt_index(
                 run_id=self.config.run_id,
-                traj_id=chunk.traj_id,
-                chunk_id=chunk.chunk_id
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id
             )
 
             # set up dynamics
@@ -143,15 +136,17 @@ class DynamicsEngine(CascadeAgent):
                 f = atoms.calc.results['forces']
                 atoms.calc.results['forces'] = f.astype(np.float64)
                 canonical_atoms = canonicalize(atoms)
-                chunk.atoms.append(canonical_atoms)
-                self._db.write(canonical_atoms, chunk_id=chunk.chunk_id, traj_id=chunk.traj_id, run_id=self.config.run_id, attempt_index=attempt_index)
+                self._db.write(
+                    canonical_atoms, 
+                    chunk_id=spec.chunk_id,
+                    traj_id=spec.traj_id,
+                    run_id=self.config.run_id,
+                    attempt_index=attempt_index)
             dyn.attach(write_to_db)
 
             # run dynamics
-            self.logger.info(f"Running dynamics for chunk {chunk.chunk_id} of traj {chunk.traj_id}.")
+            self.logger.info(f"Running dynamics for chunk {spec.chunk_id} of traj {spec.traj_id}.")
             dyn.run(spec.steps, **run_kws)
-            del chunk.atoms[0]  # we have the initial conditions saved elsewhere
-
             # Calculate number of frames from steps and loginterval
             loginterval = dyn_kws.get('loginterval', 1)
             n_frames = spec.steps // loginterval
@@ -159,21 +154,21 @@ class DynamicsEngine(CascadeAgent):
             # Record chunk metadata in ORM
             success = self._traj_db.add_chunk_attempt(
                 run_id=self.config.run_id,
-                traj_id=chunk.traj_id,
-                chunk_id=chunk.chunk_id,
-                model_version=chunk.model_version,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                model_version=self.model_version,
                 n_frames=n_frames,
                 audit_status=AuditStatus.PENDING,
                 attempt_index=attempt_index
             )
             if success:
-                self.logger.info(f"Recorded chunk {chunk.chunk_id} of traj {chunk.traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
+                self.logger.info(f"Recorded chunk {spec.chunk_id} of traj {spec.traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
             else:
-                self.logger.error(f"Failed to record chunk {chunk.chunk_id} of traj {chunk.traj_id} in database")
+                self.logger.error(f"Failed to record chunk {spec.chunk_id} of traj {spec.traj_id} in database")
 
             # submit to auditor
-            self.logger.info(f"Submitting audit for chunk {chunk.chunk_id} of traj {chunk.traj_id}.")
-            await self.auditor.submit(ChunkSpec(traj_id=chunk.traj_id, chunk_id=chunk.chunk_id))
+            self.logger.info(f"Submitting audit for chunk {spec.chunk_id} of traj {spec.traj_id}.")
+            await self.auditor.submit(spec)
 
 
 class DummyAuditor(CascadeAgent):

@@ -38,7 +38,7 @@ from cascade.agents.config import (
     LabelerConfig,
     TrainerConfig
 )
-from cascade.model import Trajectory, AdvanceSpec
+from cascade.model import AdvanceSpec
 from cascade.learning.mace import MACEInterface
 from cascade.agents.db_orm import TrajectoryDB
 

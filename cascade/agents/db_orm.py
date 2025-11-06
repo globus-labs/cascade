@@ -33,7 +33,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import relationship, sessionmaker, Session, declarative_base
-from cascade.model import AuditStatus, TrajectoryChunk, Trajectory
+from cascade.model import AuditStatus
 
 Base = declarative_base()
 
