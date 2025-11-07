@@ -28,11 +28,10 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     func,
-    Text,
     JSON,
     UniqueConstraint,
 )
-from sqlalchemy.orm import relationship, sessionmaker, Session, declarative_base
+from sqlalchemy.orm import relationship, sessionmaker, declarative_base
 from cascade.model import AuditStatus
 
 Base = declarative_base()
@@ -117,7 +116,7 @@ class DBTrainingFrame(Base):
 
 
 class TrajectoryDB:
-    """Manager for trajectory and chunk persistence using SQLAlchemy ORM"""
+    """Wrapper for the database representations of trajectories and chunks"""
     
     def __init__(self, db_url: str):
         """Initialize the trajectory database manager
@@ -328,7 +327,7 @@ class TrajectoryDB:
                         traj_id=traj_id
                     ).first()
                     if traj:
-                        traj.chunks_completed = latest_passed + 1  # +1 because chunk_id is 0-indexed
+                        traj.chunks_completed = latest_passed + 1
                         
                         # Check if trajectory is done
                         passed_chunks = sess.query(DBTrajectoryChunk).filter_by(
@@ -410,7 +409,7 @@ class TrajectoryDB:
                 for chunk in chunks
             ]
     
-    def get_trajectory_chunks_atoms(
+    def get_trajectory_atoms(
         self,
         run_id: str,
         traj_id: int,
@@ -444,13 +443,11 @@ class TrajectoryDB:
                 chunk_id=chunk['chunk_id'],
                 attempt_index=chunk['attempt_index']
             ))
-            # Sort by some order if needed (e.g., id or custom key)
             frames.sort(key=lambda row: row.id)
-            
-            # Skip first frame of all chunks except the first one
+            # Skip first frame of all chunks except chunk 0
             # (first frame is duplicate of previous chunk's last frame)
             if i > 0:
-                frames = frames[1:]  # Skip first frame
+                frames = frames[1:]
             
             all_atoms.extend([row.toatoms() for row in frames])
         
