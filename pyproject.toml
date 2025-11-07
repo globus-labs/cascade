@@ -23,7 +23,9 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    "ase>3.22", academy-py
+    "ase>3.22",
+    "academy-py",
+    "sqlalchemy>=1.4.0"
 ]
 
 [tool.setuptools.packages.find]
