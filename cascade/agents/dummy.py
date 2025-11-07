@@ -512,34 +512,6 @@ class DatabaseMonitor(CascadeAgent):
                     chunk_id = chunk_info['chunk_id']
                     attempt_index = chunk_info['attempt_index']
                     
-                    # Verify the chunk status (should be FAILED, but warn if not)
-                    chunk_attempt = self._traj_db.get_chunk_attempt(
-                        run_id=self.config.run_id,
-                        traj_id=traj_id,
-                        chunk_id=chunk_id,
-                        attempt_index=attempt_index
-                    )
-                    
-                    if chunk_attempt and chunk_attempt['audit_status'] != AuditStatus.FAILED:
-                        self.logger.warning(
-                            f"Traj {traj_id}: Chunk {chunk_id}, attempt {attempt_index} has status "
-                            f"{chunk_attempt['audit_status']}, expected FAILED. Resubmitting anyway."
-                        )
-                    
-                    # Check if a newer attempt for this chunk already exists
-                    latest_attempt = self._traj_db.get_latest_chunk_attempt(
-                        run_id=self.config.run_id,
-                        traj_id=traj_id,
-                        chunk_id=chunk_id
-                    )
-                    
-                    if latest_attempt and latest_attempt['attempt_index'] > attempt_index:
-                        self.logger.info(
-                            f"Traj {traj_id}: Chunk {chunk_id} already has a newer attempt "
-                            f"(attempt {latest_attempt['attempt_index']} > {attempt_index}), skipping resubmission"
-                        )
-                        continue
-                    
                     # Get the starting frame for resubmission:
                     # - If chunk_id > 0: use first frame of previous chunk (chunk_id - 1)
                     # - If chunk_id == 0: use initial frame from trajectory
@@ -551,13 +523,6 @@ class DatabaseMonitor(CascadeAgent):
                             traj_id=traj_id,
                             chunk_id=chunk_id - 1
                         )
-                        
-                        if not prev_chunk_attempt:
-                            self.logger.warning(
-                                f"Traj {traj_id}: No previous chunk {chunk_id - 1} found, skipping resubmission"
-                            )
-                            continue
-                        
                         # Get last frame of previous chunk
                         start_frame = self._traj_db.get_last_frame_from_chunk(
                             run_id=self.config.run_id,
