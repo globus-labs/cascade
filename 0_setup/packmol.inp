@@ -1,0 +1,13 @@
+
+seed 1
+tolerance 2.0
+output cell.pdb
+structure solvent.pdb
+  number 64
+  inside cube 0. 0. 0. 12.03
+end structure
+structure solute.pdb
+   number 1
+   center 
+   fixed 6.01 6.01 6.01 0. 0. 0.
+end structure 
