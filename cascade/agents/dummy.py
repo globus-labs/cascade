@@ -228,10 +228,14 @@ class DummyAuditor(CascadeAgent):
                 self.logger.info(f'Audit passed for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
                 
                 # Check if trajectory is done using the data model
-                if not self._traj_db.is_trajectory_done(
+                done = self._traj_db.is_trajectory_done(
                     run_id=self.config.run_id,
                     traj_id=chunk_spec.traj_id
-                ):
+                )
+                if done:
+                    # trajectory done, already marked in db 
+                    self.logger.info(f"Traj {chunk_spec.traj_id} is complete")
+                else:
                     # Trajectory not done - submit next chunk
                     # Get the last frame from the current chunk to use as starting point
                     last_frame = self._traj_db.get_last_frame_from_chunk(
@@ -241,25 +245,18 @@ class DummyAuditor(CascadeAgent):
                         attempt_index=db_chunk['attempt_index'],
                         ase_db=self._db
                     )
-                    
-                    if last_frame:
-                        # Create and submit next advance spec
-                        next_spec = AdvanceSpec(
-                            atoms=last_frame,
-                            traj_id=chunk_spec.traj_id,
-                            chunk_id=chunk_spec.chunk_id + 1,
-                            steps=self.config.chunk_size
-                        )
-                        await self.dynamics_engine.submit(next_spec)
-                        self.logger.info(f"Submitted next chunk {chunk_spec.chunk_id + 1} for traj {chunk_spec.traj_id}")
-                    else:
-                        self.logger.warning(f"No frames found for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}")
-                else:
-                    self.logger.info(f"Traj {chunk_spec.traj_id} is complete")
-                #todo: mt.2025.11.04 flatten this logic
+                    # Create and submit next advance spec
+                    next_spec = AdvanceSpec(
+                        atoms=last_frame,
+                        traj_id=chunk_spec.traj_id,
+                        chunk_id=chunk_spec.chunk_id + 1,
+                        steps=self.config.chunk_size
+                    )
+                    await self.dynamics_engine.submit(next_spec)
+                    self.logger.info(f"Submitted next chunk {chunk_spec.chunk_id + 1} for traj {chunk_spec.traj_id}")
             else:
+                # audit failed, submit to sampler
                 self.logger.info(f'Audit failed for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
-                # Submit failed chunk to sampler
                 await self.sampler.submit(chunk_spec)
 
 
