@@ -17,7 +17,7 @@ def random_audit(
     chunk_atoms: list[Atoms],
     chunk_spec: ChunkSpec,
     attempt_index: int,
-    rng: np.random.RandomState = np.random.default_rng(),
+    rng: np.random.RandomState,
     accept_prob: float = 0.5,
     sleep_time: float = 0.,
 ) -> AuditResult:
@@ -25,13 +25,14 @@ def random_audit(
     
     Intended to be used as a stub for a real audit function.
     """
-    from cascade.model import AuditResult
+    from cascade.model import AuditResult, AuditStatus
     import time
 
     time.sleep(sleep_time)
     passed = rng.random() < accept_prob
     score = rng.random() if passed else 0.0
-    return AuditResult(passed=passed, score=score, traj_id=chunk_spec.traj_id, chunk_id=chunk_spec.chunk_id, attempt_index=attempt_index)
+    status = AuditStatus.PASSED if passed else AuditStatus.FAILED
+    return AuditResult(status=status, score=score, traj_id=chunk_spec.traj_id, chunk_id=chunk_spec.chunk_id, attempt_index=attempt_index)
 
 def advance_dynamics(
     spec: AdvanceSpec,

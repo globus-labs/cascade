@@ -43,6 +43,7 @@ class AuditorConfig(CascadeAgentConfig):
     """Configuration for DummyAuditor agent"""
     accept_rate: float
     chunk_size: int
+    rng: np.random.Generator | None = None
 
 
 @dataclass

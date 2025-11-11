@@ -216,6 +216,7 @@ class Auditor(CascadeAgent):
         self.dynamics_engine = dynamics_engine
         self.queue = Queue()
         self.audit_task = audit_task
+        self.rng = config.rng if config.rng else np.random.default_rng()
 
     @action
     async def submit(self, chunk_spec: ChunkSpec):
@@ -245,7 +246,8 @@ class Auditor(CascadeAgent):
             self.audit_task,
             chunk_atoms=chunk_atoms,
             chunk_spec=chunk_spec,
-            attempt_index=latest_attempt['attempt_index']
+            attempt_index=latest_attempt['attempt_index'],
+            rng=self.rng
         )
         self.schedule_future_callback(
             parsl_future,
@@ -275,7 +277,7 @@ class Auditor(CascadeAgent):
         status = getattr(
             result,
             'status',
-            AuditStatus.PASSED if getattr(result, 'passed', False) else AuditStatus.FAILED
+            None
         )
         self.logger.info('Audit result status: %s', status)
 

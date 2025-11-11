@@ -19,7 +19,7 @@ class TrainingFrame:
 @dataclass
 class AuditResult:
     """The result of an audit"""
-    passed: bool
+    status: AuditStatus
     """Whether the chunk passed audit"""
     score: float
     """The score assigned by the auditor"""
