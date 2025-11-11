@@ -24,7 +24,7 @@ from academy.logging import init_logging
 from cascade.agents.dummy import (
     DatabaseMonitor,
     DynamicsEngine,
-    DummyAuditor,
+    Auditor,
     DummySampler,
     DummyLabeler,
     DummyTrainer
@@ -41,6 +41,7 @@ from cascade.agents.config import (
 from cascade.model import AdvanceSpec
 from cascade.learning.mace import MACEInterface
 from cascade.agents.db_orm import TrajectoryDB
+from cascade.agents.task import random_audit
 
 
 def parse_args() -> argparse.Namespace:
@@ -217,7 +218,7 @@ async def main():
         trainer_reg = await manager.register_agent(DummyTrainer)
         labeler_reg = await manager.register_agent(DummyLabeler)
         sampler_reg = await manager.register_agent(DummySampler)
-        auditor_reg = await manager.register_agent(DummyAuditor)
+        auditor_reg = await manager.register_agent(Auditor)
         dynamics_reg = await manager.register_agent(DynamicsEngine)
 
         # get handles to all agents
@@ -286,16 +287,18 @@ async def main():
             args=(
                 dynamics_config,
                 auditor_handle,
-                ProcessPoolExecutor(max_workers=10)
             ),
             registration=dynamics_reg
         )
         await manager.launch(
-            DummyAuditor,
+            Auditor,
             args=(
                 auditor_config,
                 sampler_handle,
-                dynamics_handle
+                dynamics_handle,
+                random_audit,
+                ProcessPoolExecutor(max_workers=10)
+
             ),
             registration=auditor_reg,
         )
