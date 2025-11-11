@@ -200,9 +200,11 @@ async def main():
         a = read(s, index=-1)
         initial_specs.append(
             AdvanceSpec(
-                a,
+                atoms=a,
+                run_id=run_id,
                 traj_id=i,
                 chunk_id=0,
+                attempt_index=0,
                 steps=args.chunk_size
             )
         )
@@ -251,7 +253,7 @@ async def main():
         dynamics_config = DynamicsEngineConfig(
             run_id=run_id,
             db_url=args.db_url,
-            init_specs=initial_specs,
+            #init_specs=initial_specs,
             learner=learner,
             weights=init_weights,
             dyn_cls=get_dynamics_cls(args.dyn_cls),
@@ -323,6 +325,10 @@ async def main():
             registration=trainer_reg
         )        
 
+        # submit initial specs to dynamics engine
+        for spec in initial_specs:
+            logger.info(f"Submitting initial spec to dynamics engine: {spec}")
+            await dynamics_handle.submit(spec)
         try:
             await manager.wait([db_handle])
         except KeyboardInterrupt:

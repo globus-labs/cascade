@@ -128,9 +128,9 @@ class DynamicsEngine(CascadeAgent):
         self.auditor = auditor
         self.advance_dynamics_task = advance_dynamics_task
 
-    async def agent_on_startup(self):
-        for spec in self.config.init_specs:
-            await self.queue.put(spec)
+    # async def agent_on_startup(self):
+    #     for spec in self.config.init_specs:
+    #         await self.queue.put(spec)
 
     @action
     async def receive_weights(self, weights: bytes) -> None:
@@ -140,7 +140,9 @@ class DynamicsEngine(CascadeAgent):
 
     @action
     async def submit(self, spec: AdvanceSpec):
-        self.logger.debug("Received advance spec")
+        if isinstance(spec, dict):
+            spec = AdvanceSpec(**spec)
+        self.logger.info("Received advance spec for traj {spec.traj_id} chunk {spec.chunk_id}")
         parsl_future = self.executor.submit(
                 self.advance_dynamics_task,
                 spec=spec,
@@ -166,30 +168,37 @@ class DynamicsEngine(CascadeAgent):
             return
 
         spec = future.result()
+        if isinstance(spec, dict):
+            spec = AdvanceSpec(**spec)
 
-        attempt_index = spec['attempt_index']
+        run_id = spec.run_id
+        traj_id = spec.traj_id
+        chunk_id = spec.chunk_id
+        attempt_index = spec.attempt_index
+        steps = spec.steps
+
         # Calculate number of frames from steps and loginterval
         loginterval = self.config.dyn_kws.get('loginterval', 1)
-        n_frames = spec.steps // loginterval
+        n_frames = steps // loginterval
 
         # Record chunk metadata in ORM
         success = self._traj_db.add_chunk_attempt(
-            run_id=self.config.run_id,
-            traj_id=spec.traj_id,
-            chunk_id=spec.chunk_id,
+            run_id=run_id,
+            traj_id=traj_id,
+            chunk_id=chunk_id,
             model_version=self.model_version,
             n_frames=n_frames,
             audit_status=AuditStatus.PENDING,
             attempt_index=attempt_index
         )
         if success:
-            self.logger.info(f"Recorded chunk {spec.chunk_id} of traj {spec.traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
+            self.logger.info(f"Recorded chunk {chunk_id} of traj {traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
         else:
-            self.logger.error(f"Failed to record chunk {spec.chunk_id} of traj {spec.traj_id} in database")
+            self.logger.error(f"Failed to record chunk {chunk_id} of traj {traj_id} in database")
 
         # submit to auditor
-        self.logger.info(f"Submitting audit for chunk {spec.chunk_id} of traj {spec.traj_id}.")
-        await self.auditor.submit(spec)
+        self.logger.info(f"Submitting audit for chunk {chunk_id} of traj {traj_id}.")
+        await self.auditor.submit(ChunkSpec(traj_id=traj_id, chunk_id=chunk_id))
 
 
 class Auditor(CascadeAgent):
@@ -304,10 +313,18 @@ class Auditor(CascadeAgent):
                     ase_db=self._db
                 )
                 # Create and submit next advance spec
+                next_chunk_id = result.chunk_id + 1
+                next_attempt_index = self._traj_db.get_next_attempt_index(
+                    run_id=self.config.run_id,
+                    traj_id=result.traj_id,
+                    chunk_id=next_chunk_id
+                )
                 next_spec = AdvanceSpec(
                     atoms=last_frame,
+                    run_id=self.config.run_id,
                     traj_id=result.traj_id,
-                    chunk_id=result.chunk_id + 1,
+                    chunk_id=next_chunk_id,
+                    attempt_index=next_attempt_index,
                     steps=self.config.chunk_size
                 )
                 await self.dynamics_engine.submit(next_spec)
@@ -599,14 +616,24 @@ class DatabaseMonitor(CascadeAgent):
                     
                     if start_frame:
                         # Resubmit the SAME chunk_id (dynamics engine will create a new attempt)
+                        next_attempt_index = self._traj_db.get_next_attempt_index(
+                            run_id=self.config.run_id,
+                            traj_id=traj_id,
+                            chunk_id=chunk_id
+                        )
                         retry_spec = AdvanceSpec(
                             atoms=start_frame,
+                            run_id=self.config.run_id,
                             traj_id=traj_id,
                             chunk_id=chunk_id,  # Same chunk_id, not chunk_id + 1
+                            attempt_index=next_attempt_index,
                             steps=self.config.chunk_size
                         )
                         await self.dynamics_engine.submit(retry_spec)
-                        self.logger.info(f"Resubmitted traj {traj_id}, chunk {chunk_id} for retry (from attempt {attempt_index})")
+                        self.logger.info(
+                            f"Resubmitted traj {traj_id}, chunk {chunk_id} for retry "
+                            f"(from attempt {attempt_index} to attempt {next_attempt_index})"
+                        )
                     else:
                         self.logger.warning(
                             f"Traj {traj_id}: No starting frame found for chunk {chunk_id} "

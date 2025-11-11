@@ -7,8 +7,9 @@ if TYPE_CHECKING:
     from cascade.model import AdvanceSpec
     from cascade.learning.base import BaseLearnableForcefield
     from ase import Atoms
-    from ase.optimize.optimize import Dynamics
-    import numpy as np
+from ase.optimize.optimize import Dynamics
+
+import numpy as np
 
 # can make this a classmethod on some audittask class
 # to get some shared informaiton and inheritance
@@ -65,7 +66,7 @@ def advance_dynamics(
             chunk_id=spec.chunk_id,
             traj_id=spec.traj_id,
             run_id=spec.run_id,
-            attempt_index=spec.attempt_index) # todo: get attempt index from db
+            attempt_index=spec.attempt_index)
     dyn.attach(write_to_db)
 
     dyn.run(spec.steps, **run_kws)

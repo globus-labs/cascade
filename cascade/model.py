@@ -53,13 +53,17 @@ class AdvanceSpec:
     """Trajectory advancement specification.
     
     This is bare minimum information to pass for the dynamics engine
-    create a trajectory chunk
+    to create a trajectory chunk.
     """
     atoms: Atoms
     """Initial atoms for the trajectory chunk"""
+    run_id: str
+    """Run identifier"""
     traj_id: int
     """Which trajectory"""
     chunk_id: int
     """Which chunk"""
+    attempt_index: int
+    """Attempt index for this chunk"""
     steps: int
     """How many steps to run dynamics for"""
