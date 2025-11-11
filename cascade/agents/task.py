@@ -15,13 +15,16 @@ def random_audit(
     attempt_index: int,
     rng: np.random.RandomState = np.random.default_rng(),
     accept_prob: float = 0.5,
+    sleep_time: float = 0.,
 ) -> AuditResult:
     """Random audit of a chunk of a trajectory
     
     Intended to be used as a stub for a real audit function.
     """
     from cascade.model import AuditResult
-    
+    import time
+
+    time.sleep(sleep_time)
     passed = rng.random() < accept_prob
     score = rng.random() if passed else 0.0
     return AuditResult(passed=passed, score=score, traj_id=chunk_spec.traj_id, chunk_id=chunk_spec.chunk_id, attempt_index=attempt_index)

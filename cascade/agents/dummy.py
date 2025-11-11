@@ -14,7 +14,7 @@ from asyncio import Queue
 from threading import Event
 import logging
 from functools import cached_property
-from typing import NamedTuple, Callable
+from typing import Any, Awaitable, Callable, NamedTuple, Optional, Union
 from collections import namedtuple
 from asyncio import wrap_future  
 from concurrent.futures import Executor, Future
@@ -47,16 +47,58 @@ from cascade.agents.db_orm import TrajectoryDB
 from cascade.model import ChunkSpec, TrainingFrame
 
 
+ExecutorFuture = Union[Future[Any], asyncio.Future[Any]]
+
+
 class CascadeAgent(Agent):
     """Base class for all cascade agents"""
 
     def __init__(
         self,
         config: CascadeAgentConfig,
+        executor: Optional[Executor] = None
     ):
         self.config = config
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.executor = executor
+    
+    def schedule_future_callback(
+        self,
+        future: ExecutorFuture,
+        callback: Callable[[ExecutorFuture], Awaitable[None]],
+        *,
+        description: Optional[str] = None
+    ) -> None:
+        """Schedule a coroutine callback after a future completes.
 
+        Args:
+            future: Asyncio or concurrent.futures future to await.
+            callback: Coroutine accepting the completed future.
+            description: Optional identifier for logging.
+        """
+
+        async def _await_and_dispatch() -> None:
+            try:
+                if isinstance(future, asyncio.Future):
+                    await future
+                else:
+                    await wrap_future(future)
+            except Exception:
+                self.logger.exception(
+                    'Executor task %s raised before callback',
+                    description or repr(future),
+                )
+                return
+
+            try:
+                await callback(future)
+            except Exception:
+                self.logger.exception(
+                    'Executor callback %s raised an exception',
+                    getattr(callback, '__qualname__', repr(callback)),
+                )
+
+        asyncio.create_task(_await_and_dispatch())
     @cached_property
     def _db(self):
         """An ASE database object for writing individual frames"""
@@ -74,9 +116,10 @@ class DynamicsEngine(CascadeAgent):
     def __init__(
         self,
         config: DynamicsEngineConfig,
-        auditor: Handle[Auditor]
+        auditor: Handle[Auditor],
+        executor: Executor
     ):
-        super().__init__(config)
+        super().__init__(config, executor)
         self.weights = config.weights  # This needs to be mutable
         self.model_version = 0  # todo: mt.2025.10.20 probably this should be persisted somewhere else
         self.queue = Queue()
@@ -182,12 +225,11 @@ class Auditor(CascadeAgent):
             audit_task: Callable[[ChunkSpec], AuditResult],
             executor: Executor
     ):
-        super().__init__(config)
+        super().__init__(config, executor)
         self.sampler = sampler
         self.dynamics_engine = dynamics_engine
         self.queue = Queue()
         self.audit_task = audit_task
-        self.executor = executor
 
     @action
     async def submit(self, chunk_spec: ChunkSpec):
@@ -219,23 +261,11 @@ class Auditor(CascadeAgent):
             chunk_spec=chunk_spec,
             attempt_index=latest_attempt['attempt_index']
         )
-        # parsl_future.add_done_callback(lambda future: asyncio.create_task(self._audit_callback(future)))
-        # loop = asyncio.get_running_loop()
-        async def _await_and_dispatch() -> None:
-            try:
-                await wrap_future(parsl_future)
-            except Exception:
-                self.logger.exception(
-                    'Audit task for traj %s chunk %s raised before callback',
-                    chunk_spec.traj_id,
-                    chunk_spec.chunk_id,
-                )
-                return
-            await self._audit_callback(parsl_future)
-
-        # async_future = wrap_future(parsl_future)
-        # asyncio.create_task(self._audit_callback(async_future))
-        asyncio.create_task(_await_and_dispatch())
+        self.schedule_future_callback(
+            parsl_future,
+            self._audit_callback,
+            description=f'audit traj {chunk_spec.traj_id} chunk {chunk_spec.chunk_id}',
+        )
     async def _audit_callback(self, future: Future) -> None:
         """Handle the results of an audit
     
@@ -314,31 +344,7 @@ class Auditor(CascadeAgent):
             )
             await self.sampler.submit(spec)
 
-    # @loop
-    # async def audit(
-    #     self,
-    #     shutdown: asyncio.Event
-    # ) -> None:
-    #     """Audit chunks of trajectories"""
-
-    #     while not shutdown.is_set():
-    #         chunk_spec = await self.queue.get()
-    #         self.logger.info(f'Auditing chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
-            
-    #         # Get the latest attempt for this chunk from ORM
-    #         db_chunk = self._traj_db.get_latest_chunk_attempt(
-    #             run_id=self.config.run_id,
-    #             traj_id=chunk_spec.traj_id,
-    #             chunk_id=chunk_spec.chunk_id
-    #         )
-            
-    #         if not db_chunk:
-    #             self.logger.warning(f"No chunk attempt found for traj {chunk_spec.traj_id}, chunk {chunk_spec.chunk_id}")
-    #             continue
-            
-    #         # Perform audit
-    #         good = np.random.random() < self.config.accept_rate            
-            
+    
             
 
 class DummySampler(CascadeAgent):
