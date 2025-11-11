@@ -74,7 +74,7 @@ class DynamicsEngine(CascadeAgent):
     def __init__(
         self,
         config: DynamicsEngineConfig,
-        auditor: Handle[DummyAuditor]
+        auditor: Handle[Auditor]
     ):
         super().__init__(config)
         self.weights = config.weights  # This needs to be mutable
@@ -172,7 +172,7 @@ class DynamicsEngine(CascadeAgent):
             await self.auditor.submit(spec)
 
 
-class DummyAuditor(CascadeAgent):
+class Auditor(CascadeAgent):
 
     def __init__(
             self,
@@ -194,6 +194,18 @@ class DummyAuditor(CascadeAgent):
         """Submit a chunk for audit"""
         self.logger.debug(f'Received chunk {chunk_spec.chunk_id} from traj {chunk_spec.traj_id}')
 
+        latest_attempt = self._traj_db.get_latest_chunk_attempt(
+            run_id=self.config.run_id,
+            traj_id=chunk_spec.traj_id,
+            chunk_id=chunk_spec.chunk_id
+        )
+        if not latest_attempt:
+            self.logger.warning(
+                'No attempt metadata found for traj %s chunk %s; skipping audit',
+                chunk_spec.traj_id,
+                chunk_spec.chunk_id,
+            )
+            return
         chunk_atoms = self._traj_db.get_latest_chunk_attempt_atoms(
             self.config.run_id,
             chunk_spec.traj_id,
@@ -203,11 +215,28 @@ class DummyAuditor(CascadeAgent):
         self.logger.info(f'Submitting audit of chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id} to executor')
         parsl_future = self.executor.submit(
             self.audit_task,
-            chunk_atoms=chunk_atoms
+            chunk_atoms=chunk_atoms,
+            chunk_spec=chunk_spec,
+            attempt_index=latest_attempt['attempt_index']
         )
-        parsl_future.add_done_callback(self._audit_callback)
+        # parsl_future.add_done_callback(lambda future: asyncio.create_task(self._audit_callback(future)))
+        # loop = asyncio.get_running_loop()
+        async def _await_and_dispatch() -> None:
+            try:
+                await wrap_future(parsl_future)
+            except Exception:
+                self.logger.exception(
+                    'Audit task for traj %s chunk %s raised before callback',
+                    chunk_spec.traj_id,
+                    chunk_spec.chunk_id,
+                )
+                return
+            await self._audit_callback(parsl_future)
 
-    async def _audit_callback(self, future: Future):
+        # async_future = wrap_future(parsl_future)
+        # asyncio.create_task(self._audit_callback(async_future))
+        asyncio.create_task(_await_and_dispatch())
+    async def _audit_callback(self, future: Future) -> None:
         """Handle the results of an audit
     
         If the audit fails, the chunk is submitted to the sampler.
@@ -220,26 +249,33 @@ class DummyAuditor(CascadeAgent):
         Returns:
             None
         """
-        
+        self.logger.info('Audit callback started')
         if future.exception():
-            self.logger.error(f'Audit failed: {future.exception()}')
+            self.logger.error('Audit failed: %s', future.exception())
             return
-        result = future.result()
-        self.logger.info(f'Audit result: {result.audit_status}')
 
-        if result.status not in [AuditStatus.PASSED, AuditStatus.FAILED]:
-            self.logger.error(f'Audit result is not PASSED or FAILED: {result.status}')
+        self.logger.info('Getting future result')
+        result = future.result()
+        status = getattr(
+            result,
+            'status',
+            AuditStatus.PASSED if getattr(result, 'passed', False) else AuditStatus.FAILED
+        )
+        self.logger.info('Audit result status: %s', status)
+
+        if status not in [AuditStatus.PASSED, AuditStatus.FAILED]:
+            self.logger.error('Audit result is not PASSED or FAILED: %s', status)
             return
-        
+
         self._traj_db.update_chunk_audit_status(
             run_id=self.config.run_id,
             traj_id=result.traj_id,
             chunk_id=result.chunk_id,
             attempt_index=result.attempt_index,
-            audit_status=result.status
+            audit_status=status
         )
         
-        if result.passed:
+        if getattr(result, 'passed', False):
             self.logger.info(f'Audit passed for chunk {result.chunk_id} of traj {result.traj_id}')
             
             # Check if trajectory is done using the data model
@@ -278,30 +314,30 @@ class DummyAuditor(CascadeAgent):
             )
             await self.sampler.submit(spec)
 
-    @loop
-    async def audit(
-        self,
-        shutdown: asyncio.Event
-    ) -> None:
-        """Audit chunks of trajectories"""
+    # @loop
+    # async def audit(
+    #     self,
+    #     shutdown: asyncio.Event
+    # ) -> None:
+    #     """Audit chunks of trajectories"""
 
-        while not shutdown.is_set():
-            chunk_spec = await self.queue.get()
-            self.logger.info(f'Auditing chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
+    #     while not shutdown.is_set():
+    #         chunk_spec = await self.queue.get()
+    #         self.logger.info(f'Auditing chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
             
-            # Get the latest attempt for this chunk from ORM
-            db_chunk = self._traj_db.get_latest_chunk_attempt(
-                run_id=self.config.run_id,
-                traj_id=chunk_spec.traj_id,
-                chunk_id=chunk_spec.chunk_id
-            )
+    #         # Get the latest attempt for this chunk from ORM
+    #         db_chunk = self._traj_db.get_latest_chunk_attempt(
+    #             run_id=self.config.run_id,
+    #             traj_id=chunk_spec.traj_id,
+    #             chunk_id=chunk_spec.chunk_id
+    #         )
             
-            if not db_chunk:
-                self.logger.warning(f"No chunk attempt found for traj {chunk_spec.traj_id}, chunk {chunk_spec.chunk_id}")
-                continue
+    #         if not db_chunk:
+    #             self.logger.warning(f"No chunk attempt found for traj {chunk_spec.traj_id}, chunk {chunk_spec.chunk_id}")
+    #             continue
             
-            # Perform audit
-            good = np.random.random() < self.config.accept_rate            
+    #         # Perform audit
+    #         good = np.random.random() < self.config.accept_rate            
             
             
 

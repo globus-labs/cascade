@@ -11,6 +11,8 @@ from ase import Atoms
 # to get some shared informaiton and inheritance
 def random_audit(
     chunk_atoms: list[Atoms],
+    chunk_spec: ChunkSpec,
+    attempt_index: int,
     rng: np.random.RandomState = np.random.default_rng(),
     accept_prob: float = 0.5,
 ) -> AuditResult:
@@ -22,4 +24,4 @@ def random_audit(
     
     passed = rng.random() < accept_prob
     score = rng.random() if passed else 0.0
-    return AuditResult(passed=passed, score=score)
+    return AuditResult(passed=passed, score=score, traj_id=chunk_spec.traj_id, chunk_id=chunk_spec.chunk_id, attempt_index=attempt_index)
