@@ -14,8 +14,10 @@ from asyncio import Queue
 from threading import Event
 import logging
 from functools import cached_property
-from typing import NamedTuple
+from typing import NamedTuple, Callable
 from collections import namedtuple
+from asyncio import wrap_future  
+from concurrent.futures import Executor, Future
 
 import numpy as np
 import ase
@@ -25,10 +27,12 @@ from academy.handle import Handle
 from academy.agent import Agent, action, loop
 from ase.optimize.optimize import Dynamics
 from mace.calculators import mace_mp
+from parsl.concurrent import ParslPoolExecutor
+from parsl.config import Config
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.utils import canonicalize
-from cascade.model import AuditStatus, AdvanceSpec
+from cascade.model import AuditStatus, AdvanceSpec, AuditResult
 from cascade.agents.config import (
     CascadeAgentConfig,
     DatabaseConfig,
@@ -40,11 +44,8 @@ from cascade.agents.config import (
     DatabaseMonitorConfig
 )
 from cascade.agents.db_orm import TrajectoryDB
+from cascade.model import ChunkSpec, TrainingFrame
 
-
-
-ChunkSpec = namedtuple('ChunkSpec', ['traj_id', 'chunk_id'])
-TrainingFrame = namedtuple('TrainingFrame', ['atoms', 'model_version'])
 
 class CascadeAgent(Agent):
     """Base class for all cascade agents"""
@@ -178,23 +179,111 @@ class DummyAuditor(CascadeAgent):
             config: AuditorConfig,
             sampler: Handle[DummySampler],
             dynamics_engine: Handle[DynamicsEngine],
+            audit_task: Callable[[ChunkSpec], AuditResult],
+            executor: Executor
     ):
         super().__init__(config)
         self.sampler = sampler
         self.dynamics_engine = dynamics_engine
         self.queue = Queue()
+        self.audit_task = audit_task
+        self.executor = executor
 
     @action
     async def submit(self, chunk_spec: ChunkSpec):
-        self.logger.debug(f'Receieved chunk {chunk_spec.chunk_id} from traj {chunk_spec.traj_id}')
-        await self.queue.put(chunk_spec)
+        """Submit a chunk for audit"""
+        self.logger.debug(f'Received chunk {chunk_spec.chunk_id} from traj {chunk_spec.traj_id}')
+
+        chunk_atoms = self._traj_db.get_latest_chunk_attempt_atoms(
+            self.config.run_id,
+            chunk_spec.traj_id,
+            chunk_spec.chunk_id,
+            self._db
+        )
+        self.logger.info(f'Submitting audit of chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id} to executor')
+        parsl_future = self.executor.submit(
+            self.audit_task,
+            chunk_atoms=chunk_atoms
+        )
+        parsl_future.add_done_callback(self._audit_callback)
+
+    async def _audit_callback(self, future: Future):
+        """Handle the results of an audit
+    
+        If the audit fails, the chunk is submitted to the sampler.
+        If the audit passes and the trajectory is done, this is recorded in the database.
+        If the audit passes and the trajectory is NOT done, the next chunk is submitted to the dynamics engine.
+
+        Args:
+            future: The future that contains the result of the audit
+
+        Returns:
+            None
+        """
+        
+        if future.exception():
+            self.logger.error(f'Audit failed: {future.exception()}')
+            return
+        result = future.result()
+        self.logger.info(f'Audit result: {result.audit_status}')
+
+        if result.status not in [AuditStatus.PASSED, AuditStatus.FAILED]:
+            self.logger.error(f'Audit result is not PASSED or FAILED: {result.status}')
+            return
+        
+        self._traj_db.update_chunk_audit_status(
+            run_id=self.config.run_id,
+            traj_id=result.traj_id,
+            chunk_id=result.chunk_id,
+            attempt_index=result.attempt_index,
+            audit_status=result.status
+        )
+        
+        if result.passed:
+            self.logger.info(f'Audit passed for chunk {result.chunk_id} of traj {result.traj_id}')
+            
+            # Check if trajectory is done using the data model
+            done = self._traj_db.is_trajectory_done(
+                run_id=self.config.run_id,
+                traj_id=result.traj_id
+            )
+            if done:
+                # trajectory done, already marked in db 
+                self.logger.info(f"Traj {result.traj_id} is complete")
+            else:
+                # Trajectory not done - submit next chunk
+                # Get the last frame from the current chunk to use as starting point
+                last_frame = self._traj_db.get_last_frame_from_chunk(
+                    run_id=self.config.run_id,
+                    traj_id=result.traj_id,
+                    chunk_id=result.chunk_id,
+                    attempt_index=result.attempt_index,
+                    ase_db=self._db
+                )
+                # Create and submit next advance spec
+                next_spec = AdvanceSpec(
+                    atoms=last_frame,
+                    traj_id=result.traj_id,
+                    chunk_id=result.chunk_id + 1,
+                    steps=self.config.chunk_size
+                )
+                await self.dynamics_engine.submit(next_spec)
+                self.logger.info(f"Submitted next chunk {result.chunk_id + 1} for traj {result.traj_id}")
+        else:
+            # audit failed, submit to sampler
+            self.logger.info(f'Audit failed for chunk {result.chunk_id} of traj {result.traj_id}')
+            spec = ChunkSpec(
+                traj_id=result.traj_id,
+                chunk_id=result.chunk_id
+            )
+            await self.sampler.submit(spec)
 
     @loop
     async def audit(
         self,
         shutdown: asyncio.Event
     ) -> None:
-        """a stub of a real audit"""
+        """Audit chunks of trajectories"""
 
         while not shutdown.is_set():
             chunk_spec = await self.queue.get()
@@ -212,53 +301,9 @@ class DummyAuditor(CascadeAgent):
                 continue
             
             # Perform audit
-            good = np.random.random() < self.config.accept_rate
-            new_status = AuditStatus.PASSED if good else AuditStatus.FAILED
+            good = np.random.random() < self.config.accept_rate            
             
-            # Update audit status in ORM
-            self._traj_db.update_chunk_audit_status(
-                run_id=self.config.run_id,
-                traj_id=chunk_spec.traj_id,
-                chunk_id=chunk_spec.chunk_id,
-                attempt_index=db_chunk['attempt_index'],
-                audit_status=new_status
-            )
             
-            if good:
-                self.logger.info(f'Audit passed for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
-                
-                # Check if trajectory is done using the data model
-                done = self._traj_db.is_trajectory_done(
-                    run_id=self.config.run_id,
-                    traj_id=chunk_spec.traj_id
-                )
-                if done:
-                    # trajectory done, already marked in db 
-                    self.logger.info(f"Traj {chunk_spec.traj_id} is complete")
-                else:
-                    # Trajectory not done - submit next chunk
-                    # Get the last frame from the current chunk to use as starting point
-                    last_frame = self._traj_db.get_last_frame_from_chunk(
-                        run_id=self.config.run_id,
-                        traj_id=chunk_spec.traj_id,
-                        chunk_id=chunk_spec.chunk_id,
-                        attempt_index=db_chunk['attempt_index'],
-                        ase_db=self._db
-                    )
-                    # Create and submit next advance spec
-                    next_spec = AdvanceSpec(
-                        atoms=last_frame,
-                        traj_id=chunk_spec.traj_id,
-                        chunk_id=chunk_spec.chunk_id + 1,
-                        steps=self.config.chunk_size
-                    )
-                    await self.dynamics_engine.submit(next_spec)
-                    self.logger.info(f"Submitted next chunk {chunk_spec.chunk_id + 1} for traj {chunk_spec.traj_id}")
-            else:
-                # audit failed, submit to sampler
-                self.logger.info(f'Audit failed for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
-                await self.sampler.submit(chunk_spec)
-
 
 class DummySampler(CascadeAgent):
 

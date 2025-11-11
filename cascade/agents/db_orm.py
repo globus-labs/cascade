@@ -584,6 +584,42 @@ class TrajectoryDB:
                 'n_frames': chunk.n_frames
             }
     
+    def get_latest_chunk_attempt_atoms(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        ase_db: ase.database.connect
+    ) -> list[Atoms]:
+        """Get the ASE atoms for the latest attempt of a chunk
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            ase_db: ASE database connection to query frames from
+        
+        Returns:
+            List of Atoms objects for the latest chunk attempt (empty if none found)
+        """
+        latest_attempt = self.get_latest_chunk_attempt(run_id, traj_id, chunk_id)
+        if not latest_attempt:
+            return []
+        
+        attempt_index = latest_attempt['attempt_index']
+        frames = list(ase_db.select(
+            run_id=run_id,
+            traj_id=traj_id,
+            chunk_id=chunk_id,
+            attempt_index=attempt_index
+        ))
+        
+        if not frames:
+            return []
+        
+        frames.sort(key=lambda row: row.id)
+        return [row.toatoms() for row in frames]
+    
     def is_trajectory_done(
         self,
         run_id: str,

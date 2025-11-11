@@ -2,10 +2,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
+from collections import namedtuple
 
 from ase import Atoms
-from ase.io import write
 
+@dataclass
+class ChunkSpec:
+    traj_id: int
+    chunk_id: int
+
+@dataclass
+class TrainingFrame:
+    atoms: Atoms
+    model_version: int
+
+@dataclass
+class AuditResult:
+    """The result of an audit"""
+    passed: bool
+    """Whether the chunk passed audit"""
+    score: float
+    """The score assigned by the auditor"""
+    traj_id: int
+    """The trajectory ID"""
+    chunk_id: int
+    """The chunk ID""" 
+    attempt_index: int
+    """The attempt index"""
 
 class AuditStatus(Enum):
     """Whether a trajectory chunk is awaiting or has passed/failed an audit"""

@@ -1,6 +1,6 @@
 import asyncio
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import logging
 import warnings
 import datetime
@@ -286,6 +286,7 @@ async def main():
             args=(
                 dynamics_config,
                 auditor_handle,
+                ProcessPoolExecutor(max_workers=10)
             ),
             registration=dynamics_reg
         )
