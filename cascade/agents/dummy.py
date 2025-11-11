@@ -47,6 +47,7 @@ from cascade.agents.db_orm import TrajectoryDB
 from cascade.model import ChunkSpec, TrainingFrame
 
 
+
 ExecutorFuture = Union[Future[Any], asyncio.Future[Any]]
 
 
@@ -117,13 +118,15 @@ class DynamicsEngine(CascadeAgent):
         self,
         config: DynamicsEngineConfig,
         auditor: Handle[Auditor],
-        executor: Executor
+        executor: Executor,
+        advance_dynamics_task: Callable[[AdvanceSpec], None]
     ):
         super().__init__(config, executor)
         self.weights = config.weights  # This needs to be mutable
         self.model_version = 0  # todo: mt.2025.10.20 probably this should be persisted somewhere else
         self.queue = Queue()
         self.auditor = auditor
+        self.advance_dynamics_task = advance_dynamics_task
 
     async def agent_on_startup(self):
         for spec in self.config.init_specs:
@@ -138,81 +141,55 @@ class DynamicsEngine(CascadeAgent):
     @action
     async def submit(self, spec: AdvanceSpec):
         self.logger.debug("Received advance spec")
-        await self.queue.put(spec)
-
-    @loop
-    async def advance_dynamics(
+        parsl_future = self.executor.submit(
+                self.advance_dynamics_task,
+                spec=spec,
+                learner=self.config.learner,
+                weights=self.weights,
+                db=self._db,
+                device=self.config.device,
+                dyn_cls=self.config.dyn_cls,
+                dyn_kws=self.config.dyn_kws
+        )
+        self.schedule_future_callback(
+            parsl_future,
+            self._advance_dynamics_callback,
+            description=f'advance dynamics traj {spec.traj_id} chunk {spec.chunk_id}',
+        )
+    async def _advance_dynamics_callback(
         self,
-        shutdown: asyncio.Event
+        future: Future
     ) -> None:
-        """Advance dynamics while there are trajectoires to advance
+        """Handle the results of an advance dynamics call"""
+        if future.exception():
+            self.logger.error('Advance dynamics failed: %s', future.exception())
+            return
 
+        spec = future.result()
 
-        questions:
-            * should we have an update model method that locks?
-        """
-        while not shutdown.is_set():
+        attempt_index = spec['attempt_index']
+        # Calculate number of frames from steps and loginterval
+        loginterval = self.config.dyn_kws.get('loginterval', 1)
+        n_frames = spec.steps // loginterval
 
-            spec = await self.queue.get()
+        # Record chunk metadata in ORM
+        success = self._traj_db.add_chunk_attempt(
+            run_id=self.config.run_id,
+            traj_id=spec.traj_id,
+            chunk_id=spec.chunk_id,
+            model_version=self.model_version,
+            n_frames=n_frames,
+            audit_status=AuditStatus.PENDING,
+            attempt_index=attempt_index
+        )
+        if success:
+            self.logger.info(f"Recorded chunk {spec.chunk_id} of traj {spec.traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
+        else:
+            self.logger.error(f"Failed to record chunk {spec.chunk_id} of traj {spec.traj_id} in database")
 
-            atoms = spec.atoms
-            calc = self.config.learner.make_calculator(self.weights, device=self.config.device)
-            atoms.calc = calc
-
-            # Get attempt index before writing frames
-            attempt_index = self._traj_db.get_next_attempt_index(
-                run_id=self.config.run_id,
-                traj_id=spec.traj_id,
-                chunk_id=spec.chunk_id
-            )
-
-            # set up dynamics
-            dyn_kws = self.config.dyn_kws or {}
-            run_kws = self.config.run_kws or {}
-            dyn = self.config.dyn_cls(
-                atoms,
-                **dyn_kws
-            )
-
-            # set up writer
-            def write_to_db():
-                # needs to be 64 bit for db read
-                f = atoms.calc.results['forces']
-                atoms.calc.results['forces'] = f.astype(np.float64)
-                canonical_atoms = canonicalize(atoms)
-                self._db.write(
-                    canonical_atoms, 
-                    chunk_id=spec.chunk_id,
-                    traj_id=spec.traj_id,
-                    run_id=self.config.run_id,
-                    attempt_index=attempt_index)
-            dyn.attach(write_to_db)
-
-            # run dynamics
-            self.logger.info(f"Running dynamics for chunk {spec.chunk_id} of traj {spec.traj_id}.")
-            dyn.run(spec.steps, **run_kws)
-            # Calculate number of frames from steps and loginterval
-            loginterval = dyn_kws.get('loginterval', 1)
-            n_frames = spec.steps // loginterval
-
-            # Record chunk metadata in ORM
-            success = self._traj_db.add_chunk_attempt(
-                run_id=self.config.run_id,
-                traj_id=spec.traj_id,
-                chunk_id=spec.chunk_id,
-                model_version=self.model_version,
-                n_frames=n_frames,
-                audit_status=AuditStatus.PENDING,
-                attempt_index=attempt_index
-            )
-            if success:
-                self.logger.info(f"Recorded chunk {spec.chunk_id} of traj {spec.traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
-            else:
-                self.logger.error(f"Failed to record chunk {spec.chunk_id} of traj {spec.traj_id} in database")
-
-            # submit to auditor
-            self.logger.info(f"Submitting audit for chunk {spec.chunk_id} of traj {spec.traj_id}.")
-            await self.auditor.submit(spec)
+        # submit to auditor
+        self.logger.info(f"Submitting audit for chunk {spec.chunk_id} of traj {spec.traj_id}.")
+        await self.auditor.submit(spec)
 
 
 class Auditor(CascadeAgent):
@@ -345,8 +322,6 @@ class Auditor(CascadeAgent):
             await self.sampler.submit(spec)
 
     
-            
-
 class DummySampler(CascadeAgent):
 
     def __init__(

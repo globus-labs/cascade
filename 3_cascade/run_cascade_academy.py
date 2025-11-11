@@ -41,7 +41,7 @@ from cascade.agents.config import (
 from cascade.model import AdvanceSpec
 from cascade.learning.mace import MACEInterface
 from cascade.agents.db_orm import TrajectoryDB
-from cascade.agents.task import random_audit
+from cascade.agents.task import random_audit, advance_dynamics
 
 
 def parse_args() -> argparse.Namespace:
@@ -287,6 +287,8 @@ async def main():
             args=(
                 dynamics_config,
                 auditor_handle,
+                ProcessPoolExecutor(max_workers=10),
+                advance_dynamics,
             ),
             registration=dynamics_reg
         )
