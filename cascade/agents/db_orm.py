@@ -584,6 +584,42 @@ class TrajectoryDB:
                 'n_frames': chunk.n_frames
             }
     
+    def get_latest_chunk_attempt_atoms(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        ase_db: ase.database.connect
+    ) -> list[Atoms]:
+        """Get the ASE atoms for the latest attempt of a chunk
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            ase_db: ASE database connection to query frames from
+        
+        Returns:
+            List of Atoms objects for the latest chunk attempt (empty if none found)
+        """
+        latest_attempt = self.get_latest_chunk_attempt(run_id, traj_id, chunk_id)
+        if not latest_attempt:
+            return []
+        
+        attempt_index = latest_attempt['attempt_index']
+        frames = list(ase_db.select(
+            run_id=run_id,
+            traj_id=traj_id,
+            chunk_id=chunk_id,
+            attempt_index=attempt_index
+        ))
+        
+        if not frames:
+            return []
+        
+        frames.sort(key=lambda row: row.id)
+        return [row.toatoms() for row in frames]
+    
     def is_trajectory_done(
         self,
         run_id: str,
@@ -786,6 +822,8 @@ class TrajectoryDB:
         with self.session() as sess:
             training_frames = sess.query(DBTrainingFrame).filter_by(
                 run_id=run_id
+            ).filter(
+                DBTrainingFrame.training_round.is_(None)
             ).all()
             
             if not training_frames:
@@ -1008,7 +1046,7 @@ class TrajectoryDB:
         self,
         run_id: str,
         ase_db: ase.database.connect
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int]:  # todo mt.2025.11.12: make this more efficient, dont read all frames until you need them
         """Count active trajectories and those with sampled training frames
         
         Args:
@@ -1025,10 +1063,13 @@ class TrajectoryDB:
                 run_id=run_id
             ).all()
             
-            # Get all training frames for this run
-            training_frames = sess.query(DBTrainingFrame).filter_by(
-                run_id=run_id
-            ).all()
+            # Get training frames that haven't been consumed by a training round yet
+            training_frames = [
+                tf for tf in sess.query(DBTrainingFrame).filter_by(
+                    run_id=run_id
+                ).all()
+                if tf.training_round is None
+            ]
             
             # Extract ASE DB IDs while session is active
             ase_db_ids = [tf.ase_db_id for tf in training_frames]

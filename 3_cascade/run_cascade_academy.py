@@ -1,6 +1,6 @@
 import asyncio
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import logging
 import warnings
 import datetime
@@ -24,7 +24,7 @@ from academy.logging import init_logging
 from cascade.agents.dummy import (
     DatabaseMonitor,
     DynamicsEngine,
-    DummyAuditor,
+    Auditor,
     DummySampler,
     DummyLabeler,
     DummyTrainer
@@ -41,6 +41,7 @@ from cascade.agents.config import (
 from cascade.model import AdvanceSpec
 from cascade.learning.mace import MACEInterface
 from cascade.agents.db_orm import TrajectoryDB
+from cascade.agents.task import random_audit, advance_dynamics
 
 
 def parse_args() -> argparse.Namespace:
@@ -199,9 +200,11 @@ async def main():
         a = read(s, index=-1)
         initial_specs.append(
             AdvanceSpec(
-                a,
+                atoms=a,
+                run_id=run_id,
                 traj_id=i,
                 chunk_id=0,
+                attempt_index=0,
                 steps=args.chunk_size
             )
         )
@@ -217,7 +220,7 @@ async def main():
         trainer_reg = await manager.register_agent(DummyTrainer)
         labeler_reg = await manager.register_agent(DummyLabeler)
         sampler_reg = await manager.register_agent(DummySampler)
-        auditor_reg = await manager.register_agent(DummyAuditor)
+        auditor_reg = await manager.register_agent(Auditor)
         dynamics_reg = await manager.register_agent(DynamicsEngine)
 
         # get handles to all agents
@@ -250,7 +253,7 @@ async def main():
         dynamics_config = DynamicsEngineConfig(
             run_id=run_id,
             db_url=args.db_url,
-            init_specs=initial_specs,
+            #init_specs=initial_specs,
             learner=learner,
             weights=init_weights,
             dyn_cls=get_dynamics_cls(args.dyn_cls),
@@ -286,15 +289,20 @@ async def main():
             args=(
                 dynamics_config,
                 auditor_handle,
+                ProcessPoolExecutor(max_workers=10),
+                advance_dynamics,
             ),
             registration=dynamics_reg
         )
         await manager.launch(
-            DummyAuditor,
+            Auditor,
             args=(
                 auditor_config,
                 sampler_handle,
-                dynamics_handle
+                dynamics_handle,
+                random_audit,
+                ProcessPoolExecutor(max_workers=10)
+
             ),
             registration=auditor_reg,
         )
@@ -317,6 +325,10 @@ async def main():
             registration=trainer_reg
         )        
 
+        # submit initial specs to dynamics engine
+        for spec in initial_specs:
+            logger.info(f"Submitting initial spec to dynamics engine: {spec}")
+            await dynamics_handle.submit(spec)
         try:
             await manager.wait([db_handle])
         except KeyboardInterrupt:

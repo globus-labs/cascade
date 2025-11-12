@@ -667,6 +667,24 @@ class TestTrajectoryDB:
         total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run", ase_db)
         assert total_active == 3
         assert with_samples == 2
+
+        # Mark frames for training round 1 so they should no longer count
+        marked = traj_db.mark_training_frames_for_round("test_run", training_round=1)
+        assert marked == 2
+
+        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run", ase_db)
+        assert total_active == 3
+        assert with_samples == 0
+
+        # Add new training frames (round remains None) for trajectories 0 and 1
+        id0_round2 = ase_db.write(atoms0.copy(), run_id="test_run", traj_id=0, chunk_id=0, attempt_index=1)
+        id1_round2 = ase_db.write(atoms1.copy(), run_id="test_run", traj_id=1, chunk_id=0, attempt_index=1)
+        traj_db.add_training_frame("test_run", id0_round2, 0, 0, 0, 0)
+        traj_db.add_training_frame("test_run", id1_round2, 0, 1, 0, 0)
+        
+        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run", ase_db)
+        assert total_active == 3
+        assert with_samples == 2
         
         # Mark trajectory 2 as done by completing target_length frames
         traj_db.add_chunk_attempt("test_run", 2, 0, 0, 100, AuditStatus.PENDING)

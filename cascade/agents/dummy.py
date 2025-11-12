@@ -14,8 +14,10 @@ from asyncio import Queue
 from threading import Event
 import logging
 from functools import cached_property
-from typing import NamedTuple
+from typing import Any, Awaitable, Callable, NamedTuple, Optional, Union
 from collections import namedtuple
+from asyncio import wrap_future  
+from concurrent.futures import Executor, Future
 
 import numpy as np
 import ase
@@ -25,10 +27,12 @@ from academy.handle import Handle
 from academy.agent import Agent, action, loop
 from ase.optimize.optimize import Dynamics
 from mace.calculators import mace_mp
+from parsl.concurrent import ParslPoolExecutor
+from parsl.config import Config
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.utils import canonicalize
-from cascade.model import AuditStatus, AdvanceSpec
+from cascade.model import AuditStatus, AdvanceSpec, AuditResult
 from cascade.agents.config import (
     CascadeAgentConfig,
     DatabaseConfig,
@@ -40,11 +44,12 @@ from cascade.agents.config import (
     DatabaseMonitorConfig
 )
 from cascade.agents.db_orm import TrajectoryDB
+from cascade.model import ChunkSpec, TrainingFrame
 
 
 
-ChunkSpec = namedtuple('ChunkSpec', ['traj_id', 'chunk_id'])
-TrainingFrame = namedtuple('TrainingFrame', ['atoms', 'model_version'])
+ExecutorFuture = Union[Future[Any], asyncio.Future[Any]]
+
 
 class CascadeAgent(Agent):
     """Base class for all cascade agents"""
@@ -52,10 +57,49 @@ class CascadeAgent(Agent):
     def __init__(
         self,
         config: CascadeAgentConfig,
+        executor: Optional[Executor] = None
     ):
         self.config = config
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.executor = executor
+    
+    def schedule_future_callback(
+        self,
+        future: ExecutorFuture,
+        callback: Callable[[ExecutorFuture], Awaitable[None]],
+        *,
+        description: Optional[str] = None
+    ) -> None:
+        """Schedule a coroutine callback after a future completes.
 
+        Args:
+            future: Asyncio or concurrent.futures future to await.
+            callback: Coroutine accepting the completed future.
+            description: Optional identifier for logging.
+        """
+
+        async def _await_and_dispatch() -> None:
+            try:
+                if isinstance(future, asyncio.Future):
+                    await future
+                else:
+                    await wrap_future(future)
+            except Exception:
+                self.logger.exception(
+                    'Executor task %s raised before callback',
+                    description or repr(future),
+                )
+                return
+
+            try:
+                await callback(future)
+            except Exception:
+                self.logger.exception(
+                    'Executor callback %s raised an exception',
+                    getattr(callback, '__qualname__', repr(callback)),
+                )
+
+        asyncio.create_task(_await_and_dispatch())
     @cached_property
     def _db(self):
         """An ASE database object for writing individual frames"""
@@ -73,17 +117,20 @@ class DynamicsEngine(CascadeAgent):
     def __init__(
         self,
         config: DynamicsEngineConfig,
-        auditor: Handle[DummyAuditor]
+        auditor: Handle[Auditor],
+        executor: Executor,
+        advance_dynamics_task: Callable[[AdvanceSpec], None]
     ):
-        super().__init__(config)
+        super().__init__(config, executor)
         self.weights = config.weights  # This needs to be mutable
         self.model_version = 0  # todo: mt.2025.10.20 probably this should be persisted somewhere else
         self.queue = Queue()
         self.auditor = auditor
+        self.advance_dynamics_task = advance_dynamics_task
 
-    async def agent_on_startup(self):
-        for spec in self.config.init_specs:
-            await self.queue.put(spec)
+    # async def agent_on_startup(self):
+    #     for spec in self.config.init_specs:
+    #         await self.queue.put(spec)
 
     @action
     async def receive_weights(self, weights: bytes) -> None:
@@ -93,173 +140,201 @@ class DynamicsEngine(CascadeAgent):
 
     @action
     async def submit(self, spec: AdvanceSpec):
-        self.logger.debug("Received advance spec")
-        await self.queue.put(spec)
-
-    @loop
-    async def advance_dynamics(
+        if isinstance(spec, dict):
+            spec = AdvanceSpec(**spec)
+        self.logger.info(f"Received advance spec for traj {spec.traj_id} chunk {spec.chunk_id}")
+        parsl_future = self.executor.submit(
+                self.advance_dynamics_task,
+                spec=spec,
+                learner=self.config.learner,
+                weights=self.weights,
+                db=self._db,
+                device=self.config.device,
+                dyn_cls=self.config.dyn_cls,
+                dyn_kws=self.config.dyn_kws
+        )
+        self.schedule_future_callback(
+            parsl_future,
+            self._advance_dynamics_callback,
+            description=f'advance dynamics traj {spec.traj_id} chunk {spec.chunk_id}',
+        )
+    async def _advance_dynamics_callback(
         self,
-        shutdown: asyncio.Event
+        future: Future
     ) -> None:
-        """Advance dynamics while there are trajectoires to advance
+        """Handle the results of an advance dynamics call"""
+        if future.exception():
+            self.logger.error('Advance dynamics failed: %s', future.exception())
+            return
+
+        spec = future.result()
+        if isinstance(spec, dict):
+            spec = AdvanceSpec(**spec)
+
+        run_id = spec.run_id
+        traj_id = spec.traj_id
+        chunk_id = spec.chunk_id
+        attempt_index = spec.attempt_index
+        steps = spec.steps
+
+        # Calculate number of frames from steps and loginterval
+        loginterval = self.config.dyn_kws.get('loginterval', 1)
+        n_frames = steps // loginterval
+
+        # Record chunk metadata in ORM
+        success = self._traj_db.add_chunk_attempt(
+            run_id=run_id,
+            traj_id=traj_id,
+            chunk_id=chunk_id,
+            model_version=self.model_version,
+            n_frames=n_frames,
+            audit_status=AuditStatus.PENDING,
+            attempt_index=attempt_index
+        )
+        if success:
+            self.logger.info(f"Recorded chunk {chunk_id} of traj {traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
+        else:
+            self.logger.error(f"Failed to record chunk {chunk_id} of traj {traj_id} in database")
+
+        # submit to auditor
+        self.logger.info(f"Submitting audit for chunk {chunk_id} of traj {traj_id}.")
+        await self.auditor.submit(ChunkSpec(traj_id=traj_id, chunk_id=chunk_id))
 
 
-        questions:
-            * should we have an update model method that locks?
-        """
-        while not shutdown.is_set():
-
-            spec = await self.queue.get()
-
-            atoms = spec.atoms
-            calc = self.config.learner.make_calculator(self.weights, device=self.config.device)
-            atoms.calc = calc
-
-            # Get attempt index before writing frames
-            attempt_index = self._traj_db.get_next_attempt_index(
-                run_id=self.config.run_id,
-                traj_id=spec.traj_id,
-                chunk_id=spec.chunk_id
-            )
-
-            # set up dynamics
-            dyn_kws = self.config.dyn_kws or {}
-            run_kws = self.config.run_kws or {}
-            dyn = self.config.dyn_cls(
-                atoms,
-                **dyn_kws
-            )
-
-            # set up writer
-            def write_to_db():
-                # needs to be 64 bit for db read
-                f = atoms.calc.results['forces']
-                atoms.calc.results['forces'] = f.astype(np.float64)
-                canonical_atoms = canonicalize(atoms)
-                self._db.write(
-                    canonical_atoms, 
-                    chunk_id=spec.chunk_id,
-                    traj_id=spec.traj_id,
-                    run_id=self.config.run_id,
-                    attempt_index=attempt_index)
-            dyn.attach(write_to_db)
-
-            # run dynamics
-            self.logger.info(f"Running dynamics for chunk {spec.chunk_id} of traj {spec.traj_id}.")
-            dyn.run(spec.steps, **run_kws)
-            # Calculate number of frames from steps and loginterval
-            loginterval = dyn_kws.get('loginterval', 1)
-            n_frames = spec.steps // loginterval
-
-            # Record chunk metadata in ORM
-            success = self._traj_db.add_chunk_attempt(
-                run_id=self.config.run_id,
-                traj_id=spec.traj_id,
-                chunk_id=spec.chunk_id,
-                model_version=self.model_version,
-                n_frames=n_frames,
-                audit_status=AuditStatus.PENDING,
-                attempt_index=attempt_index
-            )
-            if success:
-                self.logger.info(f"Recorded chunk {spec.chunk_id} of traj {spec.traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
-            else:
-                self.logger.error(f"Failed to record chunk {spec.chunk_id} of traj {spec.traj_id} in database")
-
-            # submit to auditor
-            self.logger.info(f"Submitting audit for chunk {spec.chunk_id} of traj {spec.traj_id}.")
-            await self.auditor.submit(spec)
-
-
-class DummyAuditor(CascadeAgent):
+class Auditor(CascadeAgent):
 
     def __init__(
             self,
             config: AuditorConfig,
             sampler: Handle[DummySampler],
             dynamics_engine: Handle[DynamicsEngine],
+            audit_task: Callable[[ChunkSpec], AuditResult],
+            executor: Executor
     ):
-        super().__init__(config)
+        super().__init__(config, executor)
         self.sampler = sampler
         self.dynamics_engine = dynamics_engine
         self.queue = Queue()
+        self.audit_task = audit_task
 
     @action
     async def submit(self, chunk_spec: ChunkSpec):
-        self.logger.debug(f'Receieved chunk {chunk_spec.chunk_id} from traj {chunk_spec.traj_id}')
-        await self.queue.put(chunk_spec)
+        """Submit a chunk for audit"""
+        self.logger.debug(f'Received chunk {chunk_spec.chunk_id} from traj {chunk_spec.traj_id}')
 
-    @loop
-    async def audit(
-        self,
-        shutdown: asyncio.Event
-    ) -> None:
-        """a stub of a real audit"""
+        latest_attempt = self._traj_db.get_latest_chunk_attempt(
+            run_id=self.config.run_id,
+            traj_id=chunk_spec.traj_id,
+            chunk_id=chunk_spec.chunk_id
+        )
+        if not latest_attempt:
+            self.logger.warning(
+                'No attempt metadata found for traj %s chunk %s; skipping audit',
+                chunk_spec.traj_id,
+                chunk_spec.chunk_id,
+            )
+            return
+        chunk_atoms = self._traj_db.get_latest_chunk_attempt_atoms(
+            self.config.run_id,
+            chunk_spec.traj_id,
+            chunk_spec.chunk_id,
+            self._db
+        )
+        self.logger.info(f'Submitting audit of chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id} to executor')
+        parsl_future = self.executor.submit(
+            self.audit_task,
+            chunk_atoms=chunk_atoms,
+            chunk_spec=chunk_spec,
+            attempt_index=latest_attempt['attempt_index'],
+        )
+        self.schedule_future_callback(
+            parsl_future,
+            self._audit_callback,
+            description=f'audit traj {chunk_spec.traj_id} chunk {chunk_spec.chunk_id}',
+        )
+    async def _audit_callback(self, future: Future) -> None:
+        """Handle the results of an audit
+    
+        If the audit fails, the chunk is submitted to the sampler.
+        If the audit passes and the trajectory is done, this is recorded in the database.
+        If the audit passes and the trajectory is NOT done, the next chunk is submitted to the dynamics engine.
 
-        while not shutdown.is_set():
-            chunk_spec = await self.queue.get()
-            self.logger.info(f'Auditing chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
+        Args:
+            future: The future that contains the result of the audit
+
+        Returns:
+            None
+        """
+        self.logger.info('Audit callback started')
+        if future.exception():
+            self.logger.error('Audit TASK failed: %s', future.exception())
+            return
+
+        self.logger.info('Getting future result')
+        result = future.result()
+        status = result.status
+        self.logger.info('Audit result status: %s', status)
+
+        if status not in [AuditStatus.PASSED, AuditStatus.FAILED]:
+            self.logger.error('Audit result is not PASSED or FAILED: %s', status)
+            return
+
+        self._traj_db.update_chunk_audit_status(
+            run_id=self.config.run_id,
+            traj_id=result.traj_id,
+            chunk_id=result.chunk_id,
+            attempt_index=result.attempt_index,
+            audit_status=status
+        )
+        
+        if status == AuditStatus.PASSED:
+            self.logger.info(f'Audit passed for chunk {result.chunk_id} of traj {result.traj_id}')
             
-            # Get the latest attempt for this chunk from ORM
-            db_chunk = self._traj_db.get_latest_chunk_attempt(
+            # Check if trajectory is done using the data model
+            done = self._traj_db.is_trajectory_done(
                 run_id=self.config.run_id,
-                traj_id=chunk_spec.traj_id,
-                chunk_id=chunk_spec.chunk_id
+                traj_id=result.traj_id
             )
-            
-            if not db_chunk:
-                self.logger.warning(f"No chunk attempt found for traj {chunk_spec.traj_id}, chunk {chunk_spec.chunk_id}")
-                continue
-            
-            # Perform audit
-            good = np.random.random() < self.config.accept_rate
-            new_status = AuditStatus.PASSED if good else AuditStatus.FAILED
-            
-            # Update audit status in ORM
-            self._traj_db.update_chunk_audit_status(
-                run_id=self.config.run_id,
-                traj_id=chunk_spec.traj_id,
-                chunk_id=chunk_spec.chunk_id,
-                attempt_index=db_chunk['attempt_index'],
-                audit_status=new_status
-            )
-            
-            if good:
-                self.logger.info(f'Audit passed for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
-                
-                # Check if trajectory is done using the data model
-                done = self._traj_db.is_trajectory_done(
-                    run_id=self.config.run_id,
-                    traj_id=chunk_spec.traj_id
-                )
-                if done:
-                    # trajectory done, already marked in db 
-                    self.logger.info(f"Traj {chunk_spec.traj_id} is complete")
-                else:
-                    # Trajectory not done - submit next chunk
-                    # Get the last frame from the current chunk to use as starting point
-                    last_frame = self._traj_db.get_last_frame_from_chunk(
-                        run_id=self.config.run_id,
-                        traj_id=chunk_spec.traj_id,
-                        chunk_id=chunk_spec.chunk_id,
-                        attempt_index=db_chunk['attempt_index'],
-                        ase_db=self._db
-                    )
-                    # Create and submit next advance spec
-                    next_spec = AdvanceSpec(
-                        atoms=last_frame,
-                        traj_id=chunk_spec.traj_id,
-                        chunk_id=chunk_spec.chunk_id + 1,
-                        steps=self.config.chunk_size
-                    )
-                    await self.dynamics_engine.submit(next_spec)
-                    self.logger.info(f"Submitted next chunk {chunk_spec.chunk_id + 1} for traj {chunk_spec.traj_id}")
+            if done:
+                # trajectory done, already marked in db 
+                self.logger.info(f"Traj {result.traj_id} is complete")
             else:
-                # audit failed, submit to sampler
-                self.logger.info(f'Audit failed for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
-                await self.sampler.submit(chunk_spec)
+                # Trajectory not done - submit next chunk
+                # Get the last frame from the current chunk to use as starting point
+                last_frame = self._traj_db.get_last_frame_from_chunk(
+                    run_id=self.config.run_id,
+                    traj_id=result.traj_id,
+                    chunk_id=result.chunk_id,
+                    attempt_index=result.attempt_index,
+                    ase_db=self._db
+                )
+                # Create and submit next advance spec
+                next_chunk_id = result.chunk_id + 1
+                next_attempt_index = self._traj_db.get_next_attempt_index(
+                    run_id=self.config.run_id,
+                    traj_id=result.traj_id,
+                    chunk_id=next_chunk_id
+                )
+                next_spec = AdvanceSpec(
+                    atoms=last_frame,
+                    run_id=self.config.run_id,
+                    traj_id=result.traj_id,
+                    chunk_id=next_chunk_id,
+                    attempt_index=next_attempt_index,
+                    steps=self.config.chunk_size
+                )
+                await self.dynamics_engine.submit(next_spec)
+                self.logger.info(f"Submitted next chunk {result.chunk_id + 1} for traj {result.traj_id}")
+        else:
+            # audit failed, submit to sampler
+            self.logger.info(f'Audit failed for chunk {result.chunk_id} of traj {result.traj_id}')
+            spec = ChunkSpec(
+                traj_id=result.traj_id,
+                chunk_id=result.chunk_id
+            )
+            await self.sampler.submit(spec)
 
-
+    
 class DummySampler(CascadeAgent):
 
     def __init__(
@@ -537,14 +612,24 @@ class DatabaseMonitor(CascadeAgent):
                     
                     if start_frame:
                         # Resubmit the SAME chunk_id (dynamics engine will create a new attempt)
+                        next_attempt_index = self._traj_db.get_next_attempt_index(
+                            run_id=self.config.run_id,
+                            traj_id=traj_id,
+                            chunk_id=chunk_id
+                        )
                         retry_spec = AdvanceSpec(
                             atoms=start_frame,
+                            run_id=self.config.run_id,
                             traj_id=traj_id,
                             chunk_id=chunk_id,  # Same chunk_id, not chunk_id + 1
+                            attempt_index=next_attempt_index,
                             steps=self.config.chunk_size
                         )
                         await self.dynamics_engine.submit(retry_spec)
-                        self.logger.info(f"Resubmitted traj {traj_id}, chunk {chunk_id} for retry (from attempt {attempt_index})")
+                        self.logger.info(
+                            f"Resubmitted traj {traj_id}, chunk {chunk_id} for retry "
+                            f"(from attempt {attempt_index} to attempt {next_attempt_index})"
+                        )
                     else:
                         self.logger.warning(
                             f"Traj {traj_id}: No starting frame found for chunk {chunk_id} "
@@ -552,7 +637,7 @@ class DatabaseMonitor(CascadeAgent):
                         )
                 
                 self.last_train_count = current_count
-                self.logger.info(f"Retraining complete, setting frame count to {self.last_train_count}")
+                self.logger.info(f"Retraining complete, setting frame count to {current_count}")
             else:
                 self.logger.debug(f"Retraining not triggered, sleeping for 5 seconds")
                 await asyncio.sleep(5)
