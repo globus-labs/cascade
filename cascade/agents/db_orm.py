@@ -822,6 +822,8 @@ class TrajectoryDB:
         with self.session() as sess:
             training_frames = sess.query(DBTrainingFrame).filter_by(
                 run_id=run_id
+            ).filter(
+                DBTrainingFrame.training_round.is_(None)
             ).all()
             
             if not training_frames:
@@ -1044,7 +1046,7 @@ class TrajectoryDB:
         self,
         run_id: str,
         ase_db: ase.database.connect
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int]:  # todo mt.2025.11.12: make this more efficient, dont read all frames until you need them
         """Count active trajectories and those with sampled training frames
         
         Args:
@@ -1061,10 +1063,13 @@ class TrajectoryDB:
                 run_id=run_id
             ).all()
             
-            # Get all training frames for this run
-            training_frames = sess.query(DBTrainingFrame).filter_by(
-                run_id=run_id
-            ).all()
+            # Get training frames that haven't been consumed by a training round yet
+            training_frames = [
+                tf for tf in sess.query(DBTrainingFrame).filter_by(
+                    run_id=run_id
+                ).all()
+                if tf.training_round is None
+            ]
             
             # Extract ASE DB IDs while session is active
             ase_db_ids = [tf.ase_db_id for tf in training_frames]

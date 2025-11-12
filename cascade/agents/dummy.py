@@ -142,7 +142,7 @@ class DynamicsEngine(CascadeAgent):
     async def submit(self, spec: AdvanceSpec):
         if isinstance(spec, dict):
             spec = AdvanceSpec(**spec)
-        self.logger.info("Received advance spec for traj {spec.traj_id} chunk {spec.chunk_id}")
+        self.logger.info(f"Received advance spec for traj {spec.traj_id} chunk {spec.chunk_id}")
         parsl_future = self.executor.submit(
                 self.advance_dynamics_task,
                 spec=spec,
@@ -216,7 +216,6 @@ class Auditor(CascadeAgent):
         self.dynamics_engine = dynamics_engine
         self.queue = Queue()
         self.audit_task = audit_task
-        self.rng = config.rng if config.rng else np.random.default_rng()
 
     @action
     async def submit(self, chunk_spec: ChunkSpec):
@@ -247,7 +246,6 @@ class Auditor(CascadeAgent):
             chunk_atoms=chunk_atoms,
             chunk_spec=chunk_spec,
             attempt_index=latest_attempt['attempt_index'],
-            rng=self.rng
         )
         self.schedule_future_callback(
             parsl_future,
@@ -269,16 +267,12 @@ class Auditor(CascadeAgent):
         """
         self.logger.info('Audit callback started')
         if future.exception():
-            self.logger.error('Audit failed: %s', future.exception())
+            self.logger.error('Audit TASK failed: %s', future.exception())
             return
 
         self.logger.info('Getting future result')
         result = future.result()
-        status = getattr(
-            result,
-            'status',
-            None
-        )
+        status = result.status
         self.logger.info('Audit result status: %s', status)
 
         if status not in [AuditStatus.PASSED, AuditStatus.FAILED]:
@@ -293,7 +287,7 @@ class Auditor(CascadeAgent):
             audit_status=status
         )
         
-        if getattr(result, 'passed', False):
+        if status == AuditStatus.PASSED:
             self.logger.info(f'Audit passed for chunk {result.chunk_id} of traj {result.traj_id}')
             
             # Check if trajectory is done using the data model
@@ -643,7 +637,7 @@ class DatabaseMonitor(CascadeAgent):
                         )
                 
                 self.last_train_count = current_count
-                self.logger.info(f"Retraining complete, setting frame count to {self.last_train_count}")
+                self.logger.info(f"Retraining complete, setting frame count to {current_count}")
             else:
                 self.logger.debug(f"Retraining not triggered, sleeping for 5 seconds")
                 await asyncio.sleep(5)

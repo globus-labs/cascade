@@ -9,15 +9,12 @@ if TYPE_CHECKING:
     from ase import Atoms
 from ase.optimize.optimize import Dynamics
 
-import numpy as np
-
 # can make this a classmethod on some audittask class
 # to get some shared informaiton and inheritance
 def random_audit(
     chunk_atoms: list[Atoms],
     chunk_spec: ChunkSpec,
     attempt_index: int,
-    rng: np.random.RandomState,
     accept_prob: float = 0.5,
     sleep_time: float = 0.,
 ) -> AuditResult:
@@ -27,10 +24,11 @@ def random_audit(
     """
     from cascade.model import AuditResult, AuditStatus
     import time
+    import numpy as np
 
     time.sleep(sleep_time)
-    passed = rng.random() < accept_prob
-    score = rng.random() if passed else 0.0
+    passed = np.random.random() < accept_prob
+    score = np.random.random() if passed else 0.0
     status = AuditStatus.PASSED if passed else AuditStatus.FAILED
     return AuditResult(status=status, score=score, traj_id=chunk_spec.traj_id, chunk_id=chunk_spec.chunk_id, attempt_index=attempt_index)
 
