@@ -36,6 +36,12 @@ class AuditStatus(Enum):
     FAILED = auto()
     PASSED = auto()
 
+class TrajectoryStatus(Enum):
+    """Lifecycle state for a trajectory."""
+    RUNNING = auto()
+    COMPLETED = auto()
+    FAILED = auto()
+
 @dataclass
 class TrajectorySpec:
     """Enough information to initialize a trajectory"""

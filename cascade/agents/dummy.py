@@ -10,11 +10,13 @@ In addition to de-stubbing, we have the following todos:
 from __future__ import annotations
 
 import asyncio
+import inspect
 from asyncio import Queue
 from threading import Event
 import logging
+from dataclasses import replace
 from functools import cached_property
-from typing import Any, Awaitable, Callable, NamedTuple, Optional, Union
+from typing import Any, Awaitable, Callable, NamedTuple, Optional, Union, cast
 from collections import namedtuple
 from asyncio import wrap_future  
 from concurrent.futures import Executor, Future
@@ -32,7 +34,7 @@ from parsl.config import Config
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.utils import canonicalize
-from cascade.model import AuditStatus, AdvanceSpec, AuditResult
+from cascade.model import AuditStatus, AdvanceSpec, AuditResult, TrajectoryStatus
 from cascade.agents.config import (
     CascadeAgentConfig,
     DatabaseConfig,
@@ -68,38 +70,92 @@ class CascadeAgent(Agent):
         future: ExecutorFuture,
         callback: Callable[[ExecutorFuture], Awaitable[None]],
         *,
-        description: Optional[str] = None
+        description: Optional[str] = None,
+        max_attempts: int = 1,
+        retry_delay: float = 0.0,
+        resubmit: Optional[Callable[[int], Union[ExecutorFuture, Awaitable[ExecutorFuture]]]] = None,
+        on_retry: Optional[Callable[[int, Exception], Awaitable[None]]] = None,
+        on_exhausted: Optional[Callable[[Exception], Awaitable[None]]] = None,
     ) -> None:
-        """Schedule a coroutine callback after a future completes.
+        """Schedule a coroutine callback after a future completes, with retries.
 
         Args:
             future: Asyncio or concurrent.futures future to await.
             callback: Coroutine accepting the completed future.
             description: Optional identifier for logging.
+            max_attempts: Total attempts allowed (including the initial one).
+            retry_delay: Seconds to wait before resubmitting.
+            resubmit: Callable returning a fresh future for retries.
+            on_retry: Optional hook invoked before a retry.
+            on_exhausted: Optional hook invoked when retries are exhausted.
         """
 
-        async def _await_and_dispatch() -> None:
+        async def _maybe_await(value: Union[ExecutorFuture, Awaitable[ExecutorFuture]]) -> ExecutorFuture:
+            """Ensure the resubmit hook yields a future, awaiting when necessary."""
+            if isinstance(value, (asyncio.Future, Future)):
+                return value
+            if inspect.isawaitable(value):
+                awaited = await value
+                if isinstance(awaited, (asyncio.Future, Future)):
+                    return awaited
+                return cast(ExecutorFuture, awaited)
+            return cast(ExecutorFuture, value)
+
+        async def _await_future(fut: ExecutorFuture) -> None:
+            if isinstance(fut, asyncio.Future):
+                await fut
+            else:
+                await wrap_future(fut)
+
+        async def _handle_retry(attempt: int, exc: Exception) -> None:
+            if attempt >= max_attempts or resubmit is None:
+                if on_exhausted is not None:
+                    await on_exhausted(exc)
+                return
+
+            next_attempt = attempt + 1
+
+            if on_retry is not None:
+                await on_retry(next_attempt, exc)
+
+            if retry_delay > 0:
+                await asyncio.sleep(retry_delay)
+
             try:
-                if isinstance(future, asyncio.Future):
-                    await future
-                else:
-                    await wrap_future(future)
-            except Exception:
+                new_future = await _maybe_await(resubmit(next_attempt))
+            except Exception as resubmit_exc:
+                self.logger.exception(
+                    'Executor resubmit %s failed',
+                    description or repr(callback),
+                )
+                if on_exhausted is not None:
+                    await on_exhausted(resubmit_exc)
+                return
+
+            asyncio.create_task(_run_attempt(next_attempt, new_future))
+
+        async def _run_attempt(attempt: int, fut: ExecutorFuture) -> None:
+            try:
+                await _await_future(fut)
+            except Exception as exc:
                 self.logger.exception(
                     'Executor task %s raised before callback',
-                    description or repr(future),
+                    description or repr(fut),
                 )
+                await _handle_retry(attempt, exc)
                 return
 
             try:
-                await callback(future)
-            except Exception:
+                await callback(fut)
+            except Exception as exc:
                 self.logger.exception(
                     'Executor callback %s raised an exception',
                     getattr(callback, '__qualname__', repr(callback)),
                 )
+                await _handle_retry(attempt, exc)
+                return
 
-        asyncio.create_task(_await_and_dispatch())
+        asyncio.create_task(_run_attempt(1, future))
     @cached_property
     def _db(self):
         """An ASE database object for writing individual frames"""
@@ -142,21 +198,76 @@ class DynamicsEngine(CascadeAgent):
     async def submit(self, spec: AdvanceSpec):
         if isinstance(spec, dict):
             spec = AdvanceSpec(**spec)
-        self.logger.info(f"Received advance spec for traj {spec.traj_id} chunk {spec.chunk_id}")
-        parsl_future = self.executor.submit(
+        current_spec = spec
+        self._traj_db.mark_trajectory_running(self.config.run_id, current_spec.traj_id)
+        self.logger.info(f"Received advance spec for traj {current_spec.traj_id} chunk {current_spec.chunk_id}")
+        description = f'advance dynamics traj {current_spec.traj_id} chunk {current_spec.chunk_id}'
+
+        def _submit_spec(spec_to_run: AdvanceSpec) -> ExecutorFuture:
+            return self.executor.submit(
                 self.advance_dynamics_task,
-                spec=spec,
+                spec=spec_to_run,
                 learner=self.config.learner,
                 weights=self.weights,
                 db=self._db,
                 device=self.config.device,
                 dyn_cls=self.config.dyn_cls,
                 dyn_kws=self.config.dyn_kws
-        )
+            )
+
+        initial_future = _submit_spec(current_spec)
+
+        max_attempts = max(1, getattr(self.config, 'executor_max_attempts', 3))
+        retry_delay = getattr(self.config, 'executor_retry_delay', 0.0)
+
+        def _resubmit(attempt_no: int) -> ExecutorFuture:
+            nonlocal current_spec
+            next_attempt_index = self._traj_db.get_next_attempt_index(
+                run_id=self.config.run_id,
+                traj_id=current_spec.traj_id,
+                chunk_id=current_spec.chunk_id
+            )
+            retry_spec = replace(current_spec, attempt_index=next_attempt_index)
+            current_spec = retry_spec
+            self.logger.warning(
+                'Retrying %s (attempt %d/%d, chunk attempt_index=%d)',
+                description,
+                attempt_no,
+                max_attempts,
+                next_attempt_index,
+            )
+            return _submit_spec(retry_spec)
+
+        async def _on_retry(attempt_no: int, exc: Exception) -> None:
+            self.logger.warning(
+                'Retry %d/%d for %s due to %s',
+                attempt_no,
+                max_attempts,
+                description,
+                exc,
+            )
+
+        async def _on_exhausted(exc: Exception) -> None:
+            self._traj_db.mark_trajectory_failed(
+                run_id=self.config.run_id,
+                traj_id=current_spec.traj_id,
+            )
+            self.logger.error(
+                'Giving up on %s after %d attempts: %s',
+                description,
+                max_attempts,
+                exc,
+            )
+
         self.schedule_future_callback(
-            parsl_future,
+            initial_future,
             self._advance_dynamics_callback,
-            description=f'advance dynamics traj {spec.traj_id} chunk {spec.chunk_id}',
+            description=description,
+            max_attempts=max_attempts,
+            retry_delay=retry_delay,
+            resubmit=_resubmit,
+            on_retry=_on_retry,
+            on_exhausted=_on_exhausted,
         )
     async def _advance_dynamics_callback(
         self,
@@ -241,16 +352,67 @@ class Auditor(CascadeAgent):
             self._db
         )
         self.logger.info(f'Submitting audit of chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id} to executor')
-        parsl_future = self.executor.submit(
-            self.audit_task,
-            chunk_atoms=chunk_atoms,
-            chunk_spec=chunk_spec,
-            attempt_index=latest_attempt['attempt_index'],
-        )
+        description = f'audit traj {chunk_spec.traj_id} chunk {chunk_spec.chunk_id}'
+
+        def _submit_audit() -> ExecutorFuture:
+            return self.executor.submit(
+                self.audit_task,
+                chunk_atoms=chunk_atoms,
+                chunk_spec=chunk_spec,
+                attempt_index=latest_attempt['attempt_index'],
+            )
+
+        initial_future = _submit_audit()
+
+        max_attempts = max(1, getattr(self.config, 'executor_max_attempts', 3))
+        retry_delay = getattr(self.config, 'executor_retry_delay', 0.0)
+
+        def _resubmit(attempt_no: int) -> ExecutorFuture:
+            self.logger.warning(
+                'Retrying %s (attempt %d/%d)',
+                description,
+                attempt_no,
+                max_attempts,
+            )
+            return _submit_audit()
+
+        async def _on_retry(attempt_no: int, exc: Exception) -> None:
+            self.logger.warning(
+                'Retry %d/%d for %s due to %s',
+                attempt_no,
+                max_attempts,
+                description,
+                exc,
+            )
+
+        async def _on_exhausted(exc: Exception) -> None:
+            self._traj_db.update_chunk_audit_status(
+                run_id=self.config.run_id,
+                traj_id=chunk_spec.traj_id,
+                chunk_id=chunk_spec.chunk_id,
+                attempt_index=latest_attempt['attempt_index'],
+                audit_status=AuditStatus.FAILED,
+            )
+            self._traj_db.mark_trajectory_failed(
+                run_id=self.config.run_id,
+                traj_id=chunk_spec.traj_id,
+            )
+            self.logger.error(
+                'Giving up on %s after %d attempts: %s',
+                description,
+                max_attempts,
+                exc,
+            )
+
         self.schedule_future_callback(
-            parsl_future,
+            initial_future,
             self._audit_callback,
-            description=f'audit traj {chunk_spec.traj_id} chunk {chunk_spec.chunk_id}',
+            description=description,
+            max_attempts=max_attempts,
+            retry_delay=retry_delay,
+            resubmit=_resubmit,
+            on_retry=_on_retry,
+            on_exhausted=_on_exhausted,
         )
     async def _audit_callback(self, future: Future) -> None:
         """Handle the results of an audit
@@ -265,9 +427,9 @@ class Auditor(CascadeAgent):
         Returns:
             None
         """
-        self.logger.info('Audit callback started')
+        self.logger.debug('Audit callback started')
         if future.exception():
-            self.logger.error('Audit TASK failed: %s', future.exception())
+            self.logger.error('Audit task failed: %s', future.exception())
             return
 
         self.logger.info('Getting future result')
@@ -500,9 +662,12 @@ class DatabaseMonitor(CascadeAgent):
                 await asyncio.sleep(1)
                 continue
             
-            all_done = all(traj['done'] for traj in trajectories)
+            all_finished = all(
+                traj['status'] in (TrajectoryStatus.COMPLETED, TrajectoryStatus.FAILED)
+                for traj in trajectories
+            )
             
-            if all_done:
+            if all_finished:
                 self.logger.info("All trajs done, setting shutdown")
                 shutdown.set()
                 return

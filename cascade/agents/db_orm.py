@@ -32,7 +32,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import relationship, sessionmaker, declarative_base
-from cascade.model import AuditStatus
+from cascade.model import AuditStatus, TrajectoryStatus
 
 Base = declarative_base()
 
@@ -46,7 +46,8 @@ class DBTrajectory(Base):
     traj_id = Column(Integer, nullable=False)
     target_length = Column(Integer, nullable=False)
     chunks_completed = Column(Integer, default=0, nullable=False)
-    done = Column(Boolean, default=False, nullable=False)
+    done = Column(Boolean, default=False, nullable=False)  # legacy flag
+    status = Column(SQLEnum(TrajectoryStatus), nullable=False, default=TrajectoryStatus.RUNNING)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -61,7 +62,10 @@ class DBTrajectory(Base):
     )
 
     def __repr__(self):
-        return f"<DBTrajectory(run_id={self.run_id}, traj_id={self.traj_id}, chunks_completed={self.chunks_completed})>"
+        return (
+            f"<DBTrajectory(run_id={self.run_id}, traj_id={self.traj_id}, "
+            f"status={self.status.name}, chunks_completed={self.chunks_completed})>"
+        )
 
 
 class DBTrajectoryChunk(Base):
@@ -146,6 +150,59 @@ class TrajectoryDB:
         finally:
             session.close()
     
+    def _sync_trajectory_done_flag(self, traj: DBTrajectory) -> None:
+        """Keep legacy boolean in sync with enum-based trajectory status."""
+        traj.done = traj.status == TrajectoryStatus.COMPLETED
+
+    def _set_trajectory_status(
+        self,
+        sess,
+        traj: DBTrajectory,
+        status: TrajectoryStatus,
+    ) -> None:
+        """Internal helper to update trajectory status and maintain derived fields."""
+        previous_status = traj.status
+        previous_done = traj.done
+        if previous_status != status:
+            traj.status = status
+        self._sync_trajectory_done_flag(traj)
+        if previous_status != traj.status or previous_done != traj.done:
+            sess.flush()
+
+    def mark_trajectory_status(
+        self,
+        run_id: str,
+        traj_id: int,
+        status: TrajectoryStatus,
+    ) -> bool:
+        """Set the lifecycle status for a trajectory."""
+        with self.session() as sess:
+            traj = sess.query(DBTrajectory).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+            ).first()
+            if not traj:
+                logger.warning(
+                    "Attempted to update status for missing trajectory %s/%s",
+                    run_id,
+                    traj_id,
+                )
+                return False
+            self._set_trajectory_status(sess, traj, status)
+            return True
+
+    def mark_trajectory_running(self, run_id: str, traj_id: int) -> bool:
+        """Mark a trajectory as actively running."""
+        return self.mark_trajectory_status(run_id, traj_id, TrajectoryStatus.RUNNING)
+
+    def mark_trajectory_failed(self, run_id: str, traj_id: int) -> bool:
+        """Mark a trajectory as failed."""
+        return self.mark_trajectory_status(run_id, traj_id, TrajectoryStatus.FAILED)
+
+    def mark_trajectory_completed(self, run_id: str, traj_id: int) -> bool:
+        """Mark a trajectory as completed."""
+        return self.mark_trajectory_status(run_id, traj_id, TrajectoryStatus.COMPLETED)
+    
     def initialize_trajectory(
         self,
         run_id: str,
@@ -189,10 +246,12 @@ class TrajectoryDB:
                     traj_id=traj_id,
                     target_length=target_length,
                     chunks_completed=0,
-                    init_atoms_json=init_atoms_json
+                    init_atoms_json=init_atoms_json,
+                    status=TrajectoryStatus.RUNNING,
+                    done=False,
                 )
                 sess.add(db_traj)
-                sess.flush()
+                self._set_trajectory_status(sess, db_traj, TrajectoryStatus.RUNNING)
                 return True
         except Exception as e:
             logger.error(f"Failed to initialize trajectory {traj_id} for run {run_id}: {e}")
@@ -271,7 +330,9 @@ class TrajectoryDB:
                     n_frames=n_frames
                 )
                 sess.add(db_chunk)
-                sess.flush()
+
+                # Ensure trajectory marked running if new chunk attempt created
+                self._set_trajectory_status(sess, db_traj, TrajectoryStatus.RUNNING)
                 return True
         except Exception as e:
             logger.error(f"Failed to add chunk attempt for traj {traj_id}, chunk {chunk_id}, attempt {attempt_index}: {e}")
@@ -336,8 +397,12 @@ class TrajectoryDB:
                             audit_status=AuditStatus.PASSED
                         ).all()
                         total_frames = sum(chunk.n_frames for chunk in passed_chunks)
-                        if total_frames >= traj.target_length:
-                            traj.done = True
+                        new_status = (
+                            TrajectoryStatus.COMPLETED
+                            if total_frames >= traj.target_length
+                            else TrajectoryStatus.RUNNING
+                        )
+                        self._set_trajectory_status(sess, traj, new_status)
     
     def get_latest_passed_chunk(
         self,
@@ -481,6 +546,7 @@ class TrajectoryDB:
                 'traj_id': traj.traj_id,
                 'target_length': traj.target_length,
                 'chunks_completed': traj.chunks_completed,
+                'status': traj.status,
                 'init_atoms_json': traj.init_atoms_json,
                 'created_at': traj.created_at,
                 'updated_at': traj.updated_at
@@ -643,8 +709,22 @@ class TrajectoryDB:
             if not traj:
                 return False
             
-            # Return the stored done flag
-            return traj.done
+            return traj.status == TrajectoryStatus.COMPLETED
+
+    def get_trajectory_status(
+        self,
+        run_id: str,
+        traj_id: int,
+    ) -> Optional[TrajectoryStatus]:
+        """Return the lifecycle status for a trajectory, if it exists."""
+        with self.session() as sess:
+            traj = sess.query(DBTrajectory).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+            ).first()
+            if not traj:
+                return None
+            return traj.status
     
     def get_first_frame_from_chunk(
         self,
@@ -1076,7 +1156,7 @@ class TrajectoryDB:
             
             # Extract trajectory info while session is active to avoid DetachedInstanceError
             trajectory_info = [
-                {'traj_id': traj.traj_id, 'target_length': traj.target_length, 'done': traj.done}
+                {'traj_id': traj.traj_id, 'status': traj.status}
                 for traj in all_trajectories
             ]
         
@@ -1098,7 +1178,7 @@ class TrajectoryDB:
         
         for traj_info in trajectory_info:
             # Check if trajectory is active (not done)
-            if not traj_info['done']:
+            if traj_info['status'] == TrajectoryStatus.RUNNING:
                 active_count += 1
                 # Check if this trajectory has been sampled from
                 if traj_info['traj_id'] in sampled_traj_ids:
@@ -1364,7 +1444,7 @@ class TrajectoryDB:
         Returns:
             List of dicts with trajectory metadata, sorted by traj_id.
             Each dict contains:
-                - traj_id, target_length, chunks_completed, done
+                - traj_id, target_length, chunks_completed, status, done
                 - created_at, updated_at
         """
         with self.session() as sess:
@@ -1378,6 +1458,7 @@ class TrajectoryDB:
                     'traj_id': traj.traj_id,
                     'target_length': traj.target_length,
                     'chunks_completed': traj.chunks_completed,
+                    'status': traj.status,
                     'done': traj.done,
                     'created_at': traj.created_at,
                     'updated_at': traj.updated_at
