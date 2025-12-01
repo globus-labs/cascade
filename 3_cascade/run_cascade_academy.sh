@@ -1,5 +1,11 @@
+#strace -f -e trace=process,open,openat,close,socket,connect,accept \
+#    -o trace.log \
 python run_cascade_academy.py \
     --initial-structures \
+        ../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp \
+        ../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp \
+        ../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp \
+        ../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp \
         ../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp \
         ../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp \
         ../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp \

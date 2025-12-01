@@ -36,7 +36,7 @@ def advance_dynamics(
     spec: AdvanceSpec,
     learner: BaseLearnableForcefield,
     weights: bytes,
-    db: connect,
+    db_url: str,
     device: str = 'cpu',
     dyn_cls: type[Dynamics] = Dynamics,
     dyn_kws: dict[str, object] = {},
@@ -48,6 +48,10 @@ def advance_dynamics(
     """
     import numpy as np
     from cascade.utils import canonicalize
+    from ase.db import connect
+    
+    # Create database connection in worker process to avoid FD leaks
+    db = connect(db_url)
     
     atoms = spec.atoms
     calc = learner.make_calculator(weights, device=device)
@@ -60,12 +64,30 @@ def advance_dynamics(
         f = atoms.calc.results['forces']
         atoms.calc.results['forces'] = f.astype(np.float64)
         canonical_atoms = canonicalize(atoms)
-        db.write(
-            canonical_atoms, 
-            chunk_id=spec.chunk_id,
-            traj_id=spec.traj_id,
-            run_id=spec.run_id,
-            attempt_index=spec.attempt_index)
+        
+        # Retry logic for foreign key constraint violations (race conditions)
+        max_retries = 3
+        import time
+        import psycopg2.errors
+        
+        for attempt in range(max_retries):
+            try:
+                db.write(
+                    canonical_atoms, 
+                    chunk_id=spec.chunk_id,
+                    traj_id=spec.traj_id,
+                    run_id=spec.run_id,
+                    attempt_index=spec.attempt_index)
+                break  # Success, exit retry loop
+            except psycopg2.errors.ForeignKeyViolation as e:
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 0.1s, 0.2s, 0.4s
+                    sleep_time = 0.1 * (2 ** attempt)
+                    time.sleep(sleep_time)
+                    continue
+                else:
+                    # Last attempt failed, re-raise the exception
+                    raise
     dyn.attach(write_to_db)
 
     dyn.run(spec.steps, **run_kws)

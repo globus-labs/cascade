@@ -10,17 +10,16 @@ In addition to de-stubbing, we have the following todos:
 from __future__ import annotations
 
 import asyncio
-import inspect
 from asyncio import Queue
 from threading import Event
 import logging
-from dataclasses import replace
 from functools import cached_property
 from typing import Any, Awaitable, Callable, NamedTuple, Optional, Union, cast
 from collections import namedtuple
 from asyncio import wrap_future  
 from concurrent.futures import Executor, Future
 
+import os
 import numpy as np
 import ase
 from ase.db import connect
@@ -31,6 +30,14 @@ from ase.optimize.optimize import Dynamics
 from mace.calculators import mace_mp
 from parsl.concurrent import ParslPoolExecutor
 from parsl.config import Config
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+    _PSUTIL_WARNING_LOGGED = False
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    _PSUTIL_WARNING_LOGGED = False
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.utils import canonicalize
@@ -53,8 +60,130 @@ from cascade.model import ChunkSpec, TrainingFrame
 ExecutorFuture = Union[Future[Any], asyncio.Future[Any]]
 
 
+def count_file_descriptors_by_type() -> dict:
+    """Count open file descriptors by type for the current process
+    
+    Returns:
+        Dict with counts by FD type (REG, PIPE, IPv4, IPv6, etc.)
+    """
+    import os
+    import subprocess
+    
+    try:
+        pid = os.getpid()
+        # Use lsof to get FD types (works on Linux)
+        result = subprocess.run(
+            ['lsof', '-p', str(pid), '-F', 't'],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        
+        if result.returncode != 0:
+            return {'error': 'lsof failed or not available'}
+        
+        # Count by type (lines starting with 't' are type indicators)
+        type_counts = {}
+        for line in result.stdout.split('\n'):
+            if line.startswith('t'):
+                fd_type = line[1:]  # Remove 't' prefix
+                type_counts[fd_type] = type_counts.get(fd_type, 0) + 1
+        
+        # Also get total count from /proc
+        try:
+            fd_dir = f'/proc/{pid}/fd'
+            if os.path.exists(fd_dir):
+                total_fds = len(os.listdir(fd_dir))
+                type_counts['total'] = total_fds
+        except (OSError, PermissionError):
+            pass
+        
+        return type_counts
+    except FileNotFoundError:
+        return {'error': 'lsof command not found'}
+    except Exception as e:
+        return {'error': f'Exception counting FDs: {e}'}
+
+
+def check_executor_workers(executor: Executor) -> dict:
+    """Check health of ProcessPoolExecutor worker processes
+    
+    Args:
+        executor: ProcessPoolExecutor instance (or any Executor)
+        
+    Returns:
+        Dict with worker process health info, or error dict if unavailable
+    """
+    global _PSUTIL_WARNING_LOGGED
+    if not PSUTIL_AVAILABLE:
+        if not _PSUTIL_WARNING_LOGGED:
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "psutil not available - cannot monitor executor worker health. "
+                "Install psutil to enable worker process monitoring."
+            )
+            _PSUTIL_WARNING_LOGGED = True
+        return {'error': 'psutil not available'}
+    
+    # Only check ProcessPoolExecutor, skip others
+    from concurrent.futures import ProcessPoolExecutor
+    if not isinstance(executor, ProcessPoolExecutor):
+        return {'skipped': 'Not a ProcessPoolExecutor'}
+    
+    try:
+        if not hasattr(executor, '_processes'):
+            return {'error': 'Cannot access executor processes'}
+        
+        alive = 0
+        dead = 0
+        zombies = 0
+        worker_pids = []
+        
+        for proc in executor._processes.values():
+            if proc is None:
+                continue
+            
+            try:
+                pid = proc.pid
+                worker_pids.append(pid)
+                p = psutil.Process(pid)
+                status = p.status()
+                
+                if status == psutil.STATUS_ZOMBIE:
+                    zombies += 1
+                elif p.is_running():
+                    alive += 1
+                else:
+                    dead += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                dead += 1
+            except Exception as e:
+                # Catch any other unexpected exceptions from psutil
+                logging.getLogger(__name__).debug(f"Error checking process {proc.pid if hasattr(proc, 'pid') else 'unknown'}: {e}")
+                dead += 1
+        
+        return {
+            'alive': alive,
+            'dead': dead,
+            'zombies': zombies,
+            'worker_pids': worker_pids,
+            'total_workers': len(executor._processes)
+        }
+    except Exception as e:
+        # Catch any unexpected exceptions (e.g., AttributeError accessing _processes)
+        logging.getLogger(__name__).debug(f"Error in check_executor_workers: {e}")
+        return {'error': f'Exception checking workers: {e}'}
+
+
 class CascadeAgent(Agent):
     """Base class for all cascade agents"""
+    
+    # Track resource creation across all agents
+    _resource_counts = {
+        'agents_created': 0,
+        'db_connections_created': 0,
+        'traj_db_instances_created': 0,
+    }
 
     def __init__(
         self,
@@ -64,6 +193,10 @@ class CascadeAgent(Agent):
         self.config = config
         self.logger = logging.getLogger(self.__class__.__name__)
         self.executor = executor
+        CascadeAgent._resource_counts['agents_created'] += 1
+        self.logger.debug(
+            f"Agent created. Total agents: {CascadeAgent._resource_counts['agents_created']}"
+        )
     
     def schedule_future_callback(
         self,
@@ -71,35 +204,14 @@ class CascadeAgent(Agent):
         callback: Callable[[ExecutorFuture], Awaitable[None]],
         *,
         description: Optional[str] = None,
-        max_attempts: int = 1,
-        retry_delay: float = 0.0,
-        resubmit: Optional[Callable[[int], Union[ExecutorFuture, Awaitable[ExecutorFuture]]]] = None,
-        on_retry: Optional[Callable[[int, Exception], Awaitable[None]]] = None,
-        on_exhausted: Optional[Callable[[Exception], Awaitable[None]]] = None,
     ) -> None:
-        """Schedule a coroutine callback after a future completes, with retries.
+        """Schedule a coroutine callback after a future completes.
 
         Args:
             future: Asyncio or concurrent.futures future to await.
             callback: Coroutine accepting the completed future.
             description: Optional identifier for logging.
-            max_attempts: Total attempts allowed (including the initial one).
-            retry_delay: Seconds to wait before resubmitting.
-            resubmit: Callable returning a fresh future for retries.
-            on_retry: Optional hook invoked before a retry.
-            on_exhausted: Optional hook invoked when retries are exhausted.
         """
-
-        async def _maybe_await(value: Union[ExecutorFuture, Awaitable[ExecutorFuture]]) -> ExecutorFuture:
-            """Ensure the resubmit hook yields a future, awaiting when necessary."""
-            if isinstance(value, (asyncio.Future, Future)):
-                return value
-            if inspect.isawaitable(value):
-                awaited = await value
-                if isinstance(awaited, (asyncio.Future, Future)):
-                    return awaited
-                return cast(ExecutorFuture, awaited)
-            return cast(ExecutorFuture, value)
 
         async def _await_future(fut: ExecutorFuture) -> None:
             if isinstance(fut, asyncio.Future):
@@ -107,66 +219,102 @@ class CascadeAgent(Agent):
             else:
                 await wrap_future(fut)
 
-        async def _handle_retry(attempt: int, exc: Exception) -> None:
-            if attempt >= max_attempts or resubmit is None:
-                if on_exhausted is not None:
-                    await on_exhausted(exc)
-                return
-
-            next_attempt = attempt + 1
-
-            if on_retry is not None:
-                await on_retry(next_attempt, exc)
-
-            if retry_delay > 0:
-                await asyncio.sleep(retry_delay)
-
+        async def _run_callback() -> None:
             try:
-                new_future = await _maybe_await(resubmit(next_attempt))
-            except Exception as resubmit_exc:
-                self.logger.exception(
-                    'Executor resubmit %s failed',
-                    description or repr(callback),
-                )
-                if on_exhausted is not None:
-                    await on_exhausted(resubmit_exc)
-                return
-
-            asyncio.create_task(_run_attempt(next_attempt, new_future))
-
-        async def _run_attempt(attempt: int, fut: ExecutorFuture) -> None:
-            try:
-                await _await_future(fut)
+                await _await_future(future)
             except Exception as exc:
                 self.logger.exception(
                     'Executor task %s raised before callback',
-                    description or repr(fut),
+                    description or repr(future),
                 )
-                await _handle_retry(attempt, exc)
                 return
 
             try:
-                await callback(fut)
+                await callback(future)
             except Exception as exc:
                 self.logger.exception(
                     'Executor callback %s raised an exception',
                     getattr(callback, '__qualname__', repr(callback)),
                 )
-                await _handle_retry(attempt, exc)
-                return
 
-        asyncio.create_task(_run_attempt(1, future))
+        asyncio.create_task(_run_callback())
     @cached_property
     def _db(self):
         """An ASE database object for writing individual frames"""
-        return connect(self.config.db_url)
+        CascadeAgent._resource_counts['db_connections_created'] += 1
+        self.logger.info(
+            f"Creating ASE database connection #{CascadeAgent._resource_counts['db_connections_created']} "
+            f"for {self.__class__.__name__}"
+        )
+        db = connect(self.config.db_url)
+        self.logger.debug(f"ASE database connection created: id={id(db)}")
+        return db
     
     @cached_property
     def _traj_db(self) -> TrajectoryDB:
         """A TrajectoryDB object for managing trajectory and chunk metadata"""
-        traj_db = TrajectoryDB(self.config.db_url)
+        CascadeAgent._resource_counts['traj_db_instances_created'] += 1
+        self.logger.info(
+            f"Creating TrajectoryDB instance #{CascadeAgent._resource_counts['traj_db_instances_created']} "
+            f"for {self.__class__.__name__}"
+        )
+        traj_db = TrajectoryDB(self.config.db_url, logger=self.logger)
         traj_db.create_tables()  # Ensure tables exist
         return traj_db
+
+    @loop
+    async def monitor_executor_health(self, shutdown: asyncio.Event) -> None:
+        """Periodically check executor worker process health"""
+        self.logger.info(f"Monitoring executor health for {self.config.run_id}")
+        while not shutdown.is_set():
+            try:
+                # Check if executor exists
+                if self.executor is None:
+                    self.logger.debug("Executor is None, skipping health check")
+                    await asyncio.sleep(30)
+                    continue
+                
+                # Get worker health status
+                worker_health = check_executor_workers(self.executor)
+                self.logger.info(f"check result: {worker_health}")
+                
+                # Handle errors or skipped checks
+                if 'error' in worker_health:
+                    self.logger.debug(f"Executor health check error: {worker_health['error']}")
+                    await asyncio.sleep(30)
+                    continue
+                
+                if 'skipped' in worker_health:
+                    self.logger.debug(f"Executor health check skipped: {worker_health['skipped']}")
+                    await asyncio.sleep(30)
+                    continue
+                
+                # Check for zombie processes
+                zombies = worker_health.get('zombies', 0)
+                if zombies > 0:
+                    self.logger.warning(
+                        f"Found {zombies} zombie worker processes: {worker_health}"
+                    )
+                    await asyncio.sleep(30)
+                    continue
+                
+                # Check for many dead workers
+                dead = worker_health.get('dead', 0)
+                alive = worker_health.get('alive', 0)
+                if dead > alive:
+                    self.logger.warning(
+                        f"Many dead workers detected: {worker_health}. Consider recreating executor."
+                    )
+                    await asyncio.sleep(30)
+                    continue
+                
+                # All good - log normal health status
+                self.logger.info(f"Executor worker health: {worker_health}")
+                
+            except Exception as e:
+                self.logger.exception(f"Error in executor health monitoring: {e}")
+            
+            await asyncio.sleep(30)  # Check every 30 seconds
 
 class DynamicsEngine(CascadeAgent):
 
@@ -209,7 +357,7 @@ class DynamicsEngine(CascadeAgent):
                 spec=spec_to_run,
                 learner=self.config.learner,
                 weights=self.weights,
-                db=self._db,
+                db_url=self.config.db_url,
                 device=self.config.device,
                 dyn_cls=self.config.dyn_cls,
                 dyn_kws=self.config.dyn_kws
@@ -217,67 +365,30 @@ class DynamicsEngine(CascadeAgent):
 
         initial_future = _submit_spec(current_spec)
 
-        max_attempts = max(1, getattr(self.config, 'executor_max_attempts', 3))
-        retry_delay = getattr(self.config, 'executor_retry_delay', 0.0)
-
-        def _resubmit(attempt_no: int) -> ExecutorFuture:
-            nonlocal current_spec
-            next_attempt_index = self._traj_db.get_next_attempt_index(
-                run_id=self.config.run_id,
-                traj_id=current_spec.traj_id,
-                chunk_id=current_spec.chunk_id
-            )
-            retry_spec = replace(current_spec, attempt_index=next_attempt_index)
-            current_spec = retry_spec
-            self.logger.warning(
-                'Retrying %s (attempt %d/%d, chunk attempt_index=%d)',
-                description,
-                attempt_no,
-                max_attempts,
-                next_attempt_index,
-            )
-            return _submit_spec(retry_spec)
-
-        async def _on_retry(attempt_no: int, exc: Exception) -> None:
-            self.logger.warning(
-                'Retry %d/%d for %s due to %s',
-                attempt_no,
-                max_attempts,
-                description,
-                exc,
-            )
-
-        async def _on_exhausted(exc: Exception) -> None:
-            self._traj_db.mark_trajectory_failed(
-                run_id=self.config.run_id,
-                traj_id=current_spec.traj_id,
-            )
-            self.logger.error(
-                'Giving up on %s after %d attempts: %s',
-                description,
-                max_attempts,
-                exc,
-            )
+        # Capture traj_id for failure handling
+        traj_id = current_spec.traj_id
+        
+        async def callback_with_failure_handling(fut: ExecutorFuture) -> None:
+            if fut.exception():
+                exc = fut.exception()
+                self.logger.error('Advance dynamics failed: %s', exc)
+                self._traj_db.mark_trajectory_failed(
+                    run_id=self.config.run_id,
+                    traj_id=traj_id,
+                )
+                return
+            await self._advance_dynamics_callback(fut)
 
         self.schedule_future_callback(
             initial_future,
-            self._advance_dynamics_callback,
+            callback_with_failure_handling,
             description=description,
-            max_attempts=max_attempts,
-            retry_delay=retry_delay,
-            resubmit=_resubmit,
-            on_retry=_on_retry,
-            on_exhausted=_on_exhausted,
         )
     async def _advance_dynamics_callback(
         self,
         future: Future
     ) -> None:
         """Handle the results of an advance dynamics call"""
-        if future.exception():
-            self.logger.error('Advance dynamics failed: %s', future.exception())
-            return
-
         spec = future.result()
         if isinstance(spec, dict):
             spec = AdvanceSpec(**spec)
@@ -345,12 +456,26 @@ class Auditor(CascadeAgent):
                 chunk_spec.chunk_id,
             )
             return
+        # Track file FDs before ASE DB operation
+        fd_counts_before = count_file_descriptors_by_type()
+        file_fds_before = fd_counts_before.get('REG', 0)
+        
         chunk_atoms = self._traj_db.get_latest_chunk_attempt_atoms(
             self.config.run_id,
             chunk_spec.traj_id,
             chunk_spec.chunk_id,
             self._db
         )
+        
+        # Track file FDs after ASE DB operation
+        fd_counts_after = count_file_descriptors_by_type()
+        file_fds_after = fd_counts_after.get('REG', 0)
+        
+        if file_fds_after > file_fds_before:
+            self.logger.warning(
+                f"File FD increase after get_latest_chunk_attempt_atoms (traj {chunk_spec.traj_id}, chunk {chunk_spec.chunk_id}): "
+                f"{file_fds_before} -> {file_fds_after} (delta: +{file_fds_after - file_fds_before})"
+            )
         self.logger.info(f'Submitting audit of chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id} to executor')
         description = f'audit traj {chunk_spec.traj_id} chunk {chunk_spec.chunk_id}'
 
@@ -364,55 +489,33 @@ class Auditor(CascadeAgent):
 
         initial_future = _submit_audit()
 
-        max_attempts = max(1, getattr(self.config, 'executor_max_attempts', 3))
-        retry_delay = getattr(self.config, 'executor_retry_delay', 0.0)
-
-        def _resubmit(attempt_no: int) -> ExecutorFuture:
-            self.logger.warning(
-                'Retrying %s (attempt %d/%d)',
-                description,
-                attempt_no,
-                max_attempts,
-            )
-            return _submit_audit()
-
-        async def _on_retry(attempt_no: int, exc: Exception) -> None:
-            self.logger.warning(
-                'Retry %d/%d for %s due to %s',
-                attempt_no,
-                max_attempts,
-                description,
-                exc,
-            )
-
-        async def _on_exhausted(exc: Exception) -> None:
-            self._traj_db.update_chunk_audit_status(
-                run_id=self.config.run_id,
-                traj_id=chunk_spec.traj_id,
-                chunk_id=chunk_spec.chunk_id,
-                attempt_index=latest_attempt['attempt_index'],
-                audit_status=AuditStatus.FAILED,
-            )
-            self._traj_db.mark_trajectory_failed(
-                run_id=self.config.run_id,
-                traj_id=chunk_spec.traj_id,
-            )
-            self.logger.error(
-                'Giving up on %s after %d attempts: %s',
-                description,
-                max_attempts,
-                exc,
-            )
+        # Capture values for failure handling
+        traj_id = chunk_spec.traj_id
+        chunk_id = chunk_spec.chunk_id
+        attempt_index = latest_attempt['attempt_index']
+        
+        async def callback_with_failure_handling(fut: ExecutorFuture) -> None:
+            if fut.exception():
+                exc = fut.exception()
+                self.logger.error('Audit task failed: %s', exc)
+                self._traj_db.update_chunk_audit_status(
+                    run_id=self.config.run_id,
+                    traj_id=traj_id,
+                    chunk_id=chunk_id,
+                    attempt_index=attempt_index,
+                    audit_status=AuditStatus.FAILED,
+                )
+                self._traj_db.mark_trajectory_failed(
+                    run_id=self.config.run_id,
+                    traj_id=traj_id,
+                )
+                return
+            await self._audit_callback(fut)
 
         self.schedule_future_callback(
             initial_future,
-            self._audit_callback,
+            callback_with_failure_handling,
             description=description,
-            max_attempts=max_attempts,
-            retry_delay=retry_delay,
-            resubmit=_resubmit,
-            on_retry=_on_retry,
-            on_exhausted=_on_exhausted,
         )
     async def _audit_callback(self, future: Future) -> None:
         """Handle the results of an audit
@@ -428,10 +531,6 @@ class Auditor(CascadeAgent):
             None
         """
         self.logger.debug('Audit callback started')
-        if future.exception():
-            self.logger.error('Audit task failed: %s', future.exception())
-            return
-
         self.logger.info('Getting future result')
         result = future.result()
         status = result.status
@@ -463,6 +562,10 @@ class Auditor(CascadeAgent):
             else:
                 # Trajectory not done - submit next chunk
                 # Get the last frame from the current chunk to use as starting point
+                # Track file FDs before ASE DB operation
+                fd_counts_before = count_file_descriptors_by_type()
+                file_fds_before = fd_counts_before.get('REG', 0)
+                
                 last_frame = self._traj_db.get_last_frame_from_chunk(
                     run_id=self.config.run_id,
                     traj_id=result.traj_id,
@@ -470,6 +573,16 @@ class Auditor(CascadeAgent):
                     attempt_index=result.attempt_index,
                     ase_db=self._db
                 )
+                
+                # Track file FDs after ASE DB operation
+                fd_counts_after = count_file_descriptors_by_type()
+                file_fds_after = fd_counts_after.get('REG', 0)
+                
+                if file_fds_after > file_fds_before:
+                    self.logger.warning(
+                        f"File FD increase after get_last_frame_from_chunk (traj {result.traj_id}, chunk {result.chunk_id}): "
+                        f"{file_fds_before} -> {file_fds_after} (delta: +{file_fds_after - file_fds_before})"
+                    )
                 # Create and submit next advance spec
                 next_chunk_id = result.chunk_id + 1
                 next_attempt_index = self._traj_db.get_next_attempt_index(
@@ -536,6 +649,10 @@ class DummySampler(CascadeAgent):
                 continue
             
             # Get frames from ASE database for this chunk and attempt
+            # Track file FDs before ASE DB operation
+            fd_counts_before = count_file_descriptors_by_type()
+            file_fds_before = fd_counts_before.get('REG', 0)
+            
             frames = list(self._db.select(
                 run_id=self.config.run_id,
                 traj_id=chunk_spec.traj_id,
@@ -547,14 +664,30 @@ class DummySampler(CascadeAgent):
                 self.logger.warning(f"No frames found for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}")
                 continue
             
-            # Convert to Atoms objects
+            # Convert to Atoms objects and extract frame IDs before cleanup
             atoms_list = [row.toatoms() for row in frames]
+            frame_ids = [row.id for row in frames]
+            
+            # Explicit cleanup: delete frames list and force GC to release file handles
+            del frames
+            import gc
+            gc.collect()
+            
+            # Track file FDs after ASE DB operation and cleanup
+            fd_counts_after = count_file_descriptors_by_type()
+            file_fds_after = fd_counts_after.get('REG', 0)
+            
+            if file_fds_after > file_fds_before:
+                self.logger.warning(
+                    f"File FD increase after _db.select (traj {chunk_spec.traj_id}, chunk {chunk_spec.chunk_id}): "
+                    f"{file_fds_before} -> {file_fds_after} (delta: +{file_fds_after - file_fds_before})"
+                )
             
             # Sample frames
             n_sample = min(self.config.n_frames, len(atoms_list))
             indices = self.rng.choice(len(atoms_list), size=n_sample, replace=False)
             sampled_frames = [atoms_list[i] for i in indices]
-            sampled_frame_ids = [frames[i].id for i in indices]
+            sampled_frame_ids = [frame_ids[i] for i in indices]
             
             # Submit frames with their model version and ASE DB IDs
             for frame, ase_db_id in zip(sampled_frames, sampled_frame_ids):
@@ -679,6 +812,69 @@ class DatabaseMonitor(CascadeAgent):
         """Monitor for enough training frames and trigger retraining"""
         self.logger.info("periodic_retrain loop started")
         while not shutdown.is_set():
+            # Log connection pool statistics for debugging FD leaks
+            self._traj_db.log_pool_stats(self.logger)
+            
+            # Log resource creation counts
+            self.logger.info(
+                f"Resource counts: agents={CascadeAgent._resource_counts['agents_created']}, "
+                f"db_connections={CascadeAgent._resource_counts['db_connections_created']}, "
+                f"traj_db_instances={CascadeAgent._resource_counts['traj_db_instances_created']}"
+            )
+            
+            # Alert if resource counts are unexpectedly high
+            if CascadeAgent._resource_counts['db_connections_created'] > CascadeAgent._resource_counts['agents_created'] * 2:
+                self.logger.warning(
+                    f"More DB connections ({CascadeAgent._resource_counts['db_connections_created']}) "
+                    f"than expected for {CascadeAgent._resource_counts['agents_created']} agents. "
+                    "Connections may be recreated unnecessarily."
+                )
+            if CascadeAgent._resource_counts['traj_db_instances_created'] > CascadeAgent._resource_counts['agents_created'] * 2:
+                self.logger.warning(
+                    f"More TrajectoryDB instances ({CascadeAgent._resource_counts['traj_db_instances_created']}) "
+                    f"than expected for {CascadeAgent._resource_counts['agents_created']} agents. "
+                    "Instances may be recreated unnecessarily."
+                )
+            
+            # Monitor file descriptor counts by type
+            fd_counts = count_file_descriptors_by_type()
+            if 'error' not in fd_counts:
+                total = fd_counts.get('total', 0)
+                pipes = fd_counts.get('PIPE', 0)
+                files = fd_counts.get('REG', 0)
+                sockets = fd_counts.get('IPv4', 0) + fd_counts.get('IPv6', 0)
+                
+                self.logger.info(
+                    f"FD counts: total={total}, pipes={pipes}, files={files}, sockets={sockets}"
+                )
+                
+                # Alert on high FD counts
+                if total > 500:
+                    self.logger.warning(
+                        f"High total FD count: {total}. Possible FD leak detected!"
+                    )
+                if pipes > 100:
+                    self.logger.warning(
+                        f"High pipe count: {pipes}. ProcessPoolExecutor may have issues."
+                    )
+            else:
+                self.logger.debug(f"FD counting unavailable: {fd_counts.get('error', 'unknown')}")
+            
+            # Check executor worker health if executor is available
+            if self.executor is not None:
+                worker_health = check_executor_workers(self.executor)
+                if 'error' not in worker_health and 'skipped' not in worker_health:
+                    if worker_health.get('zombies', 0) > 0:
+                        self.logger.warning(
+                            f"Found {worker_health['zombies']} zombie worker processes: {worker_health}"
+                        )
+                    elif worker_health.get('dead', 0) > worker_health.get('alive', 0):
+                        self.logger.warning(
+                            f"Many dead workers detected: {worker_health}. Consider recreating executor."
+                        )
+                    else:
+                        self.logger.debug(f"Executor worker health: {worker_health}")
+            
             # Check if we have enough new training frames
             current_count = self._traj_db.count_training_frames(self.config.run_id)
             new_frames = current_count - self.last_train_count

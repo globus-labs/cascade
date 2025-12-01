@@ -122,20 +122,84 @@ class DBTrainingFrame(Base):
 class TrajectoryDB:
     """Wrapper for the database representations of trajectories and chunks"""
     
-    def __init__(self, db_url: str):
+    # Track pool sizes across instances for growth detection
+    _pool_size_history: dict[int, list[int]] = {}  # engine_id -> list of sizes
+    
+    def __init__(self, db_url: str, logger: Optional[logging.Logger] = None):
         """Initialize the trajectory database manager
         
         Args:
             db_url: PostgreSQL connection URL (e.g., 'postgresql://user:pass@host:port/dbname')
+            logger: Optional logger for tracking engine creation
         """
         self.db_url = db_url
+        self._logger = logger or logging.getLogger(__name__)
         # Create engine and session factory
         self.engine = create_engine(db_url, echo=False, pool_pre_ping=True)
         self.SessionLocal = sessionmaker(bind=self.engine, autocommit=False, autoflush=False)
+        self._logger.info(f"Created TrajectoryDB engine (id={id(self.engine)}) for {db_url}")
         
     def create_tables(self):
         """Create all tables if they don't exist"""
         Base.metadata.create_all(self.engine)
+    
+    def log_pool_stats(self, logger: logging.Logger) -> None:
+        """Log SQLAlchemy connection pool statistics for debugging
+        
+        Args:
+            logger: Logger instance to use for logging
+        """
+        try:
+            pool = self.engine.pool
+            engine_id = id(self.engine)
+            
+            # Get available stats (not all pools have all attributes)
+            current_size = pool.size()
+            stats = {
+                'size': current_size,
+                'checked_in': pool.checkedin(),
+                'checked_out': pool.checkedout(),
+                'overflow': pool.overflow(),
+            }
+            # Only add invalid if the attribute exists
+            if hasattr(pool, 'invalid'):
+                stats['invalid'] = pool.invalid()
+            
+            # Track pool size history for growth detection
+            if engine_id not in TrajectoryDB._pool_size_history:
+                TrajectoryDB._pool_size_history[engine_id] = []
+            history = TrajectoryDB._pool_size_history[engine_id]
+            history.append(current_size)
+            # Keep only last 10 measurements
+            if len(history) > 10:
+                history.pop(0)
+            
+            # Check for growth trends
+            if len(history) >= 3:
+                recent_growth = history[-1] - history[-3]
+                if recent_growth > 5:
+                    logger.warning(
+                        f"Pool size growing rapidly: {history[-3]} -> {current_size} "
+                        f"(+{recent_growth} in last 3 checks). Possible connection leak!"
+                    )
+            
+            # Alert on high pool size
+            if current_size > 20:
+                logger.warning(
+                    f"Pool size is high ({current_size}). Consider checking for connection leaks."
+                )
+            
+            # Alert on many checked out connections
+            checked_out = stats['checked_out']
+            if checked_out > 10:
+                logger.warning(
+                    f"Many connections checked out ({checked_out}). "
+                    "Sessions may not be properly closed."
+                )
+            
+            logger.info(f"SQLAlchemy pool stats: {', '.join(f'{k}={v}' for k, v in stats.items())}")
+        except Exception as e:
+            logger.warning(f"Failed to get pool stats: {e}")
     
     @contextlib.contextmanager
     def session(self):
@@ -684,7 +748,14 @@ class TrajectoryDB:
             return []
         
         frames.sort(key=lambda row: row.id)
-        return [row.toatoms() for row in frames]
+        atoms_list = [row.toatoms() for row in frames]
+        
+        # Explicit cleanup: delete frames list and force GC to release file handles
+        del frames
+        import gc
+        gc.collect()
+        
+        return atoms_list
     
     def is_trajectory_done(
         self,
@@ -760,8 +831,15 @@ class TrajectoryDB:
         # Sort by id to ensure proper ordering
         frames.sort(key=lambda row: row.id)
         
-        # Return the first frame
-        return frames[0].toatoms()
+        # Extract the first frame before cleanup
+        first_atoms = frames[0].toatoms()
+        
+        # Explicit cleanup: delete frames list and force GC to release file handles
+        del frames
+        import gc
+        gc.collect()
+        
+        return first_atoms
     
     def get_last_frame_from_chunk(
         self,
@@ -797,8 +875,15 @@ class TrajectoryDB:
         # Sort by id to ensure proper ordering
         frames.sort(key=lambda row: row.id)
         
-        # Return the last frame
-        return frames[-1].toatoms()
+        # Extract the last frame before cleanup
+        last_atoms = frames[-1].toatoms()
+        
+        # Explicit cleanup: delete frames list and force GC to release file handles
+        del frames
+        import gc
+        gc.collect()
+        
+        return last_atoms
     
     def get_initial_trajectory_frame(
         self,
