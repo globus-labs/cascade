@@ -190,49 +190,6 @@ class TrajectoryDB:
         """Create all tables if they don't exist"""
         Base.metadata.create_all(self.engine)
     
-    def dispose(self) -> None:
-        """Dispose of the database engine and close all connections
-        
-        This should be called when done with a TrajectoryDB instance to ensure
-        all connection pool connections are properly closed and file descriptors
-        are released.
-        """
-        if hasattr(self, 'engine'):
-            pool = self.engine.pool
-            
-            # Invalidate all connections first (marks them for closure)
-            # This will cause connections to be closed when returned to the pool
-            # and will prevent new connections from being created
-            try:
-                pool.invalidate()
-            except Exception:
-                pass  # Pool might already be invalidated or closed
-            
-            # Force close all connections currently in the pool
-            # This handles checked-in connections
-            try:
-                # Get the current pool size before we start closing
-                initial_size = pool.size()
-                # Close connections in the pool
-                for _ in range(initial_size):
-                    try:
-                        conn = pool.connect()
-                        conn.close()
-                        # Invalidate to ensure it's marked for closure
-                        pool.invalidate(conn)
-                    except Exception:
-                        break  # No more connections available or pool is closed
-            except Exception:
-                pass  # Pool might already be empty or closed
-            
-            # Finally dispose - this will close any remaining connections
-            # and clean up the pool
-            self.engine.dispose(close=True)
-            self._logger.debug(f"Disposed TrajectoryDB engine (id={id(self.engine)})")
-            
-            # Force garbage collection to release any held references to connections/engines
-            gc.collect()
-    
     def log_pool_stats(self, logger: logging.Logger) -> None:
         """Log SQLAlchemy connection pool statistics for debugging
         
@@ -302,35 +259,8 @@ class TrajectoryDB:
             session.rollback()
             raise
         finally:
-            # Explicitly expunge all objects before closing to ensure connection is returned to pool
-            # This prevents ORM objects from holding database connections
-            try:
-                session.expunge_all()
-            except Exception:
-                pass  # Ignore errors during cleanup
             session.close()
             # Force garbage collection after session close to release any held references
-            gc.collect()
-    
-    def _execute_with_gc(self, func, *args, **kwargs):
-        """Execute a database operation and force garbage collection afterward
-        
-        This helper method is useful for operations that retrieve large binary data
-        or perform multiple queries, ensuring that resources are released promptly.
-        
-        Args:
-            func: Callable that performs the database operation
-            *args: Positional arguments to pass to func
-            **kwargs: Keyword arguments to pass to func
-            
-        Returns:
-            Result of func(*args, **kwargs)
-        """
-        try:
-            result = func(*args, **kwargs)
-            return result
-        finally:
-            # Force garbage collection after database operation
             gc.collect()
     
     @staticmethod
@@ -658,15 +588,12 @@ class TrajectoryDB:
                         traj.chunks_completed = latest_passed + 1
                         
                         # Check if trajectory is done
-                        # Extract n_frames values immediately to avoid holding ORM objects
                         passed_chunks = sess.query(DBTrajectoryChunk).filter_by(
                             run_id=run_id,
                             traj_id=traj_id,
                             audit_status=AuditStatus.PASSED
                         ).all()
-                        # Extract scalar values immediately before session closes
-                        n_frames_list = [chunk.n_frames for chunk in passed_chunks]
-                        total_frames = sum(n_frames_list)
+                        total_frames = sum(chunk.n_frames for chunk in passed_chunks)
                         new_status = (
                             TrajectoryStatus.COMPLETED
                             if total_frames >= traj.target_length
@@ -766,8 +693,7 @@ class TrajectoryDB:
         """
         chunks = self.get_passed_chunks(run_id, traj_id)
         
-        # Extract all binary data while session is active
-        all_atoms_blobs = []
+        all_atoms = []
         with self.session() as sess:
             for i, chunk in enumerate(chunks):
                 # Query frames for this chunk and attempt
@@ -783,12 +709,10 @@ class TrajectoryDB:
                 if i > 0:
                     frames = frames[1:]
                 
-                # Extract binary data as bytes while session is active
+                # Deserialize directly from ORM objects
                 for frame in frames:
-                    all_atoms_blobs.append(bytes(frame.atoms_blob))
+                    all_atoms.append(self._deserialize_atoms(frame.atoms_blob))
         
-        # Deserialize outside the session context
-        all_atoms = [self._deserialize_atoms(blob) for blob in all_atoms_blobs]
         # Force garbage collection after deserializing large binary data
         gc.collect()
         return all_atoms
@@ -947,8 +871,6 @@ class TrajectoryDB:
         
         attempt_index = latest_attempt['attempt_index']
         
-        # Extract binary data while session is active, then deserialize outside
-        atoms_blobs = []
         with self.session() as sess:
             frames = sess.query(DBTrajectoryFrame).filter_by(
                 run_id=run_id,
@@ -960,12 +882,9 @@ class TrajectoryDB:
             if not frames:
                 return []
             
-            # Extract binary data as bytes while session is active
-            # This ensures we get the data before the session closes
-            atoms_blobs = [bytes(frame.atoms_blob) for frame in frames]
+            # Deserialize directly from ORM objects
+            atoms_list = [self._deserialize_atoms(frame.atoms_blob) for frame in frames]
         
-        # Deserialize outside the session context to avoid holding DB resources
-        atoms_list = [self._deserialize_atoms(blob) for blob in atoms_blobs]
         # Force garbage collection after deserializing large binary data
         gc.collect()
         return atoms_list
@@ -1028,7 +947,6 @@ class TrajectoryDB:
         Returns:
             Atoms object for the first frame, or None if no frames found
         """
-        atoms_blob = None
         with self.session() as sess:
             frame = sess.query(DBTrajectoryFrame).filter_by(
                 run_id=run_id,
@@ -1041,11 +959,9 @@ class TrajectoryDB:
             if not frame:
                 return None
             
-            # Extract binary data as bytes while session is active
-            atoms_blob = bytes(frame.atoms_blob)
+            # Deserialize directly from ORM object
+            atoms = self._deserialize_atoms(frame.atoms_blob)
         
-        # Deserialize outside the session context
-        atoms = self._deserialize_atoms(atoms_blob)
         # Force garbage collection after deserializing large binary data
         gc.collect()
         return atoms
@@ -1068,7 +984,6 @@ class TrajectoryDB:
         Returns:
             Atoms object for the last frame, or None if no frames found
         """
-        atoms_blob = None
         with self.session() as sess:
             # Get the frame with the highest frame_index for this chunk/attempt
             frame = sess.query(DBTrajectoryFrame).filter_by(
@@ -1081,11 +996,9 @@ class TrajectoryDB:
             if not frame:
                 return None
             
-            # Extract binary data as bytes while session is active
-            atoms_blob = bytes(frame.atoms_blob)
+            # Deserialize directly from ORM object
+            atoms = self._deserialize_atoms(frame.atoms_blob)
         
-        # Deserialize outside the session context
-        atoms = self._deserialize_atoms(atoms_blob)
         # Force garbage collection after deserializing large binary data
         gc.collect()
         return atoms
@@ -1189,8 +1102,6 @@ class TrajectoryDB:
         Returns:
             List of Atoms objects from all training frames
         """
-        # Extract binary data while session is active
-        atoms_blobs = []
         with self.session() as sess:
             training_frames = sess.query(DBTrainingFrame).filter_by(
                 run_id=run_id
@@ -1204,14 +1115,13 @@ class TrajectoryDB:
             # Get trajectory frame IDs
             frame_ids = [tf.trajectory_frame_id for tf in training_frames]
             
-            # Extract binary data from trajectory_frames table
+            # Deserialize directly from ORM objects
+            atoms_list = []
             for frame_id in frame_ids:
                 frame = sess.query(DBTrajectoryFrame).filter_by(id=frame_id).first()
                 if frame:
-                    atoms_blobs.append(bytes(frame.atoms_blob))
+                    atoms_list.append(self._deserialize_atoms(frame.atoms_blob))
         
-        # Deserialize outside the session context
-        atoms_list = [self._deserialize_atoms(blob) for blob in atoms_blobs]
         # Force garbage collection after deserializing large binary data
         gc.collect()
         return atoms_list

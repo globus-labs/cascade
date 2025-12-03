@@ -182,21 +182,17 @@ async def main():
     # Initialize trajectories in the database
     traj_db = TrajectoryDB(args.db_url)
     traj_db.create_tables()
-    try:
-        for i, s in enumerate(init_strc):
-            a = read(s, index=-1)
-            logger.info(f"Initializing traj {i} with {len(a)} atoms")
-            success = traj_db.initialize_trajectory(
-                run_id=run_id,
-                traj_id=i,
-                target_length=args.target_length,
-                init_atoms=a
-            )
-            if not success:
-                logger.error(f"Failed to initialize traj {i} in database")
-    finally:
-        # Dispose of the engine to close all connections
-        traj_db.dispose()
+    for i, s in enumerate(init_strc):
+        a = read(s, index=-1)
+        logger.info(f"Initializing traj {i} with {len(a)} atoms")
+        success = traj_db.initialize_trajectory(
+            run_id=run_id,
+            traj_id=i,
+            target_length=args.target_length,
+            init_atoms=a
+        )
+        if not success:
+            logger.error(f"Failed to initialize traj {i} in database")
 
     # intial conditions, trajectories
     initial_specs = []

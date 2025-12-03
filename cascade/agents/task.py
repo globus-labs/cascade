@@ -55,38 +55,34 @@ def advance_dynamics(
     # Create TrajectoryDB instance in the worker process with NullPool (no connection pooling)
     traj_db = TrajectoryDB(db_url, use_null_pool=True)
     
-    try:
-        atoms = spec.atoms
-        calc = learner.make_calculator(weights, device=device)
-        atoms.calc = calc
+    atoms = spec.atoms
+    calc = learner.make_calculator(weights, device=device)
+    atoms.calc = calc
 
-        dyn = dyn_cls(atoms, **dyn_kws)
+    dyn = dyn_cls(atoms, **dyn_kws)
+    
+    frame_index = 0  # Track frame index within this chunk
+
+    def write_to_db():
+        nonlocal frame_index
+        f = atoms.calc.results['forces']
+        atoms.calc.results['forces'] = f.astype(np.float64)
+        canonical_atoms = canonicalize(atoms)
         
-        frame_index = 0  # Track frame index within this chunk
+        # Write frame to database
+        traj_db.write_frame(
+            run_id=spec.run_id,
+            traj_id=spec.traj_id,
+            chunk_id=spec.chunk_id,
+            attempt_index=spec.attempt_index,
+            frame_index=frame_index,
+            atoms=canonical_atoms
+        )
+        frame_index += 1
+    
+    dyn.attach(write_to_db)
 
-        def write_to_db():
-            nonlocal frame_index
-            f = atoms.calc.results['forces']
-            atoms.calc.results['forces'] = f.astype(np.float64)
-            canonical_atoms = canonicalize(atoms)
-            
-            # Write frame to database
-            traj_db.write_frame(
-                run_id=spec.run_id,
-                traj_id=spec.traj_id,
-                chunk_id=spec.chunk_id,
-                attempt_index=spec.attempt_index,
-                frame_index=frame_index,
-                atoms=canonical_atoms
-            )
-            frame_index += 1
-        
-        dyn.attach(write_to_db)
-
-        dyn.run(spec.steps, **run_kws)
-    finally:
-        # Dispose of the engine to close all connections and release file descriptors
-        traj_db.dispose()
+    dyn.run(spec.steps, **run_kws)
     
     return spec
 
