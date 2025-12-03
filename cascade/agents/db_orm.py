@@ -1,16 +1,16 @@
 """ORM layer for tracking trajectories and trajectory chunks in PostgreSQL.
 
 This module provides SQLAlchemy models and utilities for persisting trajectory
-and chunk metadata alongside the ASE database for individual frames.
+and chunk metadata, and storing trajectory frames as serialized Atoms objects.
 """
 from __future__ import annotations
 
 import contextlib
+import gc
 import logging
 from typing import Optional, TYPE_CHECKING
 
 import numpy as np
-import ase
 from ase import Atoms
 
 if TYPE_CHECKING:
@@ -29,6 +29,7 @@ from sqlalchemy import (
     ForeignKey,
     func,
     JSON,
+    LargeBinary,
     UniqueConstraint,
 )
 from sqlalchemy.orm import relationship, sessionmaker, declarative_base
@@ -95,13 +96,34 @@ class DBTrajectoryChunk(Base):
         return f"<DBTrajectoryChunk(run_id={self.run_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt={self.attempt_index}, status={self.audit_status})>"
 
 
+class DBTrajectoryFrame(Base):
+    """ORM model for storing trajectory frame Atoms objects as BLOBs"""
+    __tablename__ = 'trajectory_frames'
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String, nullable=False, index=True)
+    traj_id = Column(Integer, nullable=False, index=True)
+    chunk_id = Column(Integer, nullable=False, index=True)
+    attempt_index = Column(Integer, nullable=False, index=True)
+    frame_index = Column(Integer, nullable=False)  # 0-based index within the chunk
+    atoms_blob = Column(LargeBinary, nullable=False)  # Serialized Atoms object (JSON format as bytes)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'traj_id', 'chunk_id', 'attempt_index', 'frame_index', name='uq_frame_run_traj_chunk_attempt_index'),
+    )
+
+    def __repr__(self):
+        return f"<DBTrajectoryFrame(run_id={self.run_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, frame_index={self.frame_index})>"
+
+
 class DBTrainingFrame(Base):
     """ORM model for training frames"""
     __tablename__ = 'training_frames'
 
     id = Column(Integer, primary_key=True)
     run_id = Column(String, nullable=False, index=True)
-    ase_db_id = Column(Integer, nullable=False, index=True)
+    trajectory_frame_id = Column(Integer, ForeignKey('trajectory_frames.id'), nullable=False, index=True)
     model_version_sampled_from = Column(Integer, nullable=False)
     # Denormalized chunk info for faster queries
     traj_id = Column(Integer, nullable=False, index=True)
@@ -112,11 +134,11 @@ class DBTrainingFrame(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint('run_id', 'ase_db_id', name='uq_training_frame_run_ase'),
+        UniqueConstraint('run_id', 'trajectory_frame_id', name='uq_training_frame_run_frame'),
     )
 
     def __repr__(self):
-        return f"<DBTrainingFrame(run_id={self.run_id}, ase_db_id={self.ase_db_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, training_round={self.training_round})>"
+        return f"<DBTrainingFrame(run_id={self.run_id}, trajectory_frame_id={self.trajectory_frame_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, training_round={self.training_round})>"
 
 
 class TrajectoryDB:
@@ -125,23 +147,91 @@ class TrajectoryDB:
     # Track pool sizes across instances for growth detection
     _pool_size_history: dict[int, list[int]] = {}  # engine_id -> list of sizes
     
-    def __init__(self, db_url: str, logger: Optional[logging.Logger] = None):
+    def __init__(self, db_url: str, logger: Optional[logging.Logger] = None, use_null_pool: bool = False):
         """Initialize the trajectory database manager
         
         Args:
             db_url: PostgreSQL connection URL (e.g., 'postgresql://user:pass@host:port/dbname')
             logger: Optional logger for tracking engine creation
+            use_null_pool: If True, use NullPool (no connection pooling).
+                          Use for short-lived instances like worker processes.
         """
         self.db_url = db_url
         self._logger = logger or logging.getLogger(__name__)
+        
+        if use_null_pool:
+            # Use NullPool for short-lived instances - no pooling, connections closed immediately
+            from sqlalchemy.pool import NullPool
+            poolclass = NullPool
+            pool_kwargs = {}
+        else:
+            # Use very restrictive pool for long-lived agent instances
+            from sqlalchemy.pool import QueuePool
+            poolclass = QueuePool
+            pool_kwargs = {
+                'pool_size': 1,  # Only 1 connection in pool
+                'max_overflow': 1,  # Allow 1 overflow = max 2 connections total
+                'pool_recycle': 300,  # Recycle connections after 5 minutes
+                'pool_reset_on_return': 'commit',  # Reset connections on return
+            }
+        
         # Create engine and session factory
-        self.engine = create_engine(db_url, echo=False, pool_pre_ping=True)
+        self.engine = create_engine(
+            db_url, 
+            echo=False, 
+            pool_pre_ping=True,
+            poolclass=poolclass,
+            **pool_kwargs
+        )
         self.SessionLocal = sessionmaker(bind=self.engine, autocommit=False, autoflush=False)
-        self._logger.info(f"Created TrajectoryDB engine (id={id(self.engine)}) for {db_url}")
+        self._logger.info(f"Created TrajectoryDB engine (id={id(self.engine)}) with poolclass={poolclass.__name__}")
         
     def create_tables(self):
         """Create all tables if they don't exist"""
         Base.metadata.create_all(self.engine)
+    
+    def dispose(self) -> None:
+        """Dispose of the database engine and close all connections
+        
+        This should be called when done with a TrajectoryDB instance to ensure
+        all connection pool connections are properly closed and file descriptors
+        are released.
+        """
+        if hasattr(self, 'engine'):
+            pool = self.engine.pool
+            
+            # Invalidate all connections first (marks them for closure)
+            # This will cause connections to be closed when returned to the pool
+            # and will prevent new connections from being created
+            try:
+                pool.invalidate()
+            except Exception:
+                pass  # Pool might already be invalidated or closed
+            
+            # Force close all connections currently in the pool
+            # This handles checked-in connections
+            try:
+                # Get the current pool size before we start closing
+                initial_size = pool.size()
+                # Close connections in the pool
+                for _ in range(initial_size):
+                    try:
+                        conn = pool.connect()
+                        conn.close()
+                        # Invalidate to ensure it's marked for closure
+                        pool.invalidate(conn)
+                    except Exception:
+                        break  # No more connections available or pool is closed
+            except Exception:
+                pass  # Pool might already be empty or closed
+            
+            # Finally dispose - this will close any remaining connections
+            # and clean up the pool
+            self.engine.dispose(close=True)
+            self._logger.debug(f"Disposed TrajectoryDB engine (id={id(self.engine)})")
+            
+            # Force garbage collection to release any held references to connections/engines
+            gc.collect()
     
     def log_pool_stats(self, logger: logging.Logger) -> None:
         """Log SQLAlchemy connection pool statistics for debugging
@@ -212,7 +302,120 @@ class TrajectoryDB:
             session.rollback()
             raise
         finally:
+            # Explicitly expunge all objects before closing to ensure connection is returned to pool
+            # This prevents ORM objects from holding database connections
+            try:
+                session.expunge_all()
+            except Exception:
+                pass  # Ignore errors during cleanup
             session.close()
+            # Force garbage collection after session close to release any held references
+            gc.collect()
+    
+    def _execute_with_gc(self, func, *args, **kwargs):
+        """Execute a database operation and force garbage collection afterward
+        
+        This helper method is useful for operations that retrieve large binary data
+        or perform multiple queries, ensuring that resources are released promptly.
+        
+        Args:
+            func: Callable that performs the database operation
+            *args: Positional arguments to pass to func
+            **kwargs: Keyword arguments to pass to func
+            
+        Returns:
+            Result of func(*args, **kwargs)
+        """
+        try:
+            result = func(*args, **kwargs)
+            return result
+        finally:
+            # Force garbage collection after database operation
+            gc.collect()
+    
+    @staticmethod
+    def _serialize_atoms(atoms: Atoms) -> bytes:
+        """Serialize an Atoms object to bytes using cascade.utils
+        
+        Args:
+            atoms: Atoms object to serialize
+            
+        Returns:
+            Serialized Atoms as bytes (JSON format)
+        """
+        from cascade.utils import canonicalize, write_to_string
+        canonical_atoms = canonicalize(atoms)
+        atoms_str = write_to_string(canonical_atoms, fmt='json')
+        return atoms_str.encode('utf-8')
+    
+    @staticmethod
+    def _deserialize_atoms(data: bytes) -> Atoms:
+        """Deserialize bytes to an Atoms object using cascade.utils
+        
+        Args:
+            data: Serialized Atoms as bytes (JSON format)
+            
+        Returns:
+            Deserialized Atoms object
+        """
+        from cascade.utils import read_from_string
+        atoms_str = data.decode('utf-8')
+        return read_from_string(atoms_str, fmt='json')
+    
+    def write_frame(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int,
+        frame_index: int,
+        atoms: Atoms
+    ) -> int:
+        """Write a trajectory frame to the database
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index
+            frame_index: Frame index within the chunk (0-based)
+            atoms: Atoms object to store
+            
+        Returns:
+            ID of the created frame record
+        """
+        with self.session() as sess:
+            # Serialize atoms
+            atoms_blob = self._serialize_atoms(atoms)
+            
+            # Check if frame already exists
+            existing = sess.query(DBTrajectoryFrame).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index,
+                frame_index=frame_index
+            ).first()
+            
+            if existing:
+                # Update existing frame
+                existing.atoms_blob = atoms_blob
+                sess.flush()
+                return existing.id
+            
+            # Create new frame
+            db_frame = DBTrajectoryFrame(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index,
+                frame_index=frame_index,
+                atoms_blob=atoms_blob
+            )
+            sess.add(db_frame)
+            sess.flush()
+            sess.refresh(db_frame)
+            return db_frame.id
     
     def _sync_trajectory_done_flag(self, traj: DBTrajectory) -> None:
         """Keep legacy boolean in sync with enum-based trajectory status."""
@@ -455,12 +658,15 @@ class TrajectoryDB:
                         traj.chunks_completed = latest_passed + 1
                         
                         # Check if trajectory is done
+                        # Extract n_frames values immediately to avoid holding ORM objects
                         passed_chunks = sess.query(DBTrajectoryChunk).filter_by(
                             run_id=run_id,
                             traj_id=traj_id,
                             audit_status=AuditStatus.PASSED
                         ).all()
-                        total_frames = sum(chunk.n_frames for chunk in passed_chunks)
+                        # Extract scalar values immediately before session closes
+                        n_frames_list = [chunk.n_frames for chunk in passed_chunks]
+                        total_frames = sum(n_frames_list)
                         new_status = (
                             TrajectoryStatus.COMPLETED
                             if total_frames >= traj.target_length
@@ -541,12 +747,11 @@ class TrajectoryDB:
     def get_trajectory_atoms(
         self,
         run_id: str,
-        traj_id: int,
-        ase_db: ase.database.connect
+        traj_id: int
     ) -> list[Atoms]:
         """Get all atoms from passed chunks for a trajectory
         
-        This queries the ASE database for all frames matching the passed chunks
+        This queries the trajectory_frames table for all frames matching the passed chunks
         and returns them as a list of Atoms objects. When reconstructing the full
         trajectory, the first frame of each chunk (except chunk 0) is skipped to
         avoid duplicates, since the first frame of chunk N is the same as the
@@ -555,31 +760,37 @@ class TrajectoryDB:
         Args:
             run_id: Run identifier
             traj_id: Trajectory identifier
-            ase_db: ASE database connection to query frames from
             
         Returns:
             List of Atoms objects from all passed chunks, in order, with duplicates removed
         """
         chunks = self.get_passed_chunks(run_id, traj_id)
         
-        all_atoms = []
-        for i, chunk in enumerate(chunks):
-            # Query ASE DB for all frames in this chunk and attempt
-            # Passed chunks are the specific attempt that passed, so we query by attempt_index
-            frames = list(ase_db.select(
-                run_id=run_id,
-                traj_id=traj_id,
-                chunk_id=chunk['chunk_id'],
-                attempt_index=chunk['attempt_index']
-            ))
-            frames.sort(key=lambda row: row.id)
-            # Skip first frame of all chunks except chunk 0
-            # (first frame is duplicate of previous chunk's last frame)
-            if i > 0:
-                frames = frames[1:]
-            
-            all_atoms.extend([row.toatoms() for row in frames])
+        # Extract all binary data while session is active
+        all_atoms_blobs = []
+        with self.session() as sess:
+            for i, chunk in enumerate(chunks):
+                # Query frames for this chunk and attempt
+                frames = sess.query(DBTrajectoryFrame).filter_by(
+                    run_id=run_id,
+                    traj_id=traj_id,
+                    chunk_id=chunk['chunk_id'],
+                    attempt_index=chunk['attempt_index']
+                ).order_by(DBTrajectoryFrame.frame_index).all()
+                
+                # Skip first frame of all chunks except chunk 0
+                # (first frame is duplicate of previous chunk's last frame)
+                if i > 0:
+                    frames = frames[1:]
+                
+                # Extract binary data as bytes while session is active
+                for frame in frames:
+                    all_atoms_blobs.append(bytes(frame.atoms_blob))
         
+        # Deserialize outside the session context
+        all_atoms = [self._deserialize_atoms(blob) for blob in all_atoms_blobs]
+        # Force garbage collection after deserializing large binary data
+        gc.collect()
         return all_atoms
     
     def get_trajectory(
@@ -718,16 +929,14 @@ class TrajectoryDB:
         self,
         run_id: str,
         traj_id: int,
-        chunk_id: int,
-        ase_db: ase.database.connect
+        chunk_id: int
     ) -> list[Atoms]:
-        """Get the ASE atoms for the latest attempt of a chunk
+        """Get the atoms for the latest attempt of a chunk
         
         Args:
             run_id: Run identifier
             traj_id: Trajectory identifier
             chunk_id: Chunk identifier
-            ase_db: ASE database connection to query frames from
         
         Returns:
             List of Atoms objects for the latest chunk attempt (empty if none found)
@@ -737,24 +946,28 @@ class TrajectoryDB:
             return []
         
         attempt_index = latest_attempt['attempt_index']
-        frames = list(ase_db.select(
-            run_id=run_id,
-            traj_id=traj_id,
-            chunk_id=chunk_id,
-            attempt_index=attempt_index
-        ))
         
-        if not frames:
-            return []
+        # Extract binary data while session is active, then deserialize outside
+        atoms_blobs = []
+        with self.session() as sess:
+            frames = sess.query(DBTrajectoryFrame).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index
+            ).order_by(DBTrajectoryFrame.frame_index).all()
+            
+            if not frames:
+                return []
+            
+            # Extract binary data as bytes while session is active
+            # This ensures we get the data before the session closes
+            atoms_blobs = [bytes(frame.atoms_blob) for frame in frames]
         
-        frames.sort(key=lambda row: row.id)
-        atoms_list = [row.toatoms() for row in frames]
-        
-        # Explicit cleanup: delete frames list and force GC to release file handles
-        del frames
-        import gc
+        # Deserialize outside the session context to avoid holding DB resources
+        atoms_list = [self._deserialize_atoms(blob) for blob in atoms_blobs]
+        # Force garbage collection after deserializing large binary data
         gc.collect()
-        
         return atoms_list
     
     def is_trajectory_done(
@@ -802,8 +1015,7 @@ class TrajectoryDB:
         run_id: str,
         traj_id: int,
         chunk_id: int,
-        attempt_index: int,
-        ase_db: ase.database.connect
+        attempt_index: int
     ) -> Optional[Atoms]:
         """Get the first frame from a chunk
         
@@ -812,42 +1024,38 @@ class TrajectoryDB:
             traj_id: Trajectory identifier
             chunk_id: Chunk identifier
             attempt_index: Attempt index for this chunk
-            ase_db: ASE database connection to query frames from
             
         Returns:
             Atoms object for the first frame, or None if no frames found
         """
-        # Query ASE DB for all frames in this chunk and attempt
-        frames = list(ase_db.select(
-            run_id=run_id,
-            traj_id=traj_id,
-            chunk_id=chunk_id,
-            attempt_index=attempt_index
-        ))
+        atoms_blob = None
+        with self.session() as sess:
+            frame = sess.query(DBTrajectoryFrame).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index,
+                frame_index=0
+            ).first()
+            
+            if not frame:
+                return None
+            
+            # Extract binary data as bytes while session is active
+            atoms_blob = bytes(frame.atoms_blob)
         
-        if not frames:
-            return None
-        
-        # Sort by id to ensure proper ordering
-        frames.sort(key=lambda row: row.id)
-        
-        # Extract the first frame before cleanup
-        first_atoms = frames[0].toatoms()
-        
-        # Explicit cleanup: delete frames list and force GC to release file handles
-        del frames
-        import gc
+        # Deserialize outside the session context
+        atoms = self._deserialize_atoms(atoms_blob)
+        # Force garbage collection after deserializing large binary data
         gc.collect()
-        
-        return first_atoms
+        return atoms
     
     def get_last_frame_from_chunk(
         self,
         run_id: str,
         traj_id: int,
         chunk_id: int,
-        attempt_index: int,
-        ase_db: ase.database.connect
+        attempt_index: int
     ) -> Optional[Atoms]:
         """Get the last frame from a chunk
         
@@ -856,34 +1064,31 @@ class TrajectoryDB:
             traj_id: Trajectory identifier
             chunk_id: Chunk identifier
             attempt_index: Attempt index for this chunk
-            ase_db: ASE database connection to query frames from
             
         Returns:
             Atoms object for the last frame, or None if no frames found
         """
-        # Query ASE DB for all frames in this chunk and attempt
-        frames = list(ase_db.select(
-            run_id=run_id,
-            traj_id=traj_id,
-            chunk_id=chunk_id,
-            attempt_index=attempt_index
-        ))
+        atoms_blob = None
+        with self.session() as sess:
+            # Get the frame with the highest frame_index for this chunk/attempt
+            frame = sess.query(DBTrajectoryFrame).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index
+            ).order_by(DBTrajectoryFrame.frame_index.desc()).first()
+            
+            if not frame:
+                return None
+            
+            # Extract binary data as bytes while session is active
+            atoms_blob = bytes(frame.atoms_blob)
         
-        if not frames:
-            return None
-        
-        # Sort by id to ensure proper ordering
-        frames.sort(key=lambda row: row.id)
-        
-        # Extract the last frame before cleanup
-        last_atoms = frames[-1].toatoms()
-        
-        # Explicit cleanup: delete frames list and force GC to release file handles
-        del frames
-        import gc
+        # Deserialize outside the session context
+        atoms = self._deserialize_atoms(atoms_blob)
+        # Force garbage collection after deserializing large binary data
         gc.collect()
-        
-        return last_atoms
+        return atoms
     
     def get_initial_trajectory_frame(
         self,
@@ -920,13 +1125,15 @@ class TrajectoryDB:
             
             if init_atoms_json.get('pbc') is not None:
                 atoms.set_pbc(init_atoms_json['pbc'])
-            
-            return atoms
+        
+        # Force garbage collection after reconstructing atoms
+        gc.collect()
+        return atoms
     
     def add_training_frame(
         self,
         run_id: str,
-        ase_db_id: int,
+        trajectory_frame_id: int,
         model_version_sampled_from: int,
         traj_id: int,
         chunk_id: int,
@@ -936,11 +1143,11 @@ class TrajectoryDB:
         
         Args:
             run_id: Run identifier
-            ase_db_id: ID of the frame in the ASE database
+            trajectory_frame_id: ID of the frame in the trajectory_frames table
             model_version_sampled_from: Model version that generated this frame
-            traj_id: Trajectory identifier (denormalized from ASE DB)
-            chunk_id: Chunk identifier (denormalized from ASE DB)
-            attempt_index: Attempt index (denormalized from ASE DB)
+            traj_id: Trajectory identifier (denormalized)
+            chunk_id: Chunk identifier (denormalized)
+            attempt_index: Attempt index (denormalized)
             
         Returns:
             DBTrainingFrame instance
@@ -949,7 +1156,7 @@ class TrajectoryDB:
             # Check if training frame already exists
             existing = sess.query(DBTrainingFrame).filter_by(
                 run_id=run_id,
-                ase_db_id=ase_db_id
+                trajectory_frame_id=trajectory_frame_id
             ).first()
             
             if existing:
@@ -958,7 +1165,7 @@ class TrajectoryDB:
             # Create new training frame entry
             db_training_frame = DBTrainingFrame(
                 run_id=run_id,
-                ase_db_id=ase_db_id,
+                trajectory_frame_id=trajectory_frame_id,
                 model_version_sampled_from=model_version_sampled_from,
                 traj_id=traj_id,
                 chunk_id=chunk_id,
@@ -972,18 +1179,18 @@ class TrajectoryDB:
     
     def get_training_frames(
         self,
-        run_id: str,
-        ase_db: ase.database.connect
+        run_id: str
     ) -> list[Atoms]:
         """Get all training frames for a run
         
         Args:
             run_id: Run identifier
-            ase_db: ASE database connection to query frames from
             
         Returns:
             List of Atoms objects from all training frames
         """
+        # Extract binary data while session is active
+        atoms_blobs = []
         with self.session() as sess:
             training_frames = sess.query(DBTrainingFrame).filter_by(
                 run_id=run_id
@@ -994,17 +1201,20 @@ class TrajectoryDB:
             if not training_frames:
                 return []
             
-            # Get actual Atoms objects from ASE DB
-            atoms_list = []
-            for tf in training_frames:
-                try:
-                    row = ase_db.get(tf.ase_db_id)
-                    atoms_list.append(row.toatoms())
-                except KeyError:
-                    # Frame might have been deleted from ASE DB
-                    continue
+            # Get trajectory frame IDs
+            frame_ids = [tf.trajectory_frame_id for tf in training_frames]
             
-            return atoms_list
+            # Extract binary data from trajectory_frames table
+            for frame_id in frame_ids:
+                frame = sess.query(DBTrajectoryFrame).filter_by(id=frame_id).first()
+                if frame:
+                    atoms_blobs.append(bytes(frame.atoms_blob))
+        
+        # Deserialize outside the session context
+        atoms_list = [self._deserialize_atoms(blob) for blob in atoms_blobs]
+        # Force garbage collection after deserializing large binary data
+        gc.collect()
+        return atoms_list
     
     def count_training_frames(self, run_id: str) -> int:
         """Count the number of training frames for a run
@@ -1082,14 +1292,12 @@ class TrajectoryDB:
     
     def get_sampled_traj_ids(
         self,
-        run_id: str,
-        ase_db
+        run_id: str
     ) -> set[int]:
         """Get unique trajectory IDs that have training frames sampled from them
         
         Args:
             run_id: Run identifier
-            ase_db: ASE database connection to query frames from
             
         Returns:
             Set of unique trajectory IDs from sampled frames
@@ -1102,20 +1310,8 @@ class TrajectoryDB:
             if not training_frames:
                 return set()
             
-            # Extract ASE DB IDs while session is still active
-            ase_db_ids = [tf.ase_db_id for tf in training_frames]
-            
-            # Get unique trajectory IDs from ASE DB
-            unique_traj_ids = set()
-            for ase_db_id in ase_db_ids:
-                try:
-                    row = ase_db.get(ase_db_id)
-                    traj_id = row.get('traj_id')
-                    if traj_id is not None:
-                        unique_traj_ids.add(traj_id)
-                except KeyError:
-                    # Frame might have been deleted from ASE DB
-                    continue
+            # Extract unique trajectory IDs from denormalized data
+            unique_traj_ids = {tf.traj_id for tf in training_frames}
             
             return unique_traj_ids
     
@@ -1205,23 +1401,22 @@ class TrajectoryDB:
         if atoms_json.get('pbc') is not None:
             atoms.pbc = np.array(atoms_json['pbc'])
         
+        # Force garbage collection after reconstructing atoms
+        gc.collect()
         return atoms
     
     def count_active_trajs_with_samples(
         self,
-        run_id: str,
-        ase_db: ase.database.connect
-    ) -> tuple[int, int]:  # todo mt.2025.11.12: make this more efficient, dont read all frames until you need them
+        run_id: str
+    ) -> tuple[int, int]:
         """Count active trajectories and those with sampled training frames
         
         Args:
             run_id: Run identifier
-            ase_db: ASE database connection to query frames from
             
         Returns:
             Tuple of (total_active_trajectories, active_trajectories_with_samples)
         """
-        # Get training frames and trajectories outside the session to avoid deadlocks
         with self.session() as sess:
             # Get all trajectories for this run
             all_trajectories = sess.query(DBTrajectory).filter_by(
@@ -1229,33 +1424,20 @@ class TrajectoryDB:
             ).all()
             
             # Get training frames that haven't been consumed by a training round yet
-            training_frames = [
-                tf for tf in sess.query(DBTrainingFrame).filter_by(
-                    run_id=run_id
-                ).all()
-                if tf.training_round is None
-            ]
+            training_frames = sess.query(DBTrainingFrame).filter_by(
+                run_id=run_id
+            ).filter(
+                DBTrainingFrame.training_round.is_(None)
+            ).all()
             
-            # Extract ASE DB IDs while session is active
-            ase_db_ids = [tf.ase_db_id for tf in training_frames]
-            
-            # Extract trajectory info while session is active to avoid DetachedInstanceError
+            # Extract trajectory info while session is active
             trajectory_info = [
                 {'traj_id': traj.traj_id, 'status': traj.status}
                 for traj in all_trajectories
             ]
-        
-        # Get unique trajectory IDs from sampled frames (outside session to avoid deadlock)
-        sampled_traj_ids = set()
-        for ase_db_id in ase_db_ids:
-            try:
-                row = ase_db.get(ase_db_id)
-                traj_id = row.get('traj_id')
-                if traj_id is not None:
-                    sampled_traj_ids.add(traj_id)
-            except KeyError:
-                # Frame might have been deleted from ASE DB
-                continue
+            
+            # Get unique trajectory IDs from sampled frames (denormalized data)
+            sampled_traj_ids = {tf.traj_id for tf in training_frames}
         
         # Now check which trajectories are active and have samples
         active_count = 0

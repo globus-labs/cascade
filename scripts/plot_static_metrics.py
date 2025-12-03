@@ -29,7 +29,10 @@ LOG_PATTERNS = {
         r'Submitting audit for chunk (\d+) of traj (\d+)'
     ),
     'auditor_received': re.compile(
-        r'Received chunk (\d+) from traj (\d+)',
+        r'Received chunk (\d+) from traj (\d+)'
+    ),
+    'auditor_submit_task': re.compile(
+        r'Submitting audit of chunk (\d+) of traj (\d+) to executor'
     ),
     'audit_passed': re.compile(
         r'Audit passed for chunk (\d+) of traj (\d+)'
@@ -40,8 +43,17 @@ LOG_PATTERNS = {
     'next_chunk_submitted': re.compile(
         r'Submitted next chunk (\d+) for traj (\d+)'
     ),
+    'auditor_submit_sampler': re.compile(
+        r'Submitting failed chunk (\d+) of traj (\d+) to sampler'
+    ),
     'sampler_received': re.compile(
         r'Sampling frames from chunk (\d+) of traj (\d+)'
+    ),
+    'sampler_submit_labeler': re.compile(
+        r'Submitting training frame from traj (\d+) chunk (\d+) to labeler'
+    ),
+    'labeler_received': re.compile(
+        r'Received training frame \(trajectory_frame_id=\d+\)'
     ),
     'trajectory_complete': re.compile(
         r'Traj (\d+) is complete'
@@ -56,8 +68,18 @@ LOG_PATTERNS = {
     ),
 }
 
-# FD count pattern
-FD_PATTERN = re.compile(
+# FD count patterns - separate patterns for distinct log lines
+FD_TOTAL_PATTERN = re.compile(
+    r'FD total count: (\d+)'
+)
+FD_BREAKDOWN_PATTERN = re.compile(
+    r'FD breakdown: pipes=(\d+), files=(\d+), sockets=(\d+)'
+)
+FD_WARNING_PATTERN = re.compile(
+    r'FD WARNING: (.+)'
+)
+# Legacy pattern for backward compatibility
+FD_LEGACY_PATTERN = re.compile(
     r'FD counts: total=(\d+), pipes=(\d+), files=(\d+), sockets=(\d+)'
 )
 
@@ -120,7 +142,8 @@ def parse_log_file(log_file: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataF
                             'traj_id': traj_id,
                             'chunk_id': chunk_id,
                         })
-                    elif event_type in ['auditor_received', 'audit_passed', 'audit_failed', 'sampler_received']:
+                    elif event_type in ['auditor_received', 'auditor_submit_task', 'audit_passed', 'audit_failed', 
+                                        'auditor_submit_sampler', 'sampler_received', 'sampler_submit_labeler']:
                         if len(match.groups()) >= 2:
                             chunk_id, traj_id = int(match.group(1)), int(match.group(2))
                         else:
@@ -133,6 +156,10 @@ def parse_log_file(log_file: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataF
                             'traj_id': traj_id,
                             'chunk_id': chunk_id,
                         })
+                    elif event_type == 'labeler_received':
+                        # Labeler received doesn't have traj_id in the message, skip for now
+                        # or we could try to extract from context, but for now skip
+                        pass
                     elif event_type in ['trajectory_complete', 'submitted_to_dynamics']:
                         traj_id = int(match.group(1))
                         trajectory_events.append({
@@ -144,16 +171,62 @@ def parse_log_file(log_file: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataF
                         })
                     break
             
-            # Check for FD counts
-            fd_match = FD_PATTERN.search(line)
-            if fd_match:
+            # Check for FD counts - handle new distinct log lines
+            fd_total_match = FD_TOTAL_PATTERN.search(line)
+            fd_breakdown_match = FD_BREAKDOWN_PATTERN.search(line)
+            fd_legacy_match = FD_LEGACY_PATTERN.search(line)
+            
+            # Handle new format: separate total and breakdown lines
+            if fd_total_match:
+                total = int(fd_total_match.group(1))
+                # Look for breakdown on next lines (within 1 second)
+                # For now, just record total - we'll merge breakdowns later
                 fd_counts.append({
                     'timestamp': timestamp,
-                    'total': int(fd_match.group(1)),
-                    'pipes': int(fd_match.group(2)),
-                    'files': int(fd_match.group(3)),
-                    'sockets': int(fd_match.group(4)),
+                    'total': total,
+                    'pipes': None,
+                    'files': None,
+                    'sockets': None,
                 })
+            elif fd_breakdown_match:
+                # Breakdown line - try to match with most recent total
+                pipes = int(fd_breakdown_match.group(1))
+                files = int(fd_breakdown_match.group(2))
+                sockets = int(fd_breakdown_match.group(3))
+                
+                # Find most recent total entry without breakdown and update it
+                for fd_entry in reversed(fd_counts):
+                    if fd_entry['pipes'] is None and fd_entry['total'] is not None:
+                        # Update this entry with breakdown
+                        fd_entry['pipes'] = pipes
+                        fd_entry['files'] = files
+                        fd_entry['sockets'] = sockets
+                        break
+                else:
+                    # No matching total found, create new entry with just breakdown
+                    fd_counts.append({
+                        'timestamp': timestamp,
+                        'total': None,
+                        'pipes': pipes,
+                        'files': files,
+                        'sockets': sockets,
+                    })
+            elif fd_legacy_match:
+                # Legacy format - all in one line
+                fd_counts.append({
+                    'timestamp': timestamp,
+                    'total': int(fd_legacy_match.group(1)),
+                    'pipes': int(fd_legacy_match.group(2)),
+                    'files': int(fd_legacy_match.group(3)),
+                    'sockets': int(fd_legacy_match.group(4)),
+                })
+            
+            # Check for FD warnings
+            fd_warning_match = FD_WARNING_PATTERN.search(line)
+            if fd_warning_match:
+                # Store warnings separately for potential analysis
+                # Could add a warnings list if needed
+                pass
             
             # Check for resource counts
             resource_match = RESOURCE_PATTERN.search(line)
@@ -200,6 +273,39 @@ def parse_log_file(log_file: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataF
     pool_df = pd.DataFrame(pool_stats)
     executor_df = pd.DataFrame(executor_health)
     
+    # Process FD dataframe to handle None values
+    if not fd_df.empty:
+        # Sort by timestamp
+        fd_df = fd_df.sort_values('timestamp').reset_index(drop=True)
+        
+        # Forward-fill breakdown values (pipes, files, sockets) from later entries
+        # Backward-fill total values from earlier entries
+        # This handles cases where total and breakdown are on separate log lines
+        # Since they're logged close together, this should work well
+        
+        # Use pandas fillna with method parameter (deprecated but still works)
+        # For newer pandas, we'd use ffill() and bfill() methods
+        try:
+            # Try new pandas API first
+            fd_df['pipes'] = fd_df['pipes'].ffill()
+            fd_df['files'] = fd_df['files'].ffill()
+            fd_df['sockets'] = fd_df['sockets'].ffill()
+            fd_df['total'] = fd_df['total'].bfill()
+        except AttributeError:
+            # Fall back to old API
+            fd_df['pipes'] = fd_df['pipes'].fillna(method='ffill')
+            fd_df['files'] = fd_df['files'].fillna(method='ffill')
+            fd_df['sockets'] = fd_df['sockets'].fillna(method='ffill')
+            fd_df['total'] = fd_df['total'].fillna(method='bfill')
+        
+        # Fill any remaining None values with 0
+        fd_df = fd_df.fillna(0)
+        
+        # Convert to int
+        for col in ['total', 'pipes', 'files', 'sockets']:
+            if col in fd_df.columns:
+                fd_df[col] = fd_df[col].astype(int)
+    
     return trajectory_df, fd_df, resource_df, pool_df, executor_df
 
 
@@ -215,29 +321,47 @@ def track_trajectory_states(trajectory_df: pd.DataFrame) -> Dict[int, List[Tuple
             event_type = event['event_type']
             timestamp = event['timestamp']
             
+            # Determine new agent state based on event type
+            new_agent = None
+            
             # State transitions based on event type
+            # DynamicsEngine events
             if event_type in ['dynamics_received', 'submitted_to_dynamics', 'next_chunk_submitted']:
-                current_agent = 'DynamicsEngine'
-            elif event_type in ['dynamics_submit_audit', 'submitting_to_audit']:
-                current_agent = 'Auditor'
-            elif event_type == 'auditor_received':
-                current_agent = 'Auditor'
-            elif event_type == 'audit_failed':
-                current_agent = 'DummySampler'
+                new_agent = 'DynamicsEngine'
+            # Auditor events - transition to auditor when chunk arrives or is submitted
+            elif event_type in ['dynamics_submit_audit', 'submitting_to_audit', 'auditor_received', 'auditor_submit_task']:
+                new_agent = 'Auditor'
+            # Audit result - passed means next chunk goes to dynamics, failed goes to sampler
             elif event_type == 'audit_passed':
                 # Check if there's a next chunk coming
                 future_events = traj_events[traj_events['timestamp'] > timestamp]
                 if any(future_events['event_type'] == 'next_chunk_submitted'):
-                    current_agent = 'DynamicsEngine'
+                    # Next chunk will be submitted, so trajectory stays with auditor briefly
+                    # then transitions to dynamics when next_chunk_submitted is seen
+                    new_agent = 'Auditor'
                 else:
-                    current_agent = 'Auditor'
-            elif event_type == 'sampler_received':
-                current_agent = 'DummySampler'
+                    new_agent = None  # Trajectory complete
+            elif event_type in ['audit_failed', 'auditor_submit_sampler']:
+                # Failed audit - trajectory transitions to sampler
+                new_agent = 'DummySampler'
+            # Sampler events
+            elif event_type in ['sampler_received', 'sampler_submit_labeler']:
+                new_agent = 'DummySampler'
+            # Labeler events
+            elif event_type == 'labeler_received':
+                new_agent = 'DummyLabeler'
+            # Completion
             elif event_type == 'trajectory_complete':
-                current_agent = None
+                new_agent = None
             
-            if current_agent:
-                traj_states[traj_id].append((timestamp, current_agent))
+            # Only add state entry if agent actually changed
+            # This prevents duplicate entries when multiple events occur for the same agent
+            if new_agent != current_agent:
+                current_agent = new_agent
+                if current_agent:
+                    traj_states[traj_id].append((timestamp, current_agent))
+                # If new_agent is None (trajectory complete), we don't add an entry
+                # The trajectory will remain in its last state until completion
     
     return dict(traj_states)
 

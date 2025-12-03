@@ -329,7 +329,7 @@ class TestTrajectoryDB:
         assert len(chunk_ids) == 2
         assert set(chunk_ids) == {0, 2}
 
-    def test_get_trajectory_atoms(self, traj_db, example_atoms, ase_db):
+    def test_get_trajectory_atoms(self, traj_db, example_atoms):
         """Test getting all atoms from passed chunks."""
         traj_db.initialize_trajectory(
             run_id="test_run",
@@ -338,21 +338,24 @@ class TestTrajectoryDB:
             init_atoms=example_atoms
         )
 
-        # Add and pass some chunks with frames in ASE DB
+        # Add and pass some chunks with frames
         n_chunks = 3
         for chunk_id in range(n_chunks):
             attempt_idx = traj_db.get_next_attempt_index("test_run", 0, chunk_id)
             
             chunk_size = 5
-            # Write some frames to ASE DB
+            # Write some frames using write_frame
             for frame_idx in range(chunk_size+1):  # one more for duplicated first/last frame
                 atoms = example_atoms.copy()
                 atoms.positions += 0.1 * frame_idx
-                ase_db.write(atoms, 
-                            run_id="test_run",
-                            traj_id=0,
-                            chunk_id=chunk_id,
-                            attempt_index=attempt_idx)
+                traj_db.write_frame(
+                    run_id="test_run",
+                    traj_id=0,
+                    chunk_id=chunk_id,
+                    attempt_index=attempt_idx,
+                    frame_index=frame_idx,
+                    atoms=atoms
+                )
 
             traj_db.add_chunk_attempt(
                 run_id="test_run",
@@ -373,7 +376,7 @@ class TestTrajectoryDB:
             )
 
         # Get all atoms
-        all_atoms = traj_db.get_trajectory_atoms("test_run", 0, ase_db)
+        all_atoms = traj_db.get_trajectory_atoms("test_run", 0)
         assert len(all_atoms) == chunk_size * n_chunks + 1 # 3 chunks * 5 frames + initial frame
 
         assert np.allclose(all_atoms[0].get_positions(), example_atoms.get_positions())
@@ -555,11 +558,27 @@ class TestTrajectoryDB:
 
         assert traj_db.is_trajectory_done("test_run", 0)
 
-    def test_add_training_frame(self, traj_db):
+    def test_add_training_frame(self, traj_db, example_atoms):
         """Test adding a training frame."""
+        # First create a trajectory frame
+        traj_db.initialize_trajectory(
+            run_id="test_run",
+            traj_id=0,
+            target_length=100,
+            init_atoms=example_atoms
+        )
+        frame_id = traj_db.write_frame(
+            run_id="test_run",
+            traj_id=0,
+            chunk_id=0,
+            attempt_index=0,
+            frame_index=0,
+            atoms=example_atoms
+        )
+        
         traj_db.add_training_frame(
             run_id="test_run",
-            ase_db_id=42,
+            trajectory_frame_id=frame_id,
             model_version_sampled_from=5,
             traj_id=0,
             chunk_id=0,
@@ -570,11 +589,27 @@ class TestTrajectoryDB:
         count = traj_db.count_training_frames("test_run")
         assert count == 1
 
-    def test_add_training_frame_idempotent(self, traj_db):
+    def test_add_training_frame_idempotent(self, traj_db, example_atoms):
         """Test that adding the same training frame twice returns the same object."""
+        # First create a trajectory frame
+        traj_db.initialize_trajectory(
+            run_id="test_run",
+            traj_id=0,
+            target_length=100,
+            init_atoms=example_atoms
+        )
+        frame_id = traj_db.write_frame(
+            run_id="test_run",
+            traj_id=0,
+            chunk_id=0,
+            attempt_index=0,
+            frame_index=0,
+            atoms=example_atoms
+        )
+        
         traj_db.add_training_frame(
             run_id="test_run",
-            ase_db_id=42,
+            trajectory_frame_id=frame_id,
             model_version_sampled_from=5,
             traj_id=0,
             chunk_id=0,
@@ -583,7 +618,7 @@ class TestTrajectoryDB:
 
         traj_db.add_training_frame(
             run_id="test_run",
-            ase_db_id=42,
+            trajectory_frame_id=frame_id,
             model_version_sampled_from=5,
             traj_id=0,
             chunk_id=0,
@@ -594,20 +629,28 @@ class TestTrajectoryDB:
         count = traj_db.count_training_frames("test_run")
         assert count == 1
 
-    def test_count_training_frames(self, traj_db):
+    def test_count_training_frames(self, traj_db, example_atoms):
         """Test counting training frames."""
+        # Initialize trajectories and create frames
+        traj_db.initialize_trajectory("test_run", 0, 100, example_atoms)
+        traj_db.initialize_trajectory("test_run", 1, 100, example_atoms)
+        
+        frame_id1 = traj_db.write_frame("test_run", 0, 0, 0, 0, example_atoms)
+        frame_id2 = traj_db.write_frame("test_run", 0, 0, 1, 0, example_atoms)
+        frame_id3 = traj_db.write_frame("test_run", 1, 0, 2, 0, example_atoms)
+        
         count = traj_db.count_training_frames("test_run")
         assert count == 0
 
         # Add some training frames
-        traj_db.add_training_frame("test_run", 1, 0, 0, 0, 0)
-        traj_db.add_training_frame("test_run", 2, 0, 0, 1, 0)
-        traj_db.add_training_frame("test_run", 3, 1, 0, 2, 0)
+        traj_db.add_training_frame("test_run", frame_id1, 0, 0, 0, 0)
+        traj_db.add_training_frame("test_run", frame_id2, 0, 0, 1, 0)
+        traj_db.add_training_frame("test_run", frame_id3, 1, 0, 2, 0)
 
         count = traj_db.count_training_frames("test_run")
         assert count == 3
 
-    def test_get_sampled_traj_ids(self, traj_db, ase_db, example_atoms):
+    def test_get_sampled_traj_ids(self, traj_db, example_atoms):
         """Test getting sampled trajectory IDs from training frames."""
         traj_db.initialize_trajectory(
             run_id="test_run",
@@ -623,48 +666,48 @@ class TestTrajectoryDB:
             init_atoms=example_atoms
         )
 
-        # Add some frames to ASE DB
+        # Add some frames using write_frame
         atoms1 = example_atoms.copy()
         atoms2 = example_atoms.copy()
         atoms3 = example_atoms.copy()
 
-        ase_db.write(atoms1, run_id="test_run", traj_id=0, chunk_id=0, attempt_index=0)
-        ase_db.write(atoms2, run_id="test_run", traj_id=0, chunk_id=0, attempt_index=0)
-        ase_db.write(atoms3, run_id="test_run", traj_id=1, chunk_id=0, attempt_index=0)
+        frame_id1 = traj_db.write_frame("test_run", 0, 0, 0, 0, atoms1)
+        frame_id2 = traj_db.write_frame("test_run", 0, 0, 0, 1, atoms2)
+        frame_id3 = traj_db.write_frame("test_run", 1, 0, 0, 0, atoms3)
 
-        # Add training frames (matching the ASE DB entries above)
-        traj_db.add_training_frame("test_run", 1, 0, 0, 0, 0)  # traj_id=0, chunk_id=0, attempt_index=0
-        traj_db.add_training_frame("test_run", 2, 0, 0, 0, 0)  # traj_id=0, chunk_id=0, attempt_index=0
-        traj_db.add_training_frame("test_run", 3, 0, 1, 0, 0)  # traj_id=1, chunk_id=0, attempt_index=0
+        # Add training frames
+        traj_db.add_training_frame("test_run", frame_id1, 0, 0, 0, 0)  # traj_id=0, chunk_id=0, attempt_index=0
+        traj_db.add_training_frame("test_run", frame_id2, 0, 0, 0, 0)  # traj_id=0, chunk_id=0, attempt_index=0
+        traj_db.add_training_frame("test_run", frame_id3, 0, 1, 0, 0)  # traj_id=1, chunk_id=0, attempt_index=0
 
-        sampled_ids = traj_db.get_sampled_traj_ids("test_run", ase_db)
+        sampled_ids = traj_db.get_sampled_traj_ids("test_run")
 
         assert sampled_ids == {0, 1}
     
-    def test_count_active_trajs_with_samples(self, traj_db, ase_db, example_atoms):
+    def test_count_active_trajs_with_samples(self, traj_db, example_atoms):
         """Test counting active trajectories with samples."""
         # Initialize 3 trajectories
         traj_db.initialize_trajectory("test_run", 0, 100, example_atoms)
         traj_db.initialize_trajectory("test_run", 1, 100, example_atoms)
         traj_db.initialize_trajectory("test_run", 2, 100, example_atoms)
         
-        # Add some atoms to ASE DB
+        # Add some atoms using write_frame
         atoms0 = Atoms(positions=[[0, 0, 0], [1, 1, 1]], numbers=[1, 1])
         atoms1 = Atoms(positions=[[2, 2, 2], [3, 3, 3]], numbers=[2, 2])
         
-        id0 = ase_db.write(atoms0, run_id="test_run", traj_id=0, chunk_id=0, attempt_index=0)
-        id1 = ase_db.write(atoms1, run_id="test_run", traj_id=1, chunk_id=0, attempt_index=0)
+        frame_id0 = traj_db.write_frame("test_run", 0, 0, 0, 0, atoms0)
+        frame_id1 = traj_db.write_frame("test_run", 1, 0, 0, 0, atoms1)
         
         # Initially, no samples
-        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run", ase_db)
+        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run")
         assert total_active == 3
         assert with_samples == 0
         
         # Add training frames from trajectories 0 and 1
-        traj_db.add_training_frame("test_run", id0, 0, 0, 0, 0)  # traj_id=0, chunk_id=0, attempt_index=0
-        traj_db.add_training_frame("test_run", id1, 0, 1, 0, 0)  # traj_id=1, chunk_id=0, attempt_index=0
+        traj_db.add_training_frame("test_run", frame_id0, 0, 0, 0, 0)  # traj_id=0, chunk_id=0, attempt_index=0
+        traj_db.add_training_frame("test_run", frame_id1, 0, 1, 0, 0)  # traj_id=1, chunk_id=0, attempt_index=0
         
-        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run", ase_db)
+        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run")
         assert total_active == 3
         assert with_samples == 2
 
@@ -672,17 +715,17 @@ class TestTrajectoryDB:
         marked = traj_db.mark_training_frames_for_round("test_run", training_round=1)
         assert marked == 2
 
-        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run", ase_db)
+        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run")
         assert total_active == 3
         assert with_samples == 0
 
         # Add new training frames (round remains None) for trajectories 0 and 1
-        id0_round2 = ase_db.write(atoms0.copy(), run_id="test_run", traj_id=0, chunk_id=0, attempt_index=1)
-        id1_round2 = ase_db.write(atoms1.copy(), run_id="test_run", traj_id=1, chunk_id=0, attempt_index=1)
-        traj_db.add_training_frame("test_run", id0_round2, 0, 0, 0, 0)
-        traj_db.add_training_frame("test_run", id1_round2, 0, 1, 0, 0)
+        frame_id0_round2 = traj_db.write_frame("test_run", 0, 0, 1, 0, atoms0.copy())
+        frame_id1_round2 = traj_db.write_frame("test_run", 1, 0, 1, 0, atoms1.copy())
+        traj_db.add_training_frame("test_run", frame_id0_round2, 0, 0, 0, 0)
+        traj_db.add_training_frame("test_run", frame_id1_round2, 0, 1, 0, 0)
         
-        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run", ase_db)
+        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run")
         assert total_active == 3
         assert with_samples == 2
         
@@ -691,7 +734,7 @@ class TestTrajectoryDB:
         traj_db.update_chunk_audit_status("test_run", 2, 0, 0, AuditStatus.PASSED)
         
         # Now only 2 active trajectories
-        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run", ase_db)
+        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run")
         assert total_active == 2
         assert with_samples == 2
         
@@ -700,7 +743,7 @@ class TestTrajectoryDB:
         traj_db.update_chunk_audit_status("test_run", 1, 1, 0, AuditStatus.PASSED)
         
         # Now only 1 active trajectory (trajectory 0)
-        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run", ase_db)
+        total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run")
         assert total_active == 1
         assert with_samples == 1
     
@@ -747,9 +790,13 @@ class TestTrajectoryDB:
         traj_db.add_chunk_attempt(run_id, 0, 1, 0, 10, AuditStatus.PASSED)
         traj_db.add_chunk_attempt(run_id, 1, 0, 0, 10, AuditStatus.PENDING)
         
+        # Create trajectory frames first
+        frame_id1 = traj_db.write_frame(run_id, 0, 0, 0, 0, example_atoms)
+        frame_id2 = traj_db.write_frame(run_id, 0, 1, 0, 0, example_atoms)
+        
         # Add training frames
-        traj_db.add_training_frame(run_id, 123, 0, 0, 0, 0)  # traj_id=0, chunk_id=0, attempt_index=0
-        traj_db.add_training_frame(run_id, 456, 0, 0, 1, 0)  # traj_id=0, chunk_id=1, attempt_index=0
+        traj_db.add_training_frame(run_id, frame_id1, 0, 0, 0, 0)  # traj_id=0, chunk_id=0, attempt_index=0
+        traj_db.add_training_frame(run_id, frame_id2, 0, 0, 1, 0)  # traj_id=0, chunk_id=1, attempt_index=0
         
         # Mark chunk 1 as passed for trajectory 0
         traj_db.update_chunk_audit_status(run_id, 0, 1, 0, AuditStatus.PASSED)

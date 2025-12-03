@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from cascade.model import ChunkSpec, AuditResult
-    from ase.db import connect
     from cascade.model import AdvanceSpec
     from cascade.learning.base import BaseLearnableForcefield
     from ase import Atoms
@@ -27,8 +26,11 @@ def random_audit(
     import numpy as np
 
     time.sleep(sleep_time)
-    passed = np.random.random() < accept_prob
-    score = np.random.random() if passed else 0.0
+    # Create a new random generator seeded with OS entropy to ensure
+    # each worker process gets a unique random state
+    rng = np.random.default_rng(seed=None)
+    passed = rng.random() < accept_prob
+    score = rng.random() if passed else 0.0
     status = AuditStatus.PASSED if passed else AuditStatus.FAILED
     return AuditResult(status=status, score=score, traj_id=chunk_spec.traj_id, chunk_id=chunk_spec.chunk_id, attempt_index=attempt_index)
 
@@ -48,48 +50,43 @@ def advance_dynamics(
     """
     import numpy as np
     from cascade.utils import canonicalize
-    from ase.db import connect
+    from cascade.agents.db_orm import TrajectoryDB
     
-    # Create database connection in worker process to avoid FD leaks
-    db = connect(db_url)
+    # Create TrajectoryDB instance in the worker process with NullPool (no connection pooling)
+    traj_db = TrajectoryDB(db_url, use_null_pool=True)
     
-    atoms = spec.atoms
-    calc = learner.make_calculator(weights, device=device)
-    atoms.calc = calc
+    try:
+        atoms = spec.atoms
+        calc = learner.make_calculator(weights, device=device)
+        atoms.calc = calc
 
-    dyn = dyn_cls(atoms, **dyn_kws)
-
-    def write_to_db():
-        # needs to be 64 bit for db read
-        f = atoms.calc.results['forces']
-        atoms.calc.results['forces'] = f.astype(np.float64)
-        canonical_atoms = canonicalize(atoms)
+        dyn = dyn_cls(atoms, **dyn_kws)
         
-        # Retry logic for foreign key constraint violations (race conditions)
-        max_retries = 3
-        import time
-        import psycopg2.errors
-        
-        for attempt in range(max_retries):
-            try:
-                db.write(
-                    canonical_atoms, 
-                    chunk_id=spec.chunk_id,
-                    traj_id=spec.traj_id,
-                    run_id=spec.run_id,
-                    attempt_index=spec.attempt_index)
-                break  # Success, exit retry loop
-            except psycopg2.errors.ForeignKeyViolation as e:
-                if attempt < max_retries - 1:
-                    # Exponential backoff: 0.1s, 0.2s, 0.4s
-                    sleep_time = 0.1 * (2 ** attempt)
-                    time.sleep(sleep_time)
-                    continue
-                else:
-                    # Last attempt failed, re-raise the exception
-                    raise
-    dyn.attach(write_to_db)
+        frame_index = 0  # Track frame index within this chunk
 
-    dyn.run(spec.steps, **run_kws)
+        def write_to_db():
+            nonlocal frame_index
+            f = atoms.calc.results['forces']
+            atoms.calc.results['forces'] = f.astype(np.float64)
+            canonical_atoms = canonicalize(atoms)
+            
+            # Write frame to database
+            traj_db.write_frame(
+                run_id=spec.run_id,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                attempt_index=spec.attempt_index,
+                frame_index=frame_index,
+                atoms=canonical_atoms
+            )
+            frame_index += 1
+        
+        dyn.attach(write_to_db)
+
+        dyn.run(spec.steps, **run_kws)
+    finally:
+        # Dispose of the engine to close all connections and release file descriptors
+        traj_db.dispose()
+    
     return spec
 
