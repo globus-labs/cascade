@@ -341,7 +341,18 @@ class DynamicsEngine(CascadeAgent):
         self,
         future: Future
     ) -> None:
-        """Handle the results of an advance dynamics call"""
+        """Handle the results of an advance dynamics call
+        
+        Args:
+            future: The future that contains the result of the advance dynamics call
+
+        Returns:
+            None
+
+        Track the chunk metadata in the database and submit to auditor.
+        """
+        self.logger.debug('Advance dynamics callback started')
+        self.logger.info('Getting future result')
         spec = future.result()
         if isinstance(spec, dict):
             spec = AdvanceSpec(**spec)
@@ -474,20 +485,16 @@ class Auditor(CascadeAgent):
             )
             
             # Check if trajectory is done using the data model
+            # this will also update the trajectory status to DONE in the database
             done = self._traj_db.is_trajectory_done(
                 run_id=self.config.run_id,
                 traj_id=result.traj_id
             )
             if done:
-                # trajectory done, already marked in db 
                 self.logger.info(f"Traj {result.traj_id} is complete")
             else:
                 # Trajectory not done - submit next chunk
                 # Get the last frame from the current chunk to use as starting point
-                # Track file FDs before ASE DB operation
-                fd_counts_before = count_file_descriptors_by_type()
-                file_fds_before = fd_counts_before.get('REG', 0)
-                
                 last_frame = self._traj_db.get_last_frame_from_chunk(
                     run_id=self.config.run_id,
                     traj_id=result.traj_id,
@@ -497,15 +504,6 @@ class Auditor(CascadeAgent):
                 # Force garbage collection after retrieving atoms
                 gc.collect()
                 
-                # Track file FDs after ASE DB operation
-                fd_counts_after = count_file_descriptors_by_type()
-                file_fds_after = fd_counts_after.get('REG', 0)
-                
-                if file_fds_after > file_fds_before:
-                    self.logger.warning(
-                        f"File FD increase after get_last_frame_from_chunk (traj {result.traj_id}, chunk {result.chunk_id}): "
-                        f"{file_fds_before} -> {file_fds_after} (delta: +{file_fds_after - file_fds_before})"
-                    )
                 # Create and submit next advance spec
                 next_chunk_id = result.chunk_id + 1
                 next_attempt_index = self._traj_db.get_next_attempt_index(
