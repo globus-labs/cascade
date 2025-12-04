@@ -47,7 +47,6 @@ class DBTrajectory(Base):
     traj_id = Column(Integer, nullable=False)
     target_length = Column(Integer, nullable=False)
     chunks_completed = Column(Integer, default=0, nullable=False)
-    done = Column(Boolean, default=False, nullable=False)  # legacy flag
     status = Column(SQLEnum(TrajectoryStatus), nullable=False, default=TrajectoryStatus.RUNNING)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -347,23 +346,16 @@ class TrajectoryDB:
             sess.refresh(db_frame)
             return db_frame.id
     
-    def _sync_trajectory_done_flag(self, traj: DBTrajectory) -> None:
-        """Keep legacy boolean in sync with enum-based trajectory status."""
-        traj.done = traj.status == TrajectoryStatus.COMPLETED
-
     def _set_trajectory_status(
         self,
         sess,
         traj: DBTrajectory,
         status: TrajectoryStatus,
     ) -> None:
-        """Internal helper to update trajectory status and maintain derived fields."""
+        """Internal helper to update trajectory status."""
         previous_status = traj.status
-        previous_done = traj.done
         if previous_status != status:
             traj.status = status
-        self._sync_trajectory_done_flag(traj)
-        if previous_status != traj.status or previous_done != traj.done:
             sess.flush()
 
     def mark_trajectory_status(
@@ -445,7 +437,6 @@ class TrajectoryDB:
                     chunks_completed=0,
                     init_atoms_json=init_atoms_json,
                     status=TrajectoryStatus.RUNNING,
-                    done=False,
                 )
                 sess.add(db_traj)
                 self._set_trajectory_status(sess, db_traj, TrajectoryStatus.RUNNING)
@@ -1043,6 +1034,25 @@ class TrajectoryDB:
         gc.collect()
         return atoms
     
+    def get_current_training_round(self, run_id: str) -> int:
+        """Get the current training round number for a run
+        
+        Returns the maximum training_round in the database, or 0 if none exists.
+        This represents the most recent training round that has frames.
+        
+        Args:
+            run_id: Run identifier
+            
+        Returns:
+            Current training round number (0-based)
+        """
+        with self.session() as sess:
+            max_round = sess.query(func.max(DBTrainingFrame.training_round)).filter_by(
+                run_id=run_id
+            ).scalar()
+            return max_round if max_round is not None else 0
+    
+    
     def add_training_frame(
         self,
         run_id: str,
@@ -1053,6 +1063,8 @@ class TrajectoryDB:
         attempt_index: int
     ) -> DBTrainingFrame:
         """Add a training frame to the database
+        
+        Training frames are immediately marked with the current training round.
         
         Args:
             run_id: Run identifier
@@ -1075,7 +1087,10 @@ class TrajectoryDB:
             if existing:
                 return existing
             
-            # Create new training frame entry
+            # Get current training round
+            current_round = self.get_current_training_round(run_id)
+            
+            # Create new training frame entry with current training round
             db_training_frame = DBTrainingFrame(
                 run_id=run_id,
                 trajectory_frame_id=trajectory_frame_id,
@@ -1083,7 +1098,7 @@ class TrajectoryDB:
                 traj_id=traj_id,
                 chunk_id=chunk_id,
                 attempt_index=attempt_index,
-                training_round=None  # Will be set when used in training
+                training_round=current_round  # Mark immediately with current round
             )
             sess.add(db_training_frame)
             sess.flush()
@@ -1169,36 +1184,65 @@ class TrajectoryDB:
     ) -> list[dict]:
         """Get unique chunks that generated frames used in a training round
         
+        Only returns chunks that don't already have a passed attempt.
+        Returns only the latest attempt_index for each (traj_id, chunk_id) pair.
+        
         Args:
             run_id: Run identifier
             training_round: Training round number
             
         Returns:
-            List of dicts with unique (traj_id, chunk_id, attempt_index) tuples.
+            List of dicts with unique (traj_id, chunk_id) pairs with their latest attempt_index.
             Each dict contains:
                 - traj_id: Trajectory identifier
                 - chunk_id: Chunk identifier
-                - attempt_index: Attempt index
+                - attempt_index: Latest attempt index for this chunk in the training round
         """
         with self.session() as sess:
-            # Get all frames from this training round
-            frames = sess.query(DBTrainingFrame).filter_by(
+            # Subquery to get latest attempt_index for each (traj_id, chunk_id) in training round
+            latest_attempts = sess.query(
+                DBTrainingFrame.traj_id,
+                DBTrainingFrame.chunk_id,
+                func.max(DBTrainingFrame.attempt_index).label('max_attempt_index')
+            ).filter_by(
                 run_id=run_id,
                 training_round=training_round
+            ).group_by(
+                DBTrainingFrame.traj_id,
+                DBTrainingFrame.chunk_id
+            ).subquery()
+            
+            # Subquery to find chunks with passed attempts
+            passed_chunks_subquery = sess.query(
+                DBTrajectoryChunk.traj_id,
+                DBTrajectoryChunk.chunk_id
+            ).filter_by(
+                run_id=run_id,
+                audit_status=AuditStatus.PASSED
+            ).subquery()
+            
+            # Join latest attempts with passed chunks subquery to exclude chunks with passed attempts
+            results = sess.query(
+                latest_attempts.c.traj_id,
+                latest_attempts.c.chunk_id,
+                latest_attempts.c.max_attempt_index
+            ).outerjoin(
+                passed_chunks_subquery,
+                (latest_attempts.c.traj_id == passed_chunks_subquery.c.traj_id) &
+                (latest_attempts.c.chunk_id == passed_chunks_subquery.c.chunk_id)
+            ).filter(
+                passed_chunks_subquery.c.traj_id.is_(None)
             ).all()
             
-            # Extract unique (traj_id, chunk_id, attempt_index) tuples
-            unique_chunks = {}
-            for frame in frames:
-                key = (frame.traj_id, frame.chunk_id, frame.attempt_index)
-                if key not in unique_chunks:
-                    unique_chunks[key] = {
-                        'traj_id': frame.traj_id,
-                        'chunk_id': frame.chunk_id,
-                        'attempt_index': frame.attempt_index
-                    }
-            
-            return list(unique_chunks.values())
+            # Convert to list of dicts
+            return [
+                {
+                    'traj_id': traj_id,
+                    'chunk_id': chunk_id,
+                    'attempt_index': max_attempt_index
+                }
+                for traj_id, chunk_id, max_attempt_index in results
+            ]
     
     def get_sampled_traj_ids(
         self,
@@ -1382,7 +1426,7 @@ class TrajectoryDB:
                 func.min(DBTrajectory.created_at).label('first_created'),
                 func.max(DBTrajectory.updated_at).label('last_updated'),
                 func.count(DBTrajectory.id).label('n_trajectories'),
-                func.sum(func.cast(DBTrajectory.done, Integer)).label('n_done_trajectories')
+                func.sum(func.cast(DBTrajectory.status == TrajectoryStatus.COMPLETED, Integer)).label('n_done_trajectories')
             ).group_by(DBTrajectory.run_id).all()
             
             result = []
@@ -1429,7 +1473,7 @@ class TrajectoryDB:
             # Get trajectory statistics
             traj_stats = sess.query(
                 func.count(DBTrajectory.id).label('n_trajectories'),
-                func.sum(func.cast(DBTrajectory.done, Integer)).label('n_done'),
+                func.sum(func.cast(DBTrajectory.status == TrajectoryStatus.COMPLETED, Integer)).label('n_done'),
                 func.min(DBTrajectory.created_at).label('first_created'),
                 func.max(DBTrajectory.updated_at).label('last_updated')
             ).filter_by(run_id=run_id).first()
@@ -1497,7 +1541,6 @@ class TrajectoryDB:
                 'traj_id': traj.traj_id,
                 'target_length': traj.target_length,
                 'chunks_completed': traj.chunks_completed,
-                'done': traj.done,
                 'created_at': traj.created_at,
                 'updated_at': traj.updated_at
             }
@@ -1636,7 +1679,6 @@ class TrajectoryDB:
                     'target_length': traj.target_length,
                     'chunks_completed': traj.chunks_completed,
                     'status': traj.status,
-                    'done': traj.done,
                     'created_at': traj.created_at,
                     'updated_at': traj.updated_at
                 })

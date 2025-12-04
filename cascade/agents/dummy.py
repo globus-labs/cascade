@@ -318,8 +318,8 @@ class DynamicsEngine(CascadeAgent):
             spec = AdvanceSpec(**spec)
         current_spec = spec
         self._traj_db.mark_trajectory_running(self.config.run_id, current_spec.traj_id)
-        self.logger.info(f"Received advance spec for traj {current_spec.traj_id} chunk {current_spec.chunk_id}")
-        description = f'advance dynamics traj {current_spec.traj_id} chunk {current_spec.chunk_id}'
+        self.logger.info(f"Received advance spec for traj {current_spec.traj_id} chunk {current_spec.chunk_id} attempt {current_spec.attempt_index}")
+        description = f'advance dynamics traj {current_spec.traj_id} chunk {current_spec.chunk_id} attempt {current_spec.attempt_index}'
 
         initial_future = self.executor.submit(
             self.advance_dynamics_task,
@@ -380,10 +380,10 @@ class DynamicsEngine(CascadeAgent):
         if success:
             self.logger.info(f"Recorded chunk {chunk_id} of traj {traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
         else:
-            self.logger.error(f"Failed to record chunk {chunk_id} of traj {traj_id} in database")
+            self.logger.error(f"Failed to record chunk {chunk_id} of traj {traj_id} in database (attempt {attempt_index})")
 
         # submit to auditor
-        self.logger.info(f"Submitting audit for chunk {chunk_id} of traj {traj_id}.")
+        self.logger.info(f"Submitting audit for chunk {chunk_id} of traj {traj_id} attempt {attempt_index}.")
         await self.auditor.submit(ChunkSpec(traj_id=traj_id, chunk_id=chunk_id))
 
 
@@ -520,7 +520,7 @@ class Auditor(CascadeAgent):
                     steps=self.config.chunk_size
                 )
                 await self.dynamics_engine.submit(next_spec)
-                self.logger.info(f"Submitted next chunk {result.chunk_id + 1} for traj {result.traj_id}")
+                self.logger.info(f"Submitted next chunk {result.chunk_id + 1} for traj {result.traj_id} (attempt {next_attempt_index}, after chunk {result.chunk_id} attempt {result.attempt_index} passed)")
         else:
             # audit failed, submit to sampler
             self.logger.info(
@@ -740,61 +740,7 @@ class DatabaseMonitor(CascadeAgent):
                     "Instances may be recreated unnecessarily."
                 )
             
-            # Monitor file descriptor counts by type for main process
-            import os
-            try:
-                pid = os.getpid()
-                fd_counts = count_file_descriptors_by_type()
-                
-                if 'error' not in fd_counts:
-                    total = fd_counts.get('total', 0)
-                    
-                    # Always log total count (from /proc, fast and reliable)
-                    self.logger.info(f"FD total count: {total}")
-                    
-                    # Log detailed breakdown if available (from lsof)
-                    pipes = fd_counts.get('PIPE', 0)
-                    files = fd_counts.get('REG', 0)
-                    sockets = fd_counts.get('IPv4', 0) + fd_counts.get('IPv6', 0)
-                    
-                    if pipes > 0 or files > 0 or sockets > 0:
-                        self.logger.info(
-                            f"FD breakdown: pipes={pipes}, files={files}, sockets={sockets}"
-                        )
-                    
-                    # Alert on high FD counts (separate warning lines)
-                    if total > 500:
-                        self.logger.warning(
-                            f"FD WARNING: High total FD count: {total}. Possible FD leak detected!"
-                        )
-                    if pipes > 100:
-                        self.logger.warning(
-                            f"FD WARNING: High pipe count: {pipes}. ProcessPoolExecutor may have issues."
-                        )
-                else:
-                    # Only log at debug level if FD counting fails - don't spam logs
-                    self.logger.debug(f"FD counting unavailable: {fd_counts.get('error', 'unknown')}")
-            except Exception as e:
-                # Don't let FD counting failures break the retrain loop
-                self.logger.debug(f"FD monitoring error: {e}")
-            
-            # Check executor worker health if executor is available
-            if self.executor is not None:
-                worker_health = check_executor_workers(self.executor)
-                if 'error' not in worker_health and 'skipped' not in worker_health:
-                    if worker_health.get('zombies', 0) > 0:
-                        self.logger.warning(
-                            f"Found {worker_health['zombies']} zombie worker processes: {worker_health}"
-                        )
-                    elif worker_health.get('dead', 0) > worker_health.get('alive', 0):
-                        self.logger.warning(
-                            f"Many dead workers detected: {worker_health}. Consider recreating executor."
-                        )
-                    else:
-                        self.logger.debug(f"Executor worker health: {worker_health}")
-            
-            # Log connection pool statistics for debugging FD leaks
-            self._traj_db.log_pool_stats(self.logger)
+           
             
             # Check if we have enough new training frames
             current_count = self._traj_db.count_training_frames(self.config.run_id)
@@ -829,8 +775,12 @@ class DatabaseMonitor(CascadeAgent):
                 if fraction_condition:
                     trigger_reason.append(f"fraction threshold ({sampled_fraction:.2%} >= {self.config.retrain_fraction:.2%})")
                 
-                # Increment training round
-                self.current_training_round += 1
+                # Get the training round for frames that will be used in this retraining
+                # (frames created before this retraining will have the current max training_round)
+                training_round_for_retrain = self._traj_db.get_current_training_round(self.config.run_id)
+                
+                # Increment training round - new frames created after this will use the new round
+                self.current_training_round = training_round_for_retrain + 1
                 
                 self.logger.info(
                     f"Starting retraining (round {self.current_training_round}) triggered by: {', '.join(trigger_reason)}\n"
@@ -839,24 +789,28 @@ class DatabaseMonitor(CascadeAgent):
                     f"fraction={sampled_fraction:.2%}"
                 )
 
-                # Mark all unmarked training frames with the current training round
-                frames_marked = self._traj_db.mark_training_frames_for_round(
-                    run_id=self.config.run_id,
-                    training_round=self.current_training_round
-                )
-                self.logger.info(f"Marked {frames_marked} training frames for round {self.current_training_round}")
-
                 # Train model and update weights in dynamics engine
                 weights = await self.trainer.train_model()
                 await self.dynamics_engine.receive_weights(weights)
                 
-                # Get unique chunks that generated frames in this training round
+                # Get unique chunks that generated frames in the training round we're using
+                # (frames created before this retraining will have training_round = training_round_for_retrain)
                 chunks_to_resubmit = self._traj_db.get_chunks_from_training_round(
                     run_id=self.config.run_id,
-                    training_round=self.current_training_round
+                    training_round=training_round_for_retrain
                 )
                 
-                self.logger.info(f"Found {len(chunks_to_resubmit)} unique chunks to resubmit from training round {self.current_training_round}")
+                # Deduplicate by (traj_id, chunk_id) only - we only want to resubmit each chunk once,
+                # not once per failed attempt. Keep the first entry for each unique (traj_id, chunk_id).
+                unique_chunks_by_id = {}
+                for chunk_info in chunks_to_resubmit:
+                    key = (chunk_info['traj_id'], chunk_info['chunk_id'])
+                    if key not in unique_chunks_by_id:
+                        unique_chunks_by_id[key] = chunk_info
+                
+                chunks_to_resubmit = list(unique_chunks_by_id.values())
+                
+                self.logger.info(f"Found {len(chunks_to_resubmit)} unique chunks to resubmit from training round {training_round_for_retrain}")
                 
                 # Resubmit only the chunks that were used in this training round
                 # These should all be FAILED chunks - resubmit the SAME chunk_id (will create new attempt)
@@ -892,13 +846,14 @@ class DatabaseMonitor(CascadeAgent):
                     # Force garbage collection after retrieving atoms
                     gc.collect()
                     
+                    # Resubmit the SAME chunk_id (dynamics engine will create a new attempt)
+                    next_attempt_index = self._traj_db.get_next_attempt_index(
+                        run_id=self.config.run_id,
+                        traj_id=traj_id,
+                        chunk_id=chunk_id
+                    )
+                    
                     if start_frame:
-                        # Resubmit the SAME chunk_id (dynamics engine will create a new attempt)
-                        next_attempt_index = self._traj_db.get_next_attempt_index(
-                            run_id=self.config.run_id,
-                            traj_id=traj_id,
-                            chunk_id=chunk_id
-                        )
                         retry_spec = AdvanceSpec(
                             atoms=start_frame,
                             run_id=self.config.run_id,
@@ -914,7 +869,7 @@ class DatabaseMonitor(CascadeAgent):
                         )
                     else:
                         self.logger.warning(
-                            f"Traj {traj_id}: No starting frame found for chunk {chunk_id} "
+                            f"Traj {traj_id}: No starting frame found for chunk {chunk_id} attempt {next_attempt_index} "
                             f"({'initial trajectory' if chunk_id == 0 else f'previous chunk {chunk_id - 1}'})"
                         )
                 
