@@ -15,10 +15,8 @@ from threading import Event
 import gc
 import logging
 from functools import cached_property
-from typing import Any, Awaitable, Callable, NamedTuple, Optional, Union, cast
-from collections import namedtuple
-from asyncio import wrap_future  
-from concurrent.futures import Executor, Future
+from typing import Any, Awaitable, Callable, NamedTuple, Optional, cast
+from concurrent.futures import Executor, Future as ConcurrentFuture
 
 import os
 import numpy as np
@@ -52,11 +50,10 @@ from cascade.agents.config import (
     DatabaseMonitorConfig
 )
 from cascade.agents.db_orm import TrajectoryDB
-from cascade.model import ChunkSpec, TrainingFrame
+from cascade.model import ChunkSpec, TrainingFrame, TrainingFrameSpec
 
 
 
-ExecutorFuture = Union[Future[Any], asyncio.Future[Any]]
 
 
 def count_file_descriptors_by_type() -> dict:
@@ -202,20 +199,17 @@ class CascadeAgent(Agent):
     
     def schedule_future_callback(
         self,
-        future: ExecutorFuture,
-        callback: Callable[[ExecutorFuture], Awaitable[None]],
-        *,
-        description: Optional[str] = None,
+        future: ConcurrentFuture[Any],
+        callback: Callable[[ConcurrentFuture[Any]], Awaitable[None]],
     ) -> None:
-        """Schedule a coroutine callback after a future completes.
+        """Schedule a callback to run after a future completes.
 
         Args:
             future: Future from executor.submit() (concurrent.futures.Future)
             callback: Coroutine accepting the completed future.
-            description: Optional identifier for logging (currently unused).
         """
         async def _run_callback() -> None:
-            await wrap_future(future)
+            await asyncio.wrap_future(future)  # make concurrent future awatable 
             await callback(future)
 
         asyncio.create_task(_run_callback())
@@ -316,14 +310,12 @@ class DynamicsEngine(CascadeAgent):
     async def submit(self, spec: AdvanceSpec):
         if isinstance(spec, dict):
             spec = AdvanceSpec(**spec)
-        current_spec = spec
-        self._traj_db.mark_trajectory_running(self.config.run_id, current_spec.traj_id)
-        self.logger.info(f"Received advance spec for traj {current_spec.traj_id} chunk {current_spec.chunk_id} attempt {current_spec.attempt_index}")
-        description = f'advance dynamics traj {current_spec.traj_id} chunk {current_spec.chunk_id} attempt {current_spec.attempt_index}'
+        self._traj_db.mark_trajectory_running(self.config.run_id, spec.traj_id)
+        self.logger.info(f"Received advance spec for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
 
         initial_future = self.executor.submit(
             self.advance_dynamics_task,
-            spec=current_spec,
+            spec=spec,
             learner=self.config.learner,
             weights=self.weights,
             db_url=self.config.db_url,
@@ -335,11 +327,10 @@ class DynamicsEngine(CascadeAgent):
         self.schedule_future_callback(
             initial_future,
             self._advance_dynamics_callback,
-            description=description,
         )
     async def _advance_dynamics_callback(
         self,
-        future: Future
+        future: ConcurrentFuture[Any]
     ) -> None:
         """Handle the results of an advance dynamics call
         
@@ -428,7 +419,6 @@ class Auditor(CascadeAgent):
         # Force garbage collection after retrieving atoms
         gc.collect()
         self.logger.info(f'Submitting audit of chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id} to executor')
-        description = f'audit traj {chunk_spec.traj_id} chunk {chunk_spec.chunk_id}'
 
         initial_future = self.executor.submit(
             self.audit_task,
@@ -440,9 +430,8 @@ class Auditor(CascadeAgent):
         self.schedule_future_callback(
             initial_future,
             self._audit_callback,
-            description=description,
         )
-    async def _audit_callback(self, future: Future) -> None:
+    async def _audit_callback(self, future: ConcurrentFuture[Any]) -> None:
         """Handle the results of an audit
     
         If the audit fails, the chunk is submitted to the sampler.
@@ -471,7 +460,7 @@ class Auditor(CascadeAgent):
             )
             return
 
-        self._traj_db.update_chunk_audit_status(
+        self._traj_db.update_chunk_audit_done_status(
             run_id=self.config.run_id,
             traj_id=result.traj_id,
             chunk_id=result.chunk_id,
@@ -485,7 +474,6 @@ class Auditor(CascadeAgent):
             )
             
             # Check if trajectory is done using the data model
-            # this will also update the trajectory status to DONE in the database
             done = self._traj_db.is_trajectory_done(
                 run_id=self.config.run_id,
                 traj_id=result.traj_id
@@ -506,17 +494,12 @@ class Auditor(CascadeAgent):
                 
                 # Create and submit next advance spec
                 next_chunk_id = result.chunk_id + 1
-                next_attempt_index = self._traj_db.get_next_attempt_index(
-                    run_id=self.config.run_id,
-                    traj_id=result.traj_id,
-                    chunk_id=next_chunk_id
-                )
                 next_spec = AdvanceSpec(
                     atoms=last_frame,
                     run_id=self.config.run_id,
                     traj_id=result.traj_id,
                     chunk_id=next_chunk_id,
-                    attempt_index=next_attempt_index,
+                    attempt_index=0,
                     steps=self.config.chunk_size
                 )
                 await self.dynamics_engine.submit(next_spec)
@@ -586,20 +569,12 @@ class DummySampler(CascadeAgent):
                 continue
             
             # Get frame IDs for the sampled frames
-            # Use with_entities to only select the ID column, avoiding loading full ORM objects
-            with self._traj_db.session() as sess:
-                from cascade.agents.db_orm import DBTrajectoryFrame
-                # Query only the ID and frame_index columns, then extract IDs in order
-                frame_rows = sess.query(
-                    DBTrajectoryFrame.id,
-                    DBTrajectoryFrame.frame_index
-                ).filter_by(
-                    run_id=self.config.run_id,
-                    traj_id=chunk_spec.traj_id,
-                    chunk_id=chunk_spec.chunk_id,
-                    attempt_index=db_chunk['attempt_index']
-                ).order_by(DBTrajectoryFrame.frame_index).all()
-                frame_ids = [row[0] for row in frame_rows]
+            frame_ids = self._traj_db.get_chunk_frame_ids(
+                run_id=self.config.run_id,
+                traj_id=chunk_spec.traj_id,
+                chunk_id=chunk_spec.chunk_id,
+                attempt_index=db_chunk['attempt_index']
+            )
             
             # Sample frames
             n_sample = min(self.config.n_frames, len(atoms_list))
@@ -613,8 +588,15 @@ class DummySampler(CascadeAgent):
                     atoms=frame,
                     model_version=db_chunk['model_version']
                 )
+                training_frame_spec = TrainingFrameSpec(
+                    training_frame=training_frame,
+                    trajectory_frame_id=trajectory_frame_id,
+                    traj_id=chunk_spec.traj_id,
+                    chunk_id=chunk_spec.chunk_id,
+                    attempt_index=db_chunk['attempt_index']
+                )
                 self.logger.info(f'Submitting training frame from traj {chunk_spec.traj_id} chunk {chunk_spec.chunk_id} to labeler')
-                await self.labeler.submit(training_frame, trajectory_frame_id)
+                await self.labeler.submit(training_frame_spec)
 
 
 class DummyLabeler(CascadeAgent):
@@ -627,47 +609,35 @@ class DummyLabeler(CascadeAgent):
         self.queue = Queue()
 
     @action
-    async def submit(self, training_frame: TrainingFrame, trajectory_frame_id: int) -> None:
-        self.logger.info(f'Received training frame (trajectory_frame_id={trajectory_frame_id})')
-        await self.queue.put((training_frame, trajectory_frame_id))
+    async def submit(self, training_frame_spec: TrainingFrameSpec) -> None:
+        self.logger.info(f'Received training frame (trajectory_frame_id={training_frame_spec.trajectory_frame_id})')
+        await self.queue.put(training_frame_spec)
 
     @loop
     async def label_data(self, shutdown: asyncio.Event) -> None:
 
         while not shutdown.is_set():
-            training_frame, trajectory_frame_id = await self.queue.get()
+            training_frame_spec = await self.queue.get()
             
-            # Get trajectory and chunk info from trajectory_frames table
-            # Extract scalar values immediately to avoid holding ORM objects
             try:
-                traj_id = None
-                chunk_id = None
-                attempt_index = None
-                with self._traj_db.session() as sess:
-                    from cascade.agents.db_orm import DBTrajectoryFrame
-                    frame = sess.query(DBTrajectoryFrame).filter_by(id=trajectory_frame_id).first()
-                    if not frame:
-                        self.logger.warning(f"Could not find trajectory frame ID {trajectory_frame_id}")
-                        continue
-                    # Extract scalar values immediately while session is active
-                    traj_id = frame.traj_id
-                    chunk_id = frame.chunk_id
-                    attempt_index = frame.attempt_index
-                
                 self._traj_db.add_training_frame(
                     run_id=self.config.run_id,
-                    trajectory_frame_id=trajectory_frame_id,
-                    model_version_sampled_from=training_frame.model_version,
-                    traj_id=traj_id,
-                    chunk_id=chunk_id,
-                    attempt_index=attempt_index
+                    trajectory_frame_id=training_frame_spec.trajectory_frame_id,
+                    model_version_sampled_from=training_frame_spec.training_frame.model_version,
+                    traj_id=training_frame_spec.traj_id,
+                    chunk_id=training_frame_spec.chunk_id,
+                    attempt_index=training_frame_spec.attempt_index
                 )
             except Exception as e:
-                self.logger.warning(f"Could not add training frame for trajectory_frame_id {trajectory_frame_id}: {e}, skipping training frame")
+                self.logger.warning(
+                    f"Could not add training frame for trajectory_frame_id "
+                    f"{training_frame_spec.trajectory_frame_id}: {e}, skipping training frame"
+                )
                 continue
             self.logger.info(
-                f"Added training frame to database: traj={traj_id}, chunk={chunk_id}, "
-                f"attempt={attempt_index}, model_version={training_frame.model_version}"
+                f"Added training frame to database: traj={training_frame_spec.traj_id}, "
+                f"chunk={training_frame_spec.chunk_id}, attempt={training_frame_spec.attempt_index}, "
+                f"model_version={training_frame_spec.training_frame.model_version}"
             )
 
 
@@ -721,26 +691,40 @@ class DatabaseMonitor(CascadeAgent):
             else:
                 await asyncio.sleep(1)
 
+    def _log_and_check_resource_counts(self) -> None:
+        """Log resource creation counts and alert if counts are unexpectedly high"""
+        # Log resource creation counts
+        self.logger.info(
+            f"Resource counts: agents={CascadeAgent._resource_counts['agents_created']}, "
+            f"traj_db_instances={CascadeAgent._resource_counts['traj_db_instances_created']}"
+        )
+        
+        # Alert if resource counts are unexpectedly high
+        if CascadeAgent._resource_counts['traj_db_instances_created'] > CascadeAgent._resource_counts['agents_created'] * 2:
+            self.logger.warning(
+                f"More TrajectoryDB instances ({CascadeAgent._resource_counts['traj_db_instances_created']}) "
+                f"than expected for {CascadeAgent._resource_counts['agents_created']} agents. "
+                "Instances may be recreated unnecessarily."
+            )
+
     @loop
     async def periodic_retrain(self, shutdown: asyncio.Event) -> None:
-        """Monitor for enough training frames and trigger retraining"""
+        """Monitor for enough training frames and trigger retraining.
+        
+        Retraining is triggered when either condition is met:
+        - Absolute threshold: number of new training frames >= retrain_len
+        - Fraction threshold: fraction of active trajectories with samples >= retrain_fraction
+        
+        The absolute condition ensures retraining happens after accumulating a minimum
+        number of frames, while the fraction condition ensures retraining occurs when
+        a sufficient proportion of active trajectories have been sampled, even if the
+        absolute count is low.
+        
+        After retraining, frames are resubmitted for execution with the new model.
+        """
         self.logger.info("periodic_retrain loop started")
         while not shutdown.is_set():
-            # Log resource creation counts
-            self.logger.info(
-                f"Resource counts: agents={CascadeAgent._resource_counts['agents_created']}, "
-                f"traj_db_instances={CascadeAgent._resource_counts['traj_db_instances_created']}"
-            )
-            
-            # Alert if resource counts are unexpectedly high
-            if CascadeAgent._resource_counts['traj_db_instances_created'] > CascadeAgent._resource_counts['agents_created'] * 2:
-                self.logger.warning(
-                    f"More TrajectoryDB instances ({CascadeAgent._resource_counts['traj_db_instances_created']}) "
-                    f"than expected for {CascadeAgent._resource_counts['agents_created']} agents. "
-                    "Instances may be recreated unnecessarily."
-                )
-            
-           
+            self._log_and_check_resource_counts()
             
             # Check if we have enough new training frames
             current_count = self._traj_db.count_training_frames(self.config.run_id)

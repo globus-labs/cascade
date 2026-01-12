@@ -143,109 +143,24 @@ class DBTrainingFrame(Base):
 class TrajectoryDB:
     """Wrapper for the database representations of trajectories and chunks"""
     
-    # Track pool sizes across instances for growth detection
-    _pool_size_history: dict[int, list[int]] = {}  # engine_id -> list of sizes
-    
-    def __init__(self, db_url: str, logger: Optional[logging.Logger] = None, use_null_pool: bool = False):
+    def __init__(self, db_url: str, logger: Optional[logging.Logger] = None):
         """Initialize the trajectory database manager
         
         Args:
             db_url: PostgreSQL connection URL (e.g., 'postgresql://user:pass@host:port/dbname')
             logger: Optional logger for tracking engine creation
-            use_null_pool: If True, use NullPool (no connection pooling).
-                          Use for short-lived instances like worker processes.
         """
         self.db_url = db_url
         self._logger = logger or logging.getLogger(__name__)
         
-        if use_null_pool:
-            # Use NullPool for short-lived instances - no pooling, connections closed immediately
-            from sqlalchemy.pool import NullPool
-            poolclass = NullPool
-            pool_kwargs = {}
-        else:
-            # Use very restrictive pool for long-lived agent instances
-            from sqlalchemy.pool import QueuePool
-            poolclass = QueuePool
-            pool_kwargs = {
-                'pool_size': 1,  # Only 1 connection in pool
-                'max_overflow': 1,  # Allow 1 overflow = max 2 connections total
-                'pool_recycle': 300,  # Recycle connections after 5 minutes
-                'pool_reset_on_return': 'commit',  # Reset connections on return
-            }
-        
-        # Create engine and session factory
-        self.engine = create_engine(
-            db_url, 
-            echo=False, 
-            pool_pre_ping=True,
-            poolclass=poolclass,
-            **pool_kwargs
-        )
+        # Create engine with default settings
+        self.engine = create_engine(db_url, echo=False)
         self.SessionLocal = sessionmaker(bind=self.engine, autocommit=False, autoflush=False)
-        self._logger.info(f"Created TrajectoryDB engine (id={id(self.engine)}) with poolclass={poolclass.__name__}")
+        self._logger.info(f"Created TrajectoryDB engine (id={id(self.engine)})")
         
     def create_tables(self):
         """Create all tables if they don't exist"""
         Base.metadata.create_all(self.engine)
-    
-    def log_pool_stats(self, logger: logging.Logger) -> None:
-        """Log SQLAlchemy connection pool statistics for debugging
-        
-        Args:
-            logger: Logger instance to use for logging
-        """
-        try:
-            pool = self.engine.pool
-            engine_id = id(self.engine)
-            
-            # Get available stats (not all pools have all attributes)
-            current_size = pool.size()
-            stats = {
-                'size': current_size,
-                'checked_in': pool.checkedin(),
-                'checked_out': pool.checkedout(),
-                'overflow': pool.overflow(),
-            }
-            # Only add invalid if the attribute exists
-            if hasattr(pool, 'invalid'):
-                stats['invalid'] = pool.invalid()
-            
-            # Track pool size history for growth detection
-            if engine_id not in TrajectoryDB._pool_size_history:
-                TrajectoryDB._pool_size_history[engine_id] = []
-            history = TrajectoryDB._pool_size_history[engine_id]
-            history.append(current_size)
-            # Keep only last 10 measurements
-            if len(history) > 10:
-                history.pop(0)
-            
-            # Check for growth trends
-            if len(history) >= 3:
-                recent_growth = history[-1] - history[-3]
-                if recent_growth > 5:
-                    logger.warning(
-                        f"Pool size growing rapidly: {history[-3]} -> {current_size} "
-                        f"(+{recent_growth} in last 3 checks). Possible connection leak!"
-                    )
-            
-            # Alert on high pool size
-            if current_size > 20:
-                logger.warning(
-                    f"Pool size is high ({current_size}). Consider checking for connection leaks."
-                )
-            
-            # Alert on many checked out connections
-            checked_out = stats['checked_out']
-            if checked_out > 10:
-                logger.warning(
-                    f"Many connections checked out ({checked_out}). "
-                    "Sessions may not be properly closed."
-                )
-            
-            logger.info(f"SQLAlchemy pool stats: {', '.join(f'{k}={v}' for k, v in stats.items())}")
-        except Exception as e:
-            logger.warning(f"Failed to get pool stats: {e}")
     
     @contextlib.contextmanager
     def session(self):
@@ -526,7 +441,7 @@ class TrajectoryDB:
             logger.error(f"Failed to add chunk attempt for traj {traj_id}, chunk {chunk_id}, attempt {attempt_index}: {e}")
             return False
     
-    def update_chunk_audit_status(
+    def update_chunk_audit_done_status(
         self,
         run_id: str,
         traj_id: int,
@@ -534,7 +449,7 @@ class TrajectoryDB:
         attempt_index: int,
         audit_status: AuditStatus
     ):
-        """Update the audit status of a chunk
+        """Update the audit status of a chunk and mark trajectory as done if it is complete
         
         Args:
             run_id: Run identifier
@@ -994,6 +909,39 @@ class TrajectoryDB:
         gc.collect()
         return atoms
     
+    def get_chunk_frame_ids(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int
+    ) -> list[int]:
+        """Get frame IDs for a chunk, ordered by frame_index
+        
+        Uses with_entities to only select the ID column, avoiding loading full ORM objects.
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index for this chunk
+            
+        Returns:
+            List of frame IDs ordered by frame_index
+        """
+        with self.session() as sess:
+            # Query only the ID and frame_index columns, then extract IDs in order
+            frame_rows = sess.query(
+                DBTrajectoryFrame.id,
+                DBTrajectoryFrame.frame_index
+            ).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index
+            ).order_by(DBTrajectoryFrame.frame_index).all()
+            return [row[0] for row in frame_rows]
+    
     def get_initial_trajectory_frame(
         self,
         run_id: str,
@@ -1184,7 +1132,6 @@ class TrajectoryDB:
     ) -> list[dict]:
         """Get unique chunks that generated frames used in a training round
         
-        Only returns chunks that don't already have a passed attempt.
         Returns only the latest attempt_index for each (traj_id, chunk_id) pair.
         
         Args:
@@ -1199,8 +1146,7 @@ class TrajectoryDB:
                 - attempt_index: Latest attempt index for this chunk in the training round
         """
         with self.session() as sess:
-            # Subquery to get latest attempt_index for each (traj_id, chunk_id) in training round
-            latest_attempts = sess.query(
+            results = sess.query(
                 DBTrainingFrame.traj_id,
                 DBTrainingFrame.chunk_id,
                 func.max(DBTrainingFrame.attempt_index).label('max_attempt_index')
@@ -1210,31 +1156,8 @@ class TrajectoryDB:
             ).group_by(
                 DBTrainingFrame.traj_id,
                 DBTrainingFrame.chunk_id
-            ).subquery()
-            
-            # Subquery to find chunks with passed attempts
-            passed_chunks_subquery = sess.query(
-                DBTrajectoryChunk.traj_id,
-                DBTrajectoryChunk.chunk_id
-            ).filter_by(
-                run_id=run_id,
-                audit_status=AuditStatus.PASSED
-            ).subquery()
-            
-            # Join latest attempts with passed chunks subquery to exclude chunks with passed attempts
-            results = sess.query(
-                latest_attempts.c.traj_id,
-                latest_attempts.c.chunk_id,
-                latest_attempts.c.max_attempt_index
-            ).outerjoin(
-                passed_chunks_subquery,
-                (latest_attempts.c.traj_id == passed_chunks_subquery.c.traj_id) &
-                (latest_attempts.c.chunk_id == passed_chunks_subquery.c.chunk_id)
-            ).filter(
-                passed_chunks_subquery.c.traj_id.is_(None)
             ).all()
             
-            # Convert to list of dicts
             return [
                 {
                     'traj_id': traj_id,
@@ -1390,7 +1313,7 @@ class TrajectoryDB:
                 for traj in all_trajectories
             ]
             
-            # Get unique trajectory IDs from sampled frames (denormalized data)
+            # Get unique trajectory IDs from sampled frames
             sampled_traj_ids = {tf.traj_id for tf in training_frames}
         
         # Now check which trajectories are active and have samples

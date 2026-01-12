@@ -17,6 +17,24 @@ class TrainingFrame:
     model_version: int
 
 @dataclass
+class TrainingFrameSpec:
+    """Training frame specification with all metadata needed for processing.
+    
+    This encapsulates both the training frame content and its trajectory metadata
+    to avoid database lookups when passing frames between agents.
+    """
+    training_frame: TrainingFrame
+    """The training frame with atoms and model version"""
+    trajectory_frame_id: int
+    """ID of the frame in the trajectory_frames table"""
+    traj_id: int
+    """Trajectory identifier"""
+    chunk_id: int
+    """Chunk identifier"""
+    attempt_index: int
+    """Attempt index for this chunk"""
+
+@dataclass
 class AuditResult:
     """The result of an audit"""
     status: AuditStatus

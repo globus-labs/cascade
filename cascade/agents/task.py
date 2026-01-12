@@ -52,8 +52,8 @@ def advance_dynamics(
     from cascade.utils import canonicalize
     from cascade.agents.db_orm import TrajectoryDB
     
-    # Create TrajectoryDB instance in the worker process with NullPool (no connection pooling)
-    traj_db = TrajectoryDB(db_url, use_null_pool=True)
+    # Create TrajectoryDB instance in the worker process
+    traj_db = TrajectoryDB(db_url)
     
     atoms = spec.atoms
     calc = learner.make_calculator(weights, device=device)
