@@ -21,7 +21,7 @@ from academy.exchange import LocalExchangeFactory
 from academy.manager import Manager
 from academy.logging import init_logging
 
-from cascade.agents.dummy import (
+from cascade.agents.agents import (
     DatabaseMonitor,
     DynamicsEngine,
     Auditor,

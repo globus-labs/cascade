@@ -488,18 +488,19 @@ class Auditor(CascadeAgent):
                     traj_id=result.traj_id,
                     chunk_id=result.chunk_id,
                     attempt_index=result.attempt_index
-                )
+                ) # todo maybe we want to just query once
                 # Force garbage collection after retrieving atoms
                 gc.collect()
                 
                 # Create and submit next advance spec
                 next_chunk_id = result.chunk_id + 1
+                next_attempt_index = 0
                 next_spec = AdvanceSpec(
                     atoms=last_frame,
                     run_id=self.config.run_id,
                     traj_id=result.traj_id,
                     chunk_id=next_chunk_id,
-                    attempt_index=0,
+                    attempt_index=next_attempt_index,
                     steps=self.config.chunk_size
                 )
                 await self.dynamics_engine.submit(next_spec)
@@ -511,7 +512,8 @@ class Auditor(CascadeAgent):
             )
             spec = ChunkSpec(
                 traj_id=result.traj_id,
-                chunk_id=result.chunk_id
+                chunk_id=result.chunk_id,
+                attempt_index=result.attempt_index
             )
             self.logger.info(f'Submitting failed chunk {result.chunk_id} of traj {result.traj_id} to sampler')
             await self.sampler.submit(spec)
@@ -544,17 +546,6 @@ class DummySampler(CascadeAgent):
 
             self.logger.info(f'Sampling frames from chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
             
-            # Get the latest attempt for this chunk to get model version and attempt index
-            db_chunk = self._traj_db.get_latest_chunk_attempt(
-                run_id=self.config.run_id,
-                traj_id=chunk_spec.traj_id,
-                chunk_id=chunk_spec.chunk_id
-            )
-            
-            if not db_chunk:
-                self.logger.warning(f"No chunk attempt found for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}")
-                continue
-            
             # Get frames from trajectory_frames table for this chunk and attempt
             atoms_list = self._traj_db.get_latest_chunk_attempt_atoms(
                 run_id=self.config.run_id,
@@ -573,8 +564,8 @@ class DummySampler(CascadeAgent):
                 run_id=self.config.run_id,
                 traj_id=chunk_spec.traj_id,
                 chunk_id=chunk_spec.chunk_id,
-                attempt_index=db_chunk['attempt_index']
-            )
+                attempt_index=chunk_spec.attempt_index
+            ) # todo mt.2026.01.14: can we just get this in the last query?
             
             # Sample frames
             n_sample = min(self.config.n_frames, len(atoms_list))
@@ -586,14 +577,14 @@ class DummySampler(CascadeAgent):
             for frame, trajectory_frame_id in zip(sampled_frames, sampled_frame_ids):
                 training_frame = TrainingFrame(
                     atoms=frame,
-                    model_version=db_chunk['model_version']
+                    model_version=chunk_spec.model_version
                 )
                 training_frame_spec = TrainingFrameSpec(
                     training_frame=training_frame,
                     trajectory_frame_id=trajectory_frame_id,
                     traj_id=chunk_spec.traj_id,
                     chunk_id=chunk_spec.chunk_id,
-                    attempt_index=db_chunk['attempt_index']
+                    attempt_index=chunk_spec.attempt_index
                 )
                 self.logger.info(f'Submitting training frame from traj {chunk_spec.traj_id} chunk {chunk_spec.chunk_id} to labeler')
                 await self.labeler.submit(training_frame_spec)
@@ -731,21 +722,15 @@ class DatabaseMonitor(CascadeAgent):
             new_frames = current_count - self.last_train_count
             
             # Check fraction-based condition
-            try:
-                total_active, active_with_samples = self._traj_db.count_active_trajs_with_samples(
-                    run_id=self.config.run_id
-                )
-                sampled_fraction = active_with_samples / total_active if total_active > 0 else 0.0
-                
-                self.logger.info(
-                    f"Retrain check: new={new_frames}, active={total_active}, sampled={active_with_samples}, "
-                    f"fraction={sampled_fraction:.2%}"
-                )
-            except Exception as e:
-                self.logger.error(f"Error in count_active_trajs_with_samples: {e}", exc_info=True)
-                total_active = 0
-                active_with_samples = 0
-                sampled_fraction = 0.0
+            total_active, active_with_samples = self._traj_db.count_active_trajs_with_samples(
+                run_id=self.config.run_id
+            )
+            sampled_fraction = active_with_samples / total_active if total_active > 0 else 0.0
+            
+            self.logger.info(
+                f"Retrain check: new={new_frames}, active={total_active}, sampled={active_with_samples}, "
+                f"fraction={sampled_fraction:.2%}"
+            )
             
             # Determine which condition triggered retraining
             absolute_condition = new_frames >= self.config.retrain_len
