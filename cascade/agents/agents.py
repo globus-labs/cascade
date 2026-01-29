@@ -38,7 +38,7 @@ except ImportError:
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.utils import canonicalize
-from cascade.model import AuditStatus, AdvanceSpec, AuditResult, TrajectoryStatus
+from cascade.model import AuditStatus, AdvanceSpec, AuditResult, TrajectoryStatus, ChunkEventType
 from cascade.agents.config import (
     CascadeAgentConfig,
     DatabaseConfig,
@@ -311,6 +311,13 @@ class DynamicsEngine(CascadeAgent):
         if isinstance(spec, dict):
             spec = AdvanceSpec(**spec)
         self._traj_db.mark_trajectory_running(self.config.run_id, spec.traj_id)
+        self._traj_db.record_chunk_event(
+            run_id=self.config.run_id,
+            traj_id=spec.traj_id,
+            chunk_id=spec.chunk_id,
+            attempt_index=spec.attempt_index,
+            event_type=ChunkEventType.STARTED_DYNAMICS
+        )
         self.logger.info(f"Received advance spec for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
 
         initial_future = self.executor.submit(
@@ -370,6 +377,13 @@ class DynamicsEngine(CascadeAgent):
         )
         if success:
             self.logger.info(f"Recorded chunk {chunk_id} of traj {traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
+            self._traj_db.record_chunk_event(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index,
+                event_type=ChunkEventType.FINISHED_DYNAMICS
+            )
         else:
             self.logger.error(f"Failed to record chunk {chunk_id} of traj {traj_id} in database (attempt {attempt_index})")
 
@@ -411,6 +425,14 @@ class Auditor(CascadeAgent):
                 chunk_spec.chunk_id,
             )
             return
+        attempt_index = latest_attempt['attempt_index']
+        self._traj_db.record_chunk_event(
+            run_id=self.config.run_id,
+            traj_id=chunk_spec.traj_id,
+            chunk_id=chunk_spec.chunk_id,
+            attempt_index=attempt_index,
+            event_type=ChunkEventType.STARTED_AUDIT
+        )
         chunk_atoms = self._traj_db.get_latest_chunk_attempt_atoms(
             self.config.run_id,
             chunk_spec.traj_id,
@@ -466,6 +488,16 @@ class Auditor(CascadeAgent):
             chunk_id=result.chunk_id,
             attempt_index=result.attempt_index,
             audit_status=status
+        )
+        
+        # Record audit result event
+        event_type = ChunkEventType.AUDIT_PASSED if status == AuditStatus.PASSED else ChunkEventType.AUDIT_FAILED
+        self._traj_db.record_chunk_event(
+            run_id=self.config.run_id,
+            traj_id=result.traj_id,
+            chunk_id=result.chunk_id,
+            attempt_index=result.attempt_index,
+            event_type=event_type
         )
         
         if status == AuditStatus.PASSED:
@@ -546,6 +578,15 @@ class DummySampler(CascadeAgent):
 
             self.logger.info(f'Sampling frames from chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
             
+            # Record STARTED_SAMPLING event
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=chunk_spec.traj_id,
+                chunk_id=chunk_spec.chunk_id,
+                attempt_index=chunk_spec.attempt_index,
+                event_type=ChunkEventType.STARTED_SAMPLING
+            )
+            
             # Get frames from trajectory_frames table for this chunk and attempt
             atoms_list = self._traj_db.get_latest_chunk_attempt_atoms(
                 run_id=self.config.run_id,
@@ -584,10 +625,20 @@ class DummySampler(CascadeAgent):
                     trajectory_frame_id=trajectory_frame_id,
                     traj_id=chunk_spec.traj_id,
                     chunk_id=chunk_spec.chunk_id,
-                    attempt_index=chunk_spec.attempt_index
+                    attempt_index=chunk_spec.attempt_index,
+                    total_frames_in_chunk=n_sample
                 )
                 self.logger.info(f'Submitting training frame from traj {chunk_spec.traj_id} chunk {chunk_spec.chunk_id} to labeler')
                 await self.labeler.submit(training_frame_spec)
+            
+            # Record FINISHED_SAMPLING event after all frames submitted
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=chunk_spec.traj_id,
+                chunk_id=chunk_spec.chunk_id,
+                attempt_index=chunk_spec.attempt_index,
+                event_type=ChunkEventType.FINISHED_SAMPLING
+            )
 
 
 class DummyLabeler(CascadeAgent):
@@ -610,6 +661,32 @@ class DummyLabeler(CascadeAgent):
         while not shutdown.is_set():
             training_frame_spec = await self.queue.get()
             
+            # Check if STARTED_LABELING exists for this chunk (idempotent)
+            if not self._traj_db.has_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=training_frame_spec.traj_id,
+                chunk_id=training_frame_spec.chunk_id,
+                attempt_index=training_frame_spec.attempt_index,
+                event_type=ChunkEventType.STARTED_LABELING
+            ):
+                self._traj_db.record_chunk_event(
+                    run_id=self.config.run_id,
+                    traj_id=training_frame_spec.traj_id,
+                    chunk_id=training_frame_spec.chunk_id,
+                    attempt_index=training_frame_spec.attempt_index,
+                    event_type=ChunkEventType.STARTED_LABELING
+                )
+            
+            # Record STARTED_LABELING_FRAME
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=training_frame_spec.traj_id,
+                chunk_id=training_frame_spec.chunk_id,
+                attempt_index=training_frame_spec.attempt_index,
+                event_type=ChunkEventType.STARTED_LABELING_FRAME,
+                frame_id=training_frame_spec.trajectory_frame_id
+            )
+            
             try:
                 self._traj_db.add_training_frame(
                     run_id=self.config.run_id,
@@ -625,6 +702,35 @@ class DummyLabeler(CascadeAgent):
                     f"{training_frame_spec.trajectory_frame_id}: {e}, skipping training frame"
                 )
                 continue
+            
+            # Record FINISHED_LABELING_FRAME after successfully adding training frame
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=training_frame_spec.traj_id,
+                chunk_id=training_frame_spec.chunk_id,
+                attempt_index=training_frame_spec.attempt_index,
+                event_type=ChunkEventType.FINISHED_LABELING_FRAME,
+                frame_id=training_frame_spec.trajectory_frame_id
+            )
+            
+            # Check if all frames for chunk are done
+            labeled_count = self._traj_db.count_labeled_frames_for_chunk(
+                run_id=self.config.run_id,
+                traj_id=training_frame_spec.traj_id,
+                chunk_id=training_frame_spec.chunk_id,
+                attempt_index=training_frame_spec.attempt_index
+            )
+            
+            if labeled_count >= training_frame_spec.total_frames_in_chunk:
+                # All frames labeled, record FINISHED_LABELING
+                self._traj_db.record_chunk_event(
+                    run_id=self.config.run_id,
+                    traj_id=training_frame_spec.traj_id,
+                    chunk_id=training_frame_spec.chunk_id,
+                    attempt_index=training_frame_spec.attempt_index,
+                    event_type=ChunkEventType.FINISHED_LABELING
+                )
+            
             self.logger.info(
                 f"Added training frame to database: traj={training_frame_spec.traj_id}, "
                 f"chunk={training_frame_spec.chunk_id}, attempt={training_frame_spec.attempt_index}, "
@@ -637,7 +743,15 @@ class DummyTrainer(CascadeAgent):
     @action
     async def train_model(
         self,
+        training_round: int
     ) -> bytes:
+        # Record STARTED_TRAINING event
+        self._traj_db.record_training_event(
+            run_id=self.config.run_id,
+            event_type=ChunkEventType.STARTED_TRAINING,
+            training_round=training_round
+        )
+        
         calc = mace_mp('small', device='cpu', default_dtype="float32") #todo: mt.2025.11.04 this should be configurable
         model = calc.models[0]
         model_msg = self.config.learner.serialize_model(model)
@@ -722,13 +836,13 @@ class DatabaseMonitor(CascadeAgent):
             new_frames = current_count - self.last_train_count
             
             # Check fraction-based condition
-            total_active, active_with_samples = self._traj_db.count_active_trajs_with_samples(
+            total_active, active_with_labeling = self._traj_db.count_active_trajs_with_labeling(
                 run_id=self.config.run_id
             )
-            sampled_fraction = active_with_samples / total_active if total_active > 0 else 0.0
+            sampled_fraction = active_with_labeling / total_active if total_active > 0 else 0.
             
             self.logger.info(
-                f"Retrain check: new={new_frames}, active={total_active}, sampled={active_with_samples}, "
+                f"Retrain check: new={new_frames}, active={total_active}, labeled={active_with_labeling}, "
                 f"fraction={sampled_fraction:.2%}"
             )
             
@@ -754,19 +868,26 @@ class DatabaseMonitor(CascadeAgent):
                 self.logger.info(
                     f"Starting retraining (round {self.current_training_round}) triggered by: {', '.join(trigger_reason)}\n"
                     f"Training frame count: current={current_count}, last_train={self.last_train_count}, "
-                    f"new={new_frames}, active_trajs={total_active}, sampled_trajs={active_with_samples}, "
+                    f"new={new_frames}, active_trajs={total_active}, labeled_trajs={active_with_labeling}, "
                     f"fraction={sampled_fraction:.2%}"
                 )
 
                 # Train model and update weights in dynamics engine
-                weights = await self.trainer.train_model()
+                weights = await self.trainer.train_model(self.current_training_round)
+                
+                # Record FINISHED_TRAINING event after training completes
+                self._traj_db.record_training_event(
+                    run_id=self.config.run_id,
+                    event_type=ChunkEventType.FINISHED_TRAINING,
+                    training_round=self.current_training_round
+                )
+                
                 await self.dynamics_engine.receive_weights(weights)
                 
-                # Get unique chunks that generated frames in the training round we're using
-                # (frames created before this retraining will have training_round = training_round_for_retrain)
-                chunks_to_resubmit = self._traj_db.get_chunks_from_training_round(
+                # Get chunks where latest event is FINISHED_LABELING (these need resubmission)
+                chunks_to_resubmit = self._traj_db.get_chunks_with_latest_event(
                     run_id=self.config.run_id,
-                    training_round=training_round_for_retrain
+                    event_type=ChunkEventType.FINISHED_LABELING
                 )
                 
                 # Deduplicate by (traj_id, chunk_id) only - we only want to resubmit each chunk once,
@@ -779,7 +900,7 @@ class DatabaseMonitor(CascadeAgent):
                 
                 chunks_to_resubmit = list(unique_chunks_by_id.values())
                 
-                self.logger.info(f"Found {len(chunks_to_resubmit)} unique chunks to resubmit from training round {training_round_for_retrain}")
+                self.logger.info(f"Found {len(chunks_to_resubmit)} unique chunks to resubmit with latest event FINISHED_LABELING")
                 
                 # Resubmit only the chunks that were used in this training round
                 # These should all be FAILED chunks - resubmit the SAME chunk_id (will create new attempt)

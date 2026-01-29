@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import gc
 import logging
+from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
 import numpy as np
@@ -31,9 +32,10 @@ from sqlalchemy import (
     JSON,
     LargeBinary,
     UniqueConstraint,
+    Index,
 )
 from sqlalchemy.orm import relationship, sessionmaker, declarative_base
-from cascade.model import AuditStatus, TrajectoryStatus
+from cascade.model import AuditStatus, TrajectoryStatus, ChunkEventType
 
 Base = declarative_base()
 
@@ -138,6 +140,42 @@ class DBTrainingFrame(Base):
 
     def __repr__(self):
         return f"<DBTrainingFrame(run_id={self.run_id}, trajectory_frame_id={self.trajectory_frame_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, training_round={self.training_round})>"
+
+
+class DBChunkEvent(Base):
+    """ORM model for chunk-level events"""
+    __tablename__ = 'chunk_events'
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String, nullable=False, index=True)
+    traj_id = Column(Integer, nullable=False, index=True)
+    chunk_id = Column(Integer, nullable=False, index=True)
+    attempt_index = Column(Integer, nullable=False, index=True)
+    frame_id = Column(Integer, ForeignKey('trajectory_frames.id'), nullable=True, index=True)
+    event_type = Column(SQLEnum(ChunkEventType), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    __table_args__ = (
+        # Composite index for efficient latest event queries
+        Index('idx_chunk_events_latest', 'run_id', 'traj_id', 'chunk_id', 'attempt_index', 'created_at'),
+    )
+
+    def __repr__(self):
+        return f"<DBChunkEvent(run_id={self.run_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, event_type={self.event_type.name}, frame_id={self.frame_id})>"
+
+
+class DBTrainingEvent(Base):
+    """ORM model for training-level events"""
+    __tablename__ = 'training_events'
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String, nullable=False, index=True)
+    event_type = Column(SQLEnum(ChunkEventType), nullable=False, index=True)
+    training_round = Column(Integer, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    def __repr__(self):
+        return f"<DBTrainingEvent(run_id={self.run_id}, event_type={self.event_type.name}, training_round={self.training_round})>"
 
 
 class TrajectoryDB:
@@ -1125,48 +1163,6 @@ class TrajectoryDB:
             )
             return updated
     
-    def get_chunks_from_training_round(
-        self,
-        run_id: str,
-        training_round: int
-    ) -> list[dict]:
-        """Get unique chunks that generated frames used in a training round
-        
-        Returns only the latest attempt_index for each (traj_id, chunk_id) pair.
-        
-        Args:
-            run_id: Run identifier
-            training_round: Training round number
-            
-        Returns:
-            List of dicts with unique (traj_id, chunk_id) pairs with their latest attempt_index.
-            Each dict contains:
-                - traj_id: Trajectory identifier
-                - chunk_id: Chunk identifier
-                - attempt_index: Latest attempt index for this chunk in the training round
-        """
-        with self.session() as sess:
-            results = sess.query(
-                DBTrainingFrame.traj_id,
-                DBTrainingFrame.chunk_id,
-                func.max(DBTrainingFrame.attempt_index).label('max_attempt_index')
-            ).filter_by(
-                run_id=run_id,
-                training_round=training_round
-            ).group_by(
-                DBTrainingFrame.traj_id,
-                DBTrainingFrame.chunk_id
-            ).all()
-            
-            return [
-                {
-                    'traj_id': traj_id,
-                    'chunk_id': chunk_id,
-                    'attempt_index': max_attempt_index
-                }
-                for traj_id, chunk_id, max_attempt_index in results
-            ]
-    
     def get_sampled_traj_ids(
         self,
         run_id: str
@@ -1282,17 +1278,183 @@ class TrajectoryDB:
         gc.collect()
         return atoms
     
-    def count_active_trajs_with_samples(
+    def record_chunk_event(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int,
+        event_type: ChunkEventType,
+        frame_id: Optional[int] = None
+    ) -> None:
+        """Record a chunk-level event
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index
+            event_type: Type of event
+            frame_id: Optional frame ID for frame-level events
+        """
+        with self.session() as sess:
+            db_event = DBChunkEvent(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index,
+                frame_id=frame_id,
+                event_type=event_type
+            )
+            sess.add(db_event)
+    
+    def record_training_event(
+        self,
+        run_id: str,
+        event_type: ChunkEventType,
+        training_round: int
+    ) -> None:
+        """Record a training-level event
+        
+        Args:
+            run_id: Run identifier
+            event_type: Type of event (STARTED_TRAINING or FINISHED_TRAINING)
+            training_round: Training round number
+        """
+        with self.session() as sess:
+            db_event = DBTrainingEvent(
+                run_id=run_id,
+                event_type=event_type,
+                training_round=training_round
+            )
+            sess.add(db_event)
+    
+    def has_chunk_event(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int,
+        event_type: ChunkEventType
+    ) -> bool:
+        """Check if a chunk event exists (for idempotent checks)
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index
+            event_type: Type of event to check
+            
+        Returns:
+            True if event exists, False otherwise
+        """
+        with self.session() as sess:
+            count = sess.query(DBChunkEvent).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index,
+                event_type=event_type
+            ).count()
+            return count > 0
+    
+    def get_latest_event_for_chunk(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int
+    ) -> Optional[ChunkEventType]:
+        """Get the most recent event type for a chunk
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index
+            
+        Returns:
+            Most recent event type, or None if no events exist
+        """
+        with self.session() as sess:
+            event = sess.query(DBChunkEvent).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index
+            ).order_by(DBChunkEvent.created_at.desc()).first()
+            
+            if not event:
+                return None
+            return event.event_type
+    
+    def get_chunks_with_latest_event(
+        self,
+        run_id: str,
+        event_type: ChunkEventType
+    ) -> list[dict]:
+        """Find chunks where the latest event matches the specified type
+        
+        Args:
+            run_id: Run identifier
+            event_type: Event type to match
+            
+        Returns:
+            List of dicts with traj_id, chunk_id, attempt_index for chunks
+            whose latest event matches the specified type
+        """
+        with self.session() as sess:
+            # Subquery to get the latest event timestamp for each chunk
+            latest_events = sess.query(
+                DBChunkEvent.traj_id,
+                DBChunkEvent.chunk_id,
+                DBChunkEvent.attempt_index,
+                func.max(DBChunkEvent.created_at).label('latest_time')
+            ).filter_by(
+                run_id=run_id
+            ).group_by(
+                DBChunkEvent.traj_id,
+                DBChunkEvent.chunk_id,
+                DBChunkEvent.attempt_index
+            ).subquery()
+            
+            # Find chunks where the latest event matches the specified type
+            results = sess.query(
+                DBChunkEvent.traj_id,
+                DBChunkEvent.chunk_id,
+                DBChunkEvent.attempt_index
+            ).filter_by(
+                run_id=run_id,
+                event_type=event_type
+            ).join(
+                latest_events,
+                (DBChunkEvent.traj_id == latest_events.c.traj_id) &
+                (DBChunkEvent.chunk_id == latest_events.c.chunk_id) &
+                (DBChunkEvent.attempt_index == latest_events.c.attempt_index) &
+                (DBChunkEvent.created_at == latest_events.c.latest_time)
+            ).distinct().all()
+            
+            return [
+                {
+                    'traj_id': traj_id,
+                    'chunk_id': chunk_id,
+                    'attempt_index': attempt_index
+                }
+                for traj_id, chunk_id, attempt_index in results
+            ]
+    
+    def count_active_trajs_with_labeling(
         self,
         run_id: str
     ) -> tuple[int, int]:
-        """Count active trajectories and those with sampled training frames
+        """Count active trajectories and those with labeling events
         
         Args:
             run_id: Run identifier
             
         Returns:
-            Tuple of (total_active_trajectories, active_trajectories_with_samples)
+            Tuple of (total_active_trajectories, active_trajectories_with_labeling)
         """
         with self.session() as sess:
             # Get all trajectories for this run
@@ -1300,35 +1462,82 @@ class TrajectoryDB:
                 run_id=run_id
             ).all()
             
-            # Get training frames that haven't been consumed by a training round yet
-            training_frames = sess.query(DBTrainingFrame).filter_by(
-                run_id=run_id
-            ).filter(
-                DBTrainingFrame.training_round.is_(None)
-            ).all()
+            # Get unique trajectory IDs that have FINISHED_LABELING events
+            labeled_traj_ids = sess.query(DBChunkEvent.traj_id).filter_by(
+                run_id=run_id,
+                event_type=ChunkEventType.FINISHED_LABELING
+            ).distinct().all()
+            labeled_traj_ids = {tid[0] for tid in labeled_traj_ids}
             
             # Extract trajectory info while session is active
             trajectory_info = [
                 {'traj_id': traj.traj_id, 'status': traj.status}
                 for traj in all_trajectories
             ]
-            
-            # Get unique trajectory IDs from sampled frames
-            sampled_traj_ids = {tf.traj_id for tf in training_frames}
         
-        # Now check which trajectories are active and have samples
+        # Now check which trajectories are active and have labeling
         active_count = 0
-        active_with_samples_count = 0
+        active_with_labeling_count = 0
         
         for traj_info in trajectory_info:
             # Check if trajectory is active (not done)
             if traj_info['status'] == TrajectoryStatus.RUNNING:
                 active_count += 1
-                # Check if this trajectory has been sampled from
-                if traj_info['traj_id'] in sampled_traj_ids:
-                    active_with_samples_count += 1
+                # Check if this trajectory has been labeled
+                if traj_info['traj_id'] in labeled_traj_ids:
+                    active_with_labeling_count += 1
         
-        return (active_count, active_with_samples_count)
+        return (active_count, active_with_labeling_count)
+    
+    def get_last_training_completion_time(
+        self,
+        run_id: str
+    ) -> Optional[datetime]:
+        """Get the timestamp of the most recent FINISHED_TRAINING event
+        
+        Args:
+            run_id: Run identifier
+            
+        Returns:
+            Timestamp of most recent training completion, or None if no training events
+        """
+        with self.session() as sess:
+            event = sess.query(DBTrainingEvent).filter_by(
+                run_id=run_id,
+                event_type=ChunkEventType.FINISHED_TRAINING
+            ).order_by(DBTrainingEvent.created_at.desc()).first()
+            
+            if not event:
+                return None
+            return event.created_at
+    
+    def count_labeled_frames_for_chunk(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int
+    ) -> int:
+        """Count FINISHED_LABELING_FRAME events for a chunk
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index
+            
+        Returns:
+            Number of frames labeled for this chunk
+        """
+        with self.session() as sess:
+            count = sess.query(DBChunkEvent).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index,
+                event_type=ChunkEventType.FINISHED_LABELING_FRAME
+            ).count()
+            return count
     
     def list_runs(self) -> list[dict]:
         """List all unique runs in the database with metadata

@@ -10,6 +10,8 @@ from ase import Atoms
 class ChunkSpec:
     traj_id: int
     chunk_id: int
+    attempt_index: int | None = None
+    model_version: int | None = None
 
 @dataclass
 class TrainingFrame:
@@ -33,6 +35,8 @@ class TrainingFrameSpec:
     """Chunk identifier"""
     attempt_index: int
     """Attempt index for this chunk"""
+    total_frames_in_chunk: int
+    """Total number of frames that will be labeled for this chunk"""
 
 @dataclass
 class AuditResult:
@@ -59,6 +63,20 @@ class TrajectoryStatus(Enum):
     RUNNING = auto()
     COMPLETED = auto()
     FAILED = auto()
+
+class ChunkEventType(Enum):
+    """Event types tracked for trajectory chunks"""
+    STARTED_DYNAMICS = auto()
+    FINISHED_DYNAMICS = auto()
+    STARTED_AUDIT = auto()
+    AUDIT_PASSED = auto()
+    AUDIT_FAILED = auto()
+    STARTED_SAMPLING = auto()
+    FINISHED_SAMPLING = auto()
+    STARTED_LABELING = auto()
+    STARTED_LABELING_FRAME = auto()
+    FINISHED_LABELING_FRAME = auto()
+    FINISHED_LABELING = auto()
 
 @dataclass
 class TrajectorySpec:
