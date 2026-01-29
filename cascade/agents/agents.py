@@ -512,6 +512,13 @@ class Auditor(CascadeAgent):
             )
             if done:
                 self.logger.info(f"Traj {result.traj_id} is complete")
+                self._traj_db.record_chunk_event(
+                    run_id=self.config.run_id,
+                    traj_id=result.traj_id,
+                    chunk_id=result.chunk_id,
+                    attempt_index=result.attempt_index,
+                    event_type=ChunkEventType.TRAJECTORY_COMPLETED
+                )
             else:
                 # Trajectory not done - submit next chunk
                 # Get the last frame from the current chunk to use as starting point
@@ -578,6 +585,26 @@ class DummySampler(CascadeAgent):
 
             self.logger.info(f'Sampling frames from chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
             
+            # Resolve model_version (auditor submits ChunkSpec without it; we store it in chunk metadata)
+            model_version = chunk_spec.model_version
+            if model_version is None and chunk_spec.attempt_index is not None:
+                chunk = self._traj_db.get_chunk_attempt(
+                    self.config.run_id,
+                    chunk_spec.traj_id,
+                    chunk_spec.chunk_id,
+                    chunk_spec.attempt_index,
+                )
+                if chunk is not None:
+                    model_version = chunk["model_version"]
+            if model_version is None:
+                self.logger.warning(
+                    "Cannot determine model_version for traj %s chunk %s (attempt %s), skipping",
+                    chunk_spec.traj_id,
+                    chunk_spec.chunk_id,
+                    chunk_spec.attempt_index,
+                )
+                continue
+            
             # Record STARTED_SAMPLING event
             self._traj_db.record_chunk_event(
                 run_id=self.config.run_id,
@@ -618,7 +645,7 @@ class DummySampler(CascadeAgent):
             for frame, trajectory_frame_id in zip(sampled_frames, sampled_frame_ids):
                 training_frame = TrainingFrame(
                     atoms=frame,
-                    model_version=chunk_spec.model_version
+                    model_version=model_version
                 )
                 training_frame_spec = TrainingFrameSpec(
                     training_frame=training_frame,
@@ -885,24 +912,12 @@ class DatabaseMonitor(CascadeAgent):
                 await self.dynamics_engine.receive_weights(weights)
                 
                 # Get chunks where latest event is FINISHED_LABELING (these need resubmission)
-                chunks_to_resubmit = self._traj_db.get_chunks_with_latest_event(
+                chunks_to_resubmit = self._traj_db.get_trajs_with_latest_event(
                     run_id=self.config.run_id,
-                    event_type=ChunkEventType.FINISHED_LABELING
+                    event_type=ChunkEventType.FINISHED_SAMPLING
                 )
-                
-                # Deduplicate by (traj_id, chunk_id) only - we only want to resubmit each chunk once,
-                # not once per failed attempt. Keep the first entry for each unique (traj_id, chunk_id).
-                unique_chunks_by_id = {}
-                for chunk_info in chunks_to_resubmit:
-                    key = (chunk_info['traj_id'], chunk_info['chunk_id'])
-                    if key not in unique_chunks_by_id:
-                        unique_chunks_by_id[key] = chunk_info
-                
-                chunks_to_resubmit = list(unique_chunks_by_id.values())
-                
-                self.logger.info(f"Found {len(chunks_to_resubmit)} unique chunks to resubmit with latest event FINISHED_LABELING")
-                
-                # Resubmit only the chunks that were used in this training round
+                self.logger.info(f"Found {len(chunks_to_resubmit)} trajs to resubmit (latest event FINISHED_LABELING)")
+
                 # These should all be FAILED chunks - resubmit the SAME chunk_id (will create new attempt)
                 for chunk_info in chunks_to_resubmit:
                     traj_id = chunk_info['traj_id']

@@ -77,6 +77,9 @@ class ChunkEventType(Enum):
     STARTED_LABELING_FRAME = auto()
     FINISHED_LABELING_FRAME = auto()
     FINISHED_LABELING = auto()
+    TRAJECTORY_COMPLETED = auto()
+    STARTED_TRAINING = auto()
+    FINISHED_TRAINING = auto()
 
 @dataclass
 class TrajectorySpec:

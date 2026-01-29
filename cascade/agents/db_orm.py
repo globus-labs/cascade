@@ -1389,66 +1389,123 @@ class TrajectoryDB:
                 return None
             return event.event_type
     
-    def get_chunks_with_latest_event(
+    def get_latest_event_per_trajectory(self, run_id: str) -> list[dict]:
+        """For each trajectory, the latest chunk event (by created_at).
+
+        One row per traj_id. Returns list of dicts with traj_id, event_type,
+        chunk_id, attempt_index.
+        """
+        with self.session() as sess:
+            subq = (
+                sess.query(
+                    DBChunkEvent.traj_id,
+                    DBChunkEvent.event_type,
+                    DBChunkEvent.chunk_id,
+                    DBChunkEvent.attempt_index,
+                    func.row_number()
+                    .over(
+                        partition_by=DBChunkEvent.traj_id,
+                        order_by=DBChunkEvent.created_at.desc(),
+                    )
+                    .label("rn"),
+                )
+                .filter_by(run_id=run_id)
+                .subquery()
+            )
+            rows = (
+                sess.query(
+                    subq.c.traj_id,
+                    subq.c.event_type,
+                    subq.c.chunk_id,
+                    subq.c.attempt_index,
+                )
+                .filter(subq.c.rn == 1)
+                .all()
+            )
+            return [
+                {
+                    "traj_id": t,
+                    "event_type": e,
+                    "chunk_id": c,
+                    "attempt_index": a,
+                }
+                for t, e, c, a in rows
+            ]
+
+    def get_trajs_with_latest_event(
         self,
         run_id: str,
         event_type: ChunkEventType
     ) -> list[dict]:
-        """Find chunks where the latest event matches the specified type
+        """Trajectories whose latest chunk event (by created_at) matches the given type.
+
+        Returns list of dicts with traj_id, chunk_id, attempt_index (at most one per trajectory).
+        """
+        rows = self.get_latest_event_per_trajectory(run_id)
+        return [
+            {"traj_id": r["traj_id"], "chunk_id": r["chunk_id"], "attempt_index": r["attempt_index"]}
+            for r in rows
+            if r["event_type"] == event_type
+        ]
+    
+    def list_chunk_events(
+        self,
+        run_id: str,
+        traj_id: Optional[int] = None,
+        chunk_id: Optional[int] = None,
+        limit: Optional[int] = None
+    ) -> list[dict]:
+        """List chunk events for a run, optionally filtered by trajectory or chunk.
         
         Args:
             run_id: Run identifier
-            event_type: Event type to match
+            traj_id: Optional trajectory ID to filter by
+            chunk_id: Optional chunk ID to filter by
+            limit: Optional maximum number of events to return
             
         Returns:
-            List of dicts with traj_id, chunk_id, attempt_index for chunks
-            whose latest event matches the specified type
+            List of dicts with run_id, traj_id, chunk_id, attempt_index, event_type,
+            frame_id, created_at. event_type is the enum name (e.g. 'STARTED_LABELING').
+            Ordered by traj_id, chunk_id, attempt_index, created_at.
         """
         with self.session() as sess:
-            # Subquery to get the latest event timestamp for each chunk
-            latest_events = sess.query(
+            q = sess.query(DBChunkEvent).filter_by(run_id=run_id)
+            if traj_id is not None:
+                q = q.filter_by(traj_id=traj_id)
+            if chunk_id is not None:
+                q = q.filter_by(chunk_id=chunk_id)
+            q = q.order_by(
                 DBChunkEvent.traj_id,
                 DBChunkEvent.chunk_id,
                 DBChunkEvent.attempt_index,
-                func.max(DBChunkEvent.created_at).label('latest_time')
-            ).filter_by(
-                run_id=run_id
-            ).group_by(
-                DBChunkEvent.traj_id,
-                DBChunkEvent.chunk_id,
-                DBChunkEvent.attempt_index
-            ).subquery()
+                DBChunkEvent.created_at
+            )
+            if limit is not None:
+                q = q.limit(limit)
+            events = q.all()
             
-            # Find chunks where the latest event matches the specified type
-            results = sess.query(
-                DBChunkEvent.traj_id,
-                DBChunkEvent.chunk_id,
-                DBChunkEvent.attempt_index
-            ).filter_by(
-                run_id=run_id,
-                event_type=event_type
-            ).join(
-                latest_events,
-                (DBChunkEvent.traj_id == latest_events.c.traj_id) &
-                (DBChunkEvent.chunk_id == latest_events.c.chunk_id) &
-                (DBChunkEvent.attempt_index == latest_events.c.attempt_index) &
-                (DBChunkEvent.created_at == latest_events.c.latest_time)
-            ).distinct().all()
-            
-            return [
-                {
-                    'traj_id': traj_id,
-                    'chunk_id': chunk_id,
-                    'attempt_index': attempt_index
-                }
-                for traj_id, chunk_id, attempt_index in results
-            ]
+            result = []
+            for e in events:
+                event_type_str = e.event_type.name if hasattr(e.event_type, 'name') else str(e.event_type)
+                result.append({
+                    'run_id': e.run_id,
+                    'traj_id': e.traj_id,
+                    'chunk_id': e.chunk_id,
+                    'attempt_index': e.attempt_index,
+                    'event_type': event_type_str,
+                    'frame_id': e.frame_id,
+                    'created_at': e.created_at
+                })
+            return result
     
     def count_active_trajs_with_labeling(
         self,
         run_id: str
     ) -> tuple[int, int]:
-        """Count active trajectories and those with labeling events
+        """Count active trajectories and those with labeling since last training.
+        
+        Only FINISHED_LABELING events after the most recent FINISHED_TRAINING are
+        counted. If there is no previous training, all FINISHED_LABELING events count.
         
         Args:
             run_id: Run identifier
@@ -1457,17 +1514,31 @@ class TrajectoryDB:
             Tuple of (total_active_trajectories, active_trajectories_with_labeling)
         """
         with self.session() as sess:
+            # Last training completion time; None if we haven't trained yet
+            last_train = (
+                sess.query(DBTrainingEvent.created_at)
+                .filter_by(
+                    run_id=run_id,
+                    event_type=ChunkEventType.FINISHED_TRAINING
+                )
+                .order_by(DBTrainingEvent.created_at.desc())
+                .limit(1)
+                .scalar()
+            )
+            
             # Get all trajectories for this run
             all_trajectories = sess.query(DBTrajectory).filter_by(
                 run_id=run_id
             ).all()
             
-            # Get unique trajectory IDs that have FINISHED_LABELING events
-            labeled_traj_ids = sess.query(DBChunkEvent.traj_id).filter_by(
+            # Unique traj_ids with FINISHED_LABELING since last training
+            q = sess.query(DBChunkEvent.traj_id).filter_by(
                 run_id=run_id,
                 event_type=ChunkEventType.FINISHED_LABELING
-            ).distinct().all()
-            labeled_traj_ids = {tid[0] for tid in labeled_traj_ids}
+            )
+            if last_train is not None:
+                q = q.filter(DBChunkEvent.created_at > last_train)
+            labeled_traj_ids = {r[0] for r in q.distinct().all()}
             
             # Extract trajectory info while session is active
             trajectory_info = [
