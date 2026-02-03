@@ -47,7 +47,7 @@ class AuditorConfig(CascadeAgentConfig):
 
 @dataclass
 class SamplerConfig(CascadeAgentConfig):
-    """Configuration for DummySampler agent"""
+    """Configuration for Sampler agent"""
     n_frames: int
     rng: np.random.Generator | None = None
 

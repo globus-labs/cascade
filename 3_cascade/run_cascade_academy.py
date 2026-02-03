@@ -25,7 +25,7 @@ from cascade.agents.agents import (
     DatabaseMonitor,
     DynamicsEngine,
     Auditor,
-    DummySampler,
+    Sampler,
     DummyLabeler,
     DummyTrainer
 )
@@ -41,7 +41,7 @@ from cascade.agents.config import (
 from cascade.model import AdvanceSpec
 from cascade.learning.mace import MACEInterface
 from cascade.agents.db_orm import TrajectoryDB
-from cascade.agents.task import random_audit, advance_dynamics
+from cascade.agents.task import random_audit, advance_dynamics, random_sample
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help='Minimum number of frames before fraction-based retraining can trigger'
-    )
+    ) # todo: can we clarify why this exsits along with retrain-len?
     parser.add_argument(
         '--n-sample-frames',
         type=int,
@@ -219,7 +219,7 @@ async def main():
         db_reg = await manager.register_agent(DatabaseMonitor)
         trainer_reg = await manager.register_agent(DummyTrainer)
         labeler_reg = await manager.register_agent(DummyLabeler)
-        sampler_reg = await manager.register_agent(DummySampler)
+        sampler_reg = await manager.register_agent(Sampler)
         auditor_reg = await manager.register_agent(Auditor)
         dynamics_reg = await manager.register_agent(DynamicsEngine)
 
@@ -307,10 +307,12 @@ async def main():
             registration=auditor_reg,
         )
         await manager.launch(
-            DummySampler,
+            Sampler,
             args=(
                 sampler_config,
-                labeler_handle
+                labeler_handle,
+                ProcessPoolExecutor(max_workers=10),
+                random_sample,
             ),
             registration=sampler_reg,
         )

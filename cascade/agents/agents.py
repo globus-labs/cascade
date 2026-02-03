@@ -397,7 +397,7 @@ class Auditor(CascadeAgent):
     def __init__(
             self,
             config: AuditorConfig,
-            sampler: Handle[DummySampler],
+            sampler: Handle[Sampler],
             dynamics_engine: Handle[DynamicsEngine],
             audit_task: Callable[[ChunkSpec], AuditResult],
             executor: Executor
@@ -438,8 +438,7 @@ class Auditor(CascadeAgent):
             chunk_spec.traj_id,
             chunk_spec.chunk_id
         )
-        # Force garbage collection after retrieving atoms
-        gc.collect()
+
         self.logger.info(f'Submitting audit of chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id} to executor')
 
         initial_future = self.executor.submit(
@@ -558,21 +557,51 @@ class Auditor(CascadeAgent):
             await self.sampler.submit(spec)
 
     
-class DummySampler(CascadeAgent):
+class Sampler(CascadeAgent):
 
     def __init__(
         self,
         config: SamplerConfig,
-        labeler: Handle[DummyLabeler]
+        labeler: Handle[DummyLabeler],
+        executor: Executor,
+        sample_task: Callable[..., list[TrainingFrameSpec]],
     ):
-        super().__init__(config)
-        self.rng = config.rng if config.rng else np.random.default_rng()
+        super().__init__(config, executor)
         self.queue = Queue()
         self.labeler = labeler
+        self.sample_task = sample_task
 
     @action
     async def submit(self, chunk_spec: ChunkSpec):
         await self.queue.put(chunk_spec)
+
+    def _make_sample_callback(self, chunk_spec: ChunkSpec):
+        async def _sample_frames_callback(future: ConcurrentFuture[Any]) -> None:
+            specs = future.result()
+            if len(specs) != self.config.n_frames:
+                self.logger.warning(
+                    "Sampling returned %d frames for traj %s chunk %s (attempt %s), "
+                    "expected n_frames=%d",
+                    len(specs),
+                    chunk_spec.traj_id,
+                    chunk_spec.chunk_id,
+                    chunk_spec.attempt_index,
+                    self.config.n_frames,
+                )
+            for spec in specs:
+                self.logger.info(
+                    f'Submitting training frame from traj {chunk_spec.traj_id} '
+                    f'chunk {chunk_spec.chunk_id} to labeler'
+                )
+                await self.labeler.submit(spec)
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=chunk_spec.traj_id,
+                chunk_id=chunk_spec.chunk_id,
+                attempt_index=chunk_spec.attempt_index,
+                event_type=ChunkEventType.FINISHED_SAMPLING,
+            )
+        return _sample_frames_callback
 
     @loop
     async def sample_frames(
@@ -580,91 +609,87 @@ class DummySampler(CascadeAgent):
         shutdown: asyncio.Event
     ) -> None:
         while not shutdown.is_set():
-
             chunk_spec = await self.queue.get()
 
-            self.logger.info(f'Sampling frames from chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}')
-            
-            # Resolve model_version (auditor submits ChunkSpec without it; we store it in chunk metadata)
+            self.logger.info(
+                f'Sampling frames from chunk {chunk_spec.chunk_id} of '
+                f'traj {chunk_spec.traj_id}'
+            )
+
+            # Resolve model_version and attempt_index (auditor submits ChunkSpec
+            # without model_version; we store it in chunk metadata)
             model_version = chunk_spec.model_version
-            if model_version is None and chunk_spec.attempt_index is not None:
-                chunk = self._traj_db.get_chunk_attempt(
+            attempt_index = chunk_spec.attempt_index
+            if model_version is None or attempt_index is None:
+                latest = self._traj_db.get_latest_chunk_attempt(
                     self.config.run_id,
                     chunk_spec.traj_id,
                     chunk_spec.chunk_id,
-                    chunk_spec.attempt_index,
                 )
-                if chunk is not None:
-                    model_version = chunk["model_version"]
+                if latest is not None:
+                    if model_version is None:
+                        model_version = latest.get('model_version')
+                    if attempt_index is None:
+                        attempt_index = latest['attempt_index']
             if model_version is None:
                 self.logger.warning(
-                    "Cannot determine model_version for traj %s chunk %s (attempt %s), skipping",
+                    "Cannot determine model_version for traj %s chunk %s "
+                    "(attempt %s), skipping",
                     chunk_spec.traj_id,
                     chunk_spec.chunk_id,
-                    chunk_spec.attempt_index,
+                    attempt_index,
                 )
                 continue
-            
-            # Record STARTED_SAMPLING event
-            self._traj_db.record_chunk_event(
-                run_id=self.config.run_id,
+
+            # Ensure we have attempt_index for downstream use
+            resolved_spec = ChunkSpec(
                 traj_id=chunk_spec.traj_id,
                 chunk_id=chunk_spec.chunk_id,
-                attempt_index=chunk_spec.attempt_index,
-                event_type=ChunkEventType.STARTED_SAMPLING
+                attempt_index=attempt_index,
+                model_version=model_version,
             )
-            
-            # Get frames from trajectory_frames table for this chunk and attempt
+
+            # Get frames from trajectory_frames table for this chunk
             atoms_list = self._traj_db.get_latest_chunk_attempt_atoms(
                 run_id=self.config.run_id,
                 traj_id=chunk_spec.traj_id,
-                chunk_id=chunk_spec.chunk_id
+                chunk_id=chunk_spec.chunk_id,
             )
-            # Force garbage collection after retrieving atoms
-            gc.collect()
-            
+
             if not atoms_list:
-                self.logger.warning(f"No frames found for chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id}")
+                self.logger.warning(
+                    f"No frames found for chunk {chunk_spec.chunk_id} of "
+                    f"traj {chunk_spec.traj_id}"
+                )
                 continue
-            
+
             # Get frame IDs for the sampled frames
             frame_ids = self._traj_db.get_chunk_frame_ids(
                 run_id=self.config.run_id,
                 traj_id=chunk_spec.traj_id,
                 chunk_id=chunk_spec.chunk_id,
-                attempt_index=chunk_spec.attempt_index
-            ) # todo mt.2026.01.14: can we just get this in the last query?
-            
-            # Sample frames
-            n_sample = min(self.config.n_frames, len(atoms_list))
-            indices = self.rng.choice(len(atoms_list), size=n_sample, replace=False)
-            sampled_frames = [atoms_list[i] for i in indices]
-            sampled_frame_ids = [frame_ids[i] for i in indices]
-            
-            # Submit frames with their model version and trajectory frame IDs
-            for frame, trajectory_frame_id in zip(sampled_frames, sampled_frame_ids):
-                training_frame = TrainingFrame(
-                    atoms=frame,
-                    model_version=model_version
-                )
-                training_frame_spec = TrainingFrameSpec(
-                    training_frame=training_frame,
-                    trajectory_frame_id=trajectory_frame_id,
-                    traj_id=chunk_spec.traj_id,
-                    chunk_id=chunk_spec.chunk_id,
-                    attempt_index=chunk_spec.attempt_index,
-                    total_frames_in_chunk=n_sample
-                )
-                self.logger.info(f'Submitting training frame from traj {chunk_spec.traj_id} chunk {chunk_spec.chunk_id} to labeler')
-                await self.labeler.submit(training_frame_spec)
-            
-            # Record FINISHED_SAMPLING event after all frames submitted
+                attempt_index=attempt_index,
+            )
+
+            # Record STARTED_SAMPLING (only when we have atoms to process)
             self._traj_db.record_chunk_event(
                 run_id=self.config.run_id,
-                traj_id=chunk_spec.traj_id,
-                chunk_id=chunk_spec.chunk_id,
-                attempt_index=chunk_spec.attempt_index,
-                event_type=ChunkEventType.FINISHED_SAMPLING
+                traj_id=resolved_spec.traj_id,
+                chunk_id=resolved_spec.chunk_id,
+                attempt_index=resolved_spec.attempt_index,
+                event_type=ChunkEventType.STARTED_SAMPLING,
+            )
+
+            future = self.executor.submit(
+                self.sample_task,
+                atoms_list=atoms_list,
+                frame_ids=frame_ids,
+                chunk_spec=resolved_spec,
+                model_version=model_version,
+                n_frames=self.config.n_frames,
+            )
+            self.schedule_future_callback(
+                future, self._make_sample_callback(resolved_spec)
             )
 
 
@@ -948,9 +973,7 @@ class DatabaseMonitor(CascadeAgent):
                             run_id=self.config.run_id,
                             traj_id=traj_id
                         )
-                    # Force garbage collection after retrieving atoms
-                    gc.collect()
-                    
+
                     # Resubmit the SAME chunk_id (dynamics engine will create a new attempt)
                     next_attempt_index = self._traj_db.get_next_attempt_index(
                         run_id=self.config.run_id,

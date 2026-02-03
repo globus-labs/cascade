@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from cascade.model import ChunkSpec, AuditResult
-    from cascade.model import AdvanceSpec
+    from cascade.model import AdvanceSpec, TrainingFrameSpec
     from cascade.learning.base import BaseLearnableForcefield
     from ase import Atoms
 from ase.optimize.optimize import Dynamics
@@ -33,6 +33,47 @@ def random_audit(
     score = rng.random() if passed else 0.0
     status = AuditStatus.PASSED if passed else AuditStatus.FAILED
     return AuditResult(status=status, score=score, traj_id=chunk_spec.traj_id, chunk_id=chunk_spec.chunk_id, attempt_index=attempt_index)
+
+
+def random_sample(
+    atoms_list: list[Atoms],
+    frame_ids: list[int],
+    chunk_spec: ChunkSpec,
+    model_version: int,
+    n_frames: int,
+    sleep_time: float = 0.,
+) -> list:
+    """Random sample of frames from a chunk.
+
+    Intended to be used as a stub for a real sampling function.
+    """
+    from cascade.model import TrainingFrame, TrainingFrameSpec
+    import time
+    import numpy as np
+
+    time.sleep(sleep_time)
+    # Create a new random generator seeded with OS entropy to ensure
+    # each worker process gets a unique random state
+    rng = np.random.default_rng(seed=None)
+    n_sample = min(n_frames, len(atoms_list))
+    indices = rng.choice(len(atoms_list), size=n_sample, replace=False)
+    sampled_frames = [atoms_list[i] for i in indices]
+    sampled_frame_ids = [frame_ids[i] for i in indices]
+
+    result = []
+    for frame, trajectory_frame_id in zip(sampled_frames, sampled_frame_ids):
+        training_frame = TrainingFrame(atoms=frame, model_version=model_version)
+        spec = TrainingFrameSpec(
+            training_frame=training_frame,
+            trajectory_frame_id=trajectory_frame_id,
+            traj_id=chunk_spec.traj_id,
+            chunk_id=chunk_spec.chunk_id,
+            attempt_index=chunk_spec.attempt_index,
+            total_frames_in_chunk=n_sample,
+        )
+        result.append(spec)
+    return result
+
 
 def advance_dynamics(
     spec: AdvanceSpec,
