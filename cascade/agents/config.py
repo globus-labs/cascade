@@ -27,9 +27,8 @@ class DatabaseConfig(CascadeAgentConfig):
 
 
 @dataclass
-class DynamicsEngineConfig(CascadeAgentConfig):
+class DynamicsRunnerConfig(CascadeAgentConfig):
     """Configuration for DynamicsEngine agent"""
-    #init_specs: list  # list[AdvanceSpec], but avoid circular import
     learner: BaseLearnableForcefield
     weights: bytes
     dyn_cls: type[Dynamics]
