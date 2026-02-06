@@ -23,7 +23,7 @@ from academy.logging import init_logging
 
 from cascade.agents.agents import (
     DatabaseMonitor,
-    DynamicsEngine,
+    DynamicsRunner,
     Auditor,
     Sampler,
     DummyLabeler,
@@ -32,7 +32,7 @@ from cascade.agents.agents import (
 from cascade.agents.config import (
     DatabaseConfig,
     DatabaseMonitorConfig,
-    DynamicsEngineConfig,
+    DynamicsRunnerConfig,
     AuditorConfig,
     SamplerConfig,
     LabelerConfig,
@@ -221,7 +221,7 @@ async def main():
         labeler_reg = await manager.register_agent(DummyLabeler)
         sampler_reg = await manager.register_agent(Sampler)
         auditor_reg = await manager.register_agent(Auditor)
-        dynamics_reg = await manager.register_agent(DynamicsEngine)
+        dynamics_reg = await manager.register_agent(DynamicsRunner)
 
         # get handles to all agents
         db_handle = manager.get_handle(db_reg)
@@ -250,7 +250,7 @@ async def main():
             retrain_fraction=args.retrain_fraction,
             retrain_min_frames=args.retrain_min_frames
         )
-        dynamics_config = DynamicsEngineConfig(
+        dynamics_config = DynamicsRunnerConfig(
             run_id=run_id,
             db_url=args.db_url,
             #init_specs=initial_specs,
@@ -285,7 +285,7 @@ async def main():
             registration=db_reg
         )
         await manager.launch(
-            DynamicsEngine,
+            DynamicsRunner,
             args=(
                 dynamics_config,
                 auditor_handle,

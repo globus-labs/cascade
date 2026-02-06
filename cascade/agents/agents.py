@@ -42,7 +42,7 @@ from cascade.model import AuditStatus, AdvanceSpec, AuditResult, TrajectoryStatu
 from cascade.agents.config import (
     CascadeAgentConfig,
     DatabaseConfig,
-    DynamicsEngineConfig,
+    DynamicsRunnerConfig,
     AuditorConfig,
     SamplerConfig,
     LabelerConfig,
@@ -52,151 +52,17 @@ from cascade.agents.config import (
 from cascade.agents.db_orm import TrajectoryDB
 from cascade.model import ChunkSpec, TrainingFrame, TrainingFrameSpec
 
-
-
-
-
-def count_file_descriptors_by_type() -> dict:
-    """Count open file descriptors by type for the current process
-    
-    Returns:
-        Dict with counts by FD type (REG, PIPE, IPv4, IPv6, etc.)
-    """
-    import os
-    import subprocess
-    
-    pid = os.getpid()
-    type_counts = {}
-    
-    # First, get total count from /proc (fast and reliable)
-    try:
-        fd_dir = f'/proc/{pid}/fd'
-        if os.path.exists(fd_dir):
-            total_fds = len(os.listdir(fd_dir))
-            type_counts['total'] = total_fds
-    except (OSError, PermissionError):
-        pass
-    
-    # Try to get detailed breakdown from lsof, but don't block if it's slow
-    try:
-        result = subprocess.run(
-            ['lsof', '-p', str(pid), '-F', 't'],
-            capture_output=True,
-            text=True,
-            timeout=1  # Reduced timeout to 1 second
-        )
-        
-        if result.returncode == 0:
-            # Count by type (lines starting with 't' are type indicators)
-            for line in result.stdout.split('\n'):
-                if line.startswith('t'):
-                    fd_type = line[1:]  # Remove 't' prefix
-                    type_counts[fd_type] = type_counts.get(fd_type, 0) + 1
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        # If lsof fails or times out, we still have the total count
-        if 'total' not in type_counts:
-            return {'error': 'lsof unavailable and /proc access failed'}
-    except Exception as e:
-        # Other errors - still return what we have
-        if 'total' not in type_counts:
-            return {'error': f'Exception counting FDs: {e}'}
-    
-    # Return what we have (at minimum, the total count)
-    return type_counts if type_counts else {'error': 'Could not count FDs'}
-
-
-def check_executor_workers(executor: Executor) -> dict:
-    """Check health of ProcessPoolExecutor worker processes
-    
-    Args:
-        executor: ProcessPoolExecutor instance (or any Executor)
-        
-    Returns:
-        Dict with worker process health info, or error dict if unavailable
-    """
-    global _PSUTIL_WARNING_LOGGED
-    if not PSUTIL_AVAILABLE:
-        if not _PSUTIL_WARNING_LOGGED:
-            logger = logging.getLogger(__name__)
-            logger.warning(
-                "psutil not available - cannot monitor executor worker health. "
-                "Install psutil to enable worker process monitoring."
-            )
-            _PSUTIL_WARNING_LOGGED = True
-        return {'error': 'psutil not available'}
-    
-    # Only check ProcessPoolExecutor, skip others
-    from concurrent.futures import ProcessPoolExecutor
-    if not isinstance(executor, ProcessPoolExecutor):
-        return {'skipped': 'Not a ProcessPoolExecutor'}
-    
-    try:
-        if not hasattr(executor, '_processes'):
-            return {'error': 'Cannot access executor processes'}
-        
-        alive = 0
-        dead = 0
-        zombies = 0
-        worker_pids = []
-        
-        for proc in executor._processes.values():
-            if proc is None:
-                continue
-            
-            try:
-                pid = proc.pid
-                worker_pids.append(pid)
-                p = psutil.Process(pid)
-                status = p.status()
-                
-                if status == psutil.STATUS_ZOMBIE:
-                    zombies += 1
-                elif p.is_running():
-                    alive += 1
-                else:
-                    dead += 1
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                dead += 1
-            except Exception as e:
-                # Catch any other unexpected exceptions from psutil
-                logging.getLogger(__name__).debug(f"Error checking process {proc.pid if hasattr(proc, 'pid') else 'unknown'}: {e}")
-                dead += 1
-        
-        return {
-            'alive': alive,
-            'dead': dead,
-            'zombies': zombies,
-            'worker_pids': worker_pids,
-            'total_workers': len(executor._processes)
-        }
-    except Exception as e:
-        # Catch any unexpected exceptions (e.g., AttributeError accessing _processes)
-        logging.getLogger(__name__).debug(f"Error in check_executor_workers: {e}")
-        return {'error': f'Exception checking workers: {e}'}
-
-
 class CascadeAgent(Agent):
     """Base class for all cascade agents"""
-    
-    # Track resource creation across all agents
-    _resource_counts = {
-        'agents_created': 0,
-        'traj_db_instances_created': 0,
-    }
 
     def __init__(
         self,
-        config: CascadeAgentConfig,
         executor: Optional[Executor] = None
     ):
-        self.config = config
         self.logger = logging.getLogger(self.__class__.__name__)
         self.executor = executor
-        CascadeAgent._resource_counts['agents_created'] += 1
-        self.logger.debug(
-            f"Agent created. Total agents: {CascadeAgent._resource_counts['agents_created']}"
-        )
-    
+
+
     def schedule_future_callback(
         self,
         future: ConcurrentFuture[Any],
@@ -226,79 +92,63 @@ class CascadeAgent(Agent):
         traj_db.create_tables()  # Ensure tables exist
         return traj_db
 
-    @loop
-    async def monitor_executor_health(self, shutdown: asyncio.Event) -> None:
-        """Periodically check executor worker process health"""
-        self.logger.info(f"Monitoring executor health for {self.config.run_id}")
-        while not shutdown.is_set():
-            try:
-                # Check if executor exists
-                if self.executor is None:
-                    self.logger.debug("Executor is None, skipping health check")
-                    await asyncio.sleep(30)
-                    continue
-                
-                # Get worker health status
-                worker_health = check_executor_workers(self.executor)
-                self.logger.info(f"check result: {worker_health}")
-                
-                # Handle errors or skipped checks
-                if 'error' in worker_health:
-                    self.logger.debug(f"Executor health check error: {worker_health['error']}")
-                    await asyncio.sleep(30)
-                    continue
-                
-                if 'skipped' in worker_health:
-                    self.logger.debug(f"Executor health check skipped: {worker_health['skipped']}")
-                    await asyncio.sleep(30)
-                    continue
-                
-                # Check for zombie processes
-                zombies = worker_health.get('zombies', 0)
-                if zombies > 0:
-                    self.logger.warning(
-                        f"Found {zombies} zombie worker processes: {worker_health}"
-                    )
-                    await asyncio.sleep(30)
-                    continue
-                
-                # Check for many dead workers
-                dead = worker_health.get('dead', 0)
-                alive = worker_health.get('alive', 0)
-                if dead > alive:
-                    self.logger.warning(
-                        f"Many dead workers detected: {worker_health}. Consider recreating executor."
-                    )
-                    await asyncio.sleep(30)
-                    continue
-                
-                # All good - log normal health status
-                self.logger.info(f"Executor worker health: {worker_health}")
-                
-            except Exception as e:
-                self.logger.exception(f"Error in executor health monitoring: {e}")
-            
-            await asyncio.sleep(30)  # Check every 30 seconds
-
-class DynamicsEngine(CascadeAgent):
+class DynamicsRunner(CascadeAgent):
 
     def __init__(
         self,
-        config: DynamicsEngineConfig,
+        atoms: Atoms,
+        run_id: str,
+        traj_id: int,
+        chunk_size: int,
+        n_steps: int,
         auditor: Handle[Auditor],
         executor: Executor,
-        advance_dynamics_task: Callable[[AdvanceSpec], None]
+        advance_dynamics_task: Callable[[AdvanceSpec], None],
+        learner: BaseLearnableForcefield,
+        weights: bytes,
+        dyn_cls: type[Dynamics],
+        dyn_kws: dict[str, object] | None,
+        run_kws: dict[str, object] | None,
+        device: str = 'cpu',
     ):
-        super().__init__(config, executor)
-        self.weights = config.weights  # This needs to be mutable
-        self.model_version = 0  # todo: mt.2025.10.20 probably this should be persisted somewhere else
-        self.queue = Queue()
+        """Runs dynamics in a loop until done, or a shutdown message is received
+
+        Arguments:
+            atoms: initial conditions
+            run_id: which run this is (for logging) # todo surely we dont have to pass this to every agent like this
+            chunk_size: how many steps to advance at a time
+            n_steps: total number of timesteps to run
+            auditor: handle to auditor class
+            executor: where the dynamics is executed
+            advance_dynamics_task: task run on the executor
+            learner: cascade learner class
+            weights: weights for the learner
+            dyn_cls: ase dynamics class
+            dyn_kws: arguments to the dynamics constructor
+            run_kws: arguments to the dynamics run method
+            device: for torch execution
+        """
+        super().__init__(executor)
+        self.atoms = atoms
+        self.run_id = run_id
+        self.traj_id = traj_id
+        self.chunk_size = chunk_size
+        self.n_steps = n_steps
+        self.dyn_cls = dyn_cls
+        self.weights = weights
+        self.learner = learner
+        self.weights = weights
         self.auditor = auditor
         self.advance_dynamics_task = advance_dynamics_task
+        self.dyn_kws = dyn_kws or {}
+        self.run_kws = run_kws or {}
+        self.device = device
 
-    # async def agent_on_startup(self):
-    #     for spec in self.config.init_specs:
-    #         await self.queue.put(spec)
+        self.timestep = 0
+        self.chunk = 0
+        self.attempt = 0
+        self.done = False
+
 
     @action
     async def receive_weights(self, weights: bytes) -> None:
@@ -306,35 +156,83 @@ class DynamicsEngine(CascadeAgent):
         self.model_version += 1
         self.logger.info(f"Received new weights, now on model version {self.model_version}")
 
-    @action
-    async def submit(self, spec: AdvanceSpec):
-        if isinstance(spec, dict):
-            spec = AdvanceSpec(**spec)
-        self._traj_db.mark_trajectory_running(self.config.run_id, spec.traj_id)
-        self._traj_db.record_chunk_event(
-            run_id=self.config.run_id,
-            traj_id=spec.traj_id,
-            chunk_id=spec.chunk_id,
-            attempt_index=spec.attempt_index,
-            event_type=ChunkEventType.STARTED_DYNAMICS
-        )
-        self.logger.info(f"Received advance spec for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
+    @loop
+    async def run(
+            self,
+            shutdown: asyncio.Event,
+    ) -> None:
+        """Run dynamics until done, or a shutdown message is received"""
+        while not (shutdown.is_set() or self.done):
 
-        initial_future = self.executor.submit(
-            self.advance_dynamics_task,
-            spec=spec,
-            learner=self.config.learner,
-            weights=self.weights,
-            db_url=self.config.db_url,
-            device=self.config.device,
-            dyn_cls=self.config.dyn_cls,
-            dyn_kws=self.config.dyn_kws
-        )
+            # submit dynamics for evaluation
+            spec = AdvanceSpec(
+                atoms=self.atoms,
+                steps=self.n_steps,
+                run_id=self.run_id,
+                traj_id=self.traj_id,
+                chunk_id=self.chunk,
+                attempt_index=self.attempt,
+            )
 
-        self.schedule_future_callback(
-            initial_future,
-            self._advance_dynamics_callback,
-        )
+            # save started dynamics event
+            self._traj_db.record_chunk_event(
+                run_id=self.run_id,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                attempt_index=spec.attempt_index,
+                event_type=ChunkEventType.STARTED_DYNAMICS
+            )
+            self.logger.info(f"Running dynamics for {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
+
+            atoms_future = self.executor.submit(
+                self.advance_dynamics_task,
+                spec=spec,
+                learner=self.learner,
+                weights=self.weights,
+                db_url=self.db_url,
+                device=self.device,
+                dyn_cls=self.dyn_cls,
+                dyn_kws=self.dyn_kws
+            )
+
+            # save finished dynamics event
+            self._traj_db.record_chunk_event(
+                run_id=self.run_id,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                attempt_index=spec.attempt_index,
+                event_type=ChunkEventType.FINISHED_DYNAMICS
+            )
+            self.logger.info(f"Finished dynamics for {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
+
+            # get future result
+            atoms = atoms_future.result()
+
+            # submit to auditor
+            chunk_spec = ChunkSpec(traj_id=self.traj_id, chunk_id=self.chunk)
+            self.logger.info(f"Submitting audit for {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
+            audit_status = await self.auditor.audit(chunk_spec)
+
+            # handle audit result
+            if audit_status == AuditStatus.PASSED:
+                self.timestep += self.chunk_size
+                self.done = self.timestep >= self.n_steps
+
+                if self.done:
+                    self._traj_db.mark_trajectory_completed(run_id=self.run_id, traj_id=self.traj_id)
+                else:
+                    # audit passed but not done, use the new atoms to run a new chunk
+                    self.atoms = atoms
+                    self.chunk += 1
+                    self.timestep += self.chunk_size
+                    self.attempt = 0
+            else:
+                # audit failed, try a new attempt once new model is received
+                self.attempt += 1
+                # wait for new weights
+                # not sure how best to do this
+                # await_event_async from academy?
+
     async def _advance_dynamics_callback(
         self,
         future: ConcurrentFuture[Any]
@@ -398,7 +296,7 @@ class Auditor(CascadeAgent):
             self,
             config: AuditorConfig,
             sampler: Handle[Sampler],
-            dynamics_engine: Handle[DynamicsEngine],
+            dynamics_engine: Handle[DynamicsRunner],
             audit_task: Callable[[ChunkSpec], AuditResult],
             executor: Executor
     ):
@@ -817,7 +715,7 @@ class DatabaseMonitor(CascadeAgent):
         self,
         config: DatabaseMonitorConfig,
         trainer: Handle[DummyTrainer],
-        dynamics_engine: Handle[DynamicsEngine]
+        dynamics_engine: Handle[DynamicsRunner]
     ):
         super().__init__(config)
         self.trainer = trainer
