@@ -1,16 +1,17 @@
 """ORM layer for tracking trajectories and trajectory chunks in PostgreSQL.
 
 This module provides SQLAlchemy models and utilities for persisting trajectory
-and chunk metadata alongside the ASE database for individual frames.
+and chunk metadata, and storing trajectory frames as serialized Atoms objects.
 """
 from __future__ import annotations
 
 import contextlib
+import gc
 import logging
+from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
 import numpy as np
-import ase
 from ase import Atoms
 
 if TYPE_CHECKING:
@@ -29,10 +30,12 @@ from sqlalchemy import (
     ForeignKey,
     func,
     JSON,
+    LargeBinary,
     UniqueConstraint,
+    Index,
 )
 from sqlalchemy.orm import relationship, sessionmaker, declarative_base
-from cascade.model import AuditStatus
+from cascade.model import AuditStatus, TrajectoryStatus, ChunkEventType
 
 Base = declarative_base()
 
@@ -46,7 +49,7 @@ class DBTrajectory(Base):
     traj_id = Column(Integer, nullable=False)
     target_length = Column(Integer, nullable=False)
     chunks_completed = Column(Integer, default=0, nullable=False)
-    done = Column(Boolean, default=False, nullable=False)
+    status = Column(SQLEnum(TrajectoryStatus), nullable=False, default=TrajectoryStatus.RUNNING)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -61,7 +64,10 @@ class DBTrajectory(Base):
     )
 
     def __repr__(self):
-        return f"<DBTrajectory(run_id={self.run_id}, traj_id={self.traj_id}, chunks_completed={self.chunks_completed})>"
+        return (
+            f"<DBTrajectory(run_id={self.run_id}, traj_id={self.traj_id}, "
+            f"status={self.status.name}, chunks_completed={self.chunks_completed})>"
+        )
 
 
 class DBTrajectoryChunk(Base):
@@ -91,13 +97,34 @@ class DBTrajectoryChunk(Base):
         return f"<DBTrajectoryChunk(run_id={self.run_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt={self.attempt_index}, status={self.audit_status})>"
 
 
+class DBTrajectoryFrame(Base):
+    """ORM model for storing trajectory frame Atoms objects as BLOBs"""
+    __tablename__ = 'trajectory_frames'
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String, nullable=False, index=True)
+    traj_id = Column(Integer, nullable=False, index=True)
+    chunk_id = Column(Integer, nullable=False, index=True)
+    attempt_index = Column(Integer, nullable=False, index=True)
+    frame_index = Column(Integer, nullable=False)  # 0-based index within the chunk
+    atoms_blob = Column(LargeBinary, nullable=False)  # Serialized Atoms object (JSON format as bytes)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'traj_id', 'chunk_id', 'attempt_index', 'frame_index', name='uq_frame_run_traj_chunk_attempt_index'),
+    )
+
+    def __repr__(self):
+        return f"<DBTrajectoryFrame(run_id={self.run_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, frame_index={self.frame_index})>"
+
+
 class DBTrainingFrame(Base):
     """ORM model for training frames"""
     __tablename__ = 'training_frames'
 
     id = Column(Integer, primary_key=True)
     run_id = Column(String, nullable=False, index=True)
-    ase_db_id = Column(Integer, nullable=False, index=True)
+    trajectory_frame_id = Column(Integer, ForeignKey('trajectory_frames.id'), nullable=False, index=True)
     model_version_sampled_from = Column(Integer, nullable=False)
     # Denormalized chunk info for faster queries
     traj_id = Column(Integer, nullable=False, index=True)
@@ -108,26 +135,66 @@ class DBTrainingFrame(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint('run_id', 'ase_db_id', name='uq_training_frame_run_ase'),
+        UniqueConstraint('run_id', 'trajectory_frame_id', name='uq_training_frame_run_frame'),
     )
 
     def __repr__(self):
-        return f"<DBTrainingFrame(run_id={self.run_id}, ase_db_id={self.ase_db_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, training_round={self.training_round})>"
+        return f"<DBTrainingFrame(run_id={self.run_id}, trajectory_frame_id={self.trajectory_frame_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, training_round={self.training_round})>"
+
+
+class DBChunkEvent(Base):
+    """ORM model for chunk-level events"""
+    __tablename__ = 'chunk_events'
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String, nullable=False, index=True)
+    traj_id = Column(Integer, nullable=False, index=True)
+    chunk_id = Column(Integer, nullable=False, index=True)
+    attempt_index = Column(Integer, nullable=False, index=True)
+    frame_id = Column(Integer, ForeignKey('trajectory_frames.id'), nullable=True, index=True)
+    event_type = Column(SQLEnum(ChunkEventType), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    __table_args__ = (
+        # Composite index for efficient latest event queries
+        Index('idx_chunk_events_latest', 'run_id', 'traj_id', 'chunk_id', 'attempt_index', 'created_at'),
+    )
+
+    def __repr__(self):
+        return f"<DBChunkEvent(run_id={self.run_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, event_type={self.event_type.name}, frame_id={self.frame_id})>"
+
+
+class DBTrainingEvent(Base):
+    """ORM model for training-level events"""
+    __tablename__ = 'training_events'
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String, nullable=False, index=True)
+    event_type = Column(SQLEnum(ChunkEventType), nullable=False, index=True)
+    training_round = Column(Integer, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    def __repr__(self):
+        return f"<DBTrainingEvent(run_id={self.run_id}, event_type={self.event_type.name}, training_round={self.training_round})>"
 
 
 class TrajectoryDB:
     """Wrapper for the database representations of trajectories and chunks"""
     
-    def __init__(self, db_url: str):
+    def __init__(self, db_url: str, logger: Optional[logging.Logger] = None):
         """Initialize the trajectory database manager
         
         Args:
             db_url: PostgreSQL connection URL (e.g., 'postgresql://user:pass@host:port/dbname')
+            logger: Optional logger for tracking engine creation
         """
         self.db_url = db_url
-        # Create engine and session factory
-        self.engine = create_engine(db_url, echo=False, pool_pre_ping=True)
+        self._logger = logger or logging.getLogger(__name__)
+        
+        # Create engine with default settings
+        self.engine = create_engine(db_url, echo=False)
         self.SessionLocal = sessionmaker(bind=self.engine, autocommit=False, autoflush=False)
+        self._logger.info(f"Created TrajectoryDB engine (id={id(self.engine)})")
         
     def create_tables(self):
         """Create all tables if they don't exist"""
@@ -145,6 +212,138 @@ class TrajectoryDB:
             raise
         finally:
             session.close()
+            # Force garbage collection after session close to release any held references
+            gc.collect()
+    
+    @staticmethod
+    def _serialize_atoms(atoms: Atoms) -> bytes:
+        """Serialize an Atoms object to bytes using cascade.utils
+        
+        Args:
+            atoms: Atoms object to serialize
+            
+        Returns:
+            Serialized Atoms as bytes (JSON format)
+        """
+        from cascade.utils import canonicalize, write_to_string
+        canonical_atoms = canonicalize(atoms)
+        atoms_str = write_to_string(canonical_atoms, fmt='json')
+        return atoms_str.encode('utf-8')
+    
+    @staticmethod
+    def _deserialize_atoms(data: bytes) -> Atoms:
+        """Deserialize bytes to an Atoms object using cascade.utils
+        
+        Args:
+            data: Serialized Atoms as bytes (JSON format)
+            
+        Returns:
+            Deserialized Atoms object
+        """
+        from cascade.utils import read_from_string
+        atoms_str = data.decode('utf-8')
+        return read_from_string(atoms_str, fmt='json')
+    
+    def write_frame(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int,
+        frame_index: int,
+        atoms: Atoms
+    ) -> int:
+        """Write a trajectory frame to the database
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index
+            frame_index: Frame index within the chunk (0-based)
+            atoms: Atoms object to store
+            
+        Returns:
+            ID of the created frame record
+        """
+        with self.session() as sess:
+            # Serialize atoms
+            atoms_blob = self._serialize_atoms(atoms)
+            
+            # Check if frame already exists
+            existing = sess.query(DBTrajectoryFrame).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index,
+                frame_index=frame_index
+            ).first()
+            
+            if existing:
+                # Update existing frame
+                existing.atoms_blob = atoms_blob
+                sess.flush()
+                return existing.id
+            
+            # Create new frame
+            db_frame = DBTrajectoryFrame(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index,
+                frame_index=frame_index,
+                atoms_blob=atoms_blob
+            )
+            sess.add(db_frame)
+            sess.flush()
+            sess.refresh(db_frame)
+            return db_frame.id
+    
+    def _set_trajectory_status(
+        self,
+        sess,
+        traj: DBTrajectory,
+        status: TrajectoryStatus,
+    ) -> None:
+        """Internal helper to update trajectory status."""
+        previous_status = traj.status
+        if previous_status != status:
+            traj.status = status
+            sess.flush()
+
+    def mark_trajectory_status(
+        self,
+        run_id: str,
+        traj_id: int,
+        status: TrajectoryStatus,
+    ) -> bool:
+        """Set the lifecycle status for a trajectory."""
+        with self.session() as sess:
+            traj = sess.query(DBTrajectory).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+            ).first()
+            if not traj:
+                logger.warning(
+                    "Attempted to update status for missing trajectory %s/%s",
+                    run_id,
+                    traj_id,
+                )
+                return False
+            self._set_trajectory_status(sess, traj, status)
+            return True
+
+    def mark_trajectory_running(self, run_id: str, traj_id: int) -> bool:
+        """Mark a trajectory as actively running."""
+        return self.mark_trajectory_status(run_id, traj_id, TrajectoryStatus.RUNNING)
+
+    def mark_trajectory_failed(self, run_id: str, traj_id: int) -> bool:
+        """Mark a trajectory as failed."""
+        return self.mark_trajectory_status(run_id, traj_id, TrajectoryStatus.FAILED)
+
+    def mark_trajectory_completed(self, run_id: str, traj_id: int) -> bool:
+        """Mark a trajectory as completed."""
+        return self.mark_trajectory_status(run_id, traj_id, TrajectoryStatus.COMPLETED)
     
     def initialize_trajectory(
         self,
@@ -189,10 +388,11 @@ class TrajectoryDB:
                     traj_id=traj_id,
                     target_length=target_length,
                     chunks_completed=0,
-                    init_atoms_json=init_atoms_json
+                    init_atoms_json=init_atoms_json,
+                    status=TrajectoryStatus.RUNNING,
                 )
                 sess.add(db_traj)
-                sess.flush()
+                self._set_trajectory_status(sess, db_traj, TrajectoryStatus.RUNNING)
                 return True
         except Exception as e:
             logger.error(f"Failed to initialize trajectory {traj_id} for run {run_id}: {e}")
@@ -271,13 +471,15 @@ class TrajectoryDB:
                     n_frames=n_frames
                 )
                 sess.add(db_chunk)
-                sess.flush()
+
+                # Ensure trajectory marked running if new chunk attempt created
+                self._set_trajectory_status(sess, db_traj, TrajectoryStatus.RUNNING)
                 return True
         except Exception as e:
             logger.error(f"Failed to add chunk attempt for traj {traj_id}, chunk {chunk_id}, attempt {attempt_index}: {e}")
             return False
     
-    def update_chunk_audit_status(
+    def update_chunk_audit_done_status(
         self,
         run_id: str,
         traj_id: int,
@@ -285,7 +487,7 @@ class TrajectoryDB:
         attempt_index: int,
         audit_status: AuditStatus
     ):
-        """Update the audit status of a chunk
+        """Update the audit status of a chunk and mark trajectory as done if it is complete
         
         Args:
             run_id: Run identifier
@@ -336,8 +538,12 @@ class TrajectoryDB:
                             audit_status=AuditStatus.PASSED
                         ).all()
                         total_frames = sum(chunk.n_frames for chunk in passed_chunks)
-                        if total_frames >= traj.target_length:
-                            traj.done = True
+                        new_status = (
+                            TrajectoryStatus.COMPLETED
+                            if total_frames >= traj.target_length
+                            else TrajectoryStatus.RUNNING
+                        )
+                        self._set_trajectory_status(sess, traj, new_status)
     
     def get_latest_passed_chunk(
         self,
@@ -412,12 +618,11 @@ class TrajectoryDB:
     def get_trajectory_atoms(
         self,
         run_id: str,
-        traj_id: int,
-        ase_db: ase.database.connect
+        traj_id: int
     ) -> list[Atoms]:
         """Get all atoms from passed chunks for a trajectory
         
-        This queries the ASE database for all frames matching the passed chunks
+        This queries the trajectory_frames table for all frames matching the passed chunks
         and returns them as a list of Atoms objects. When reconstructing the full
         trajectory, the first frame of each chunk (except chunk 0) is skipped to
         avoid duplicates, since the first frame of chunk N is the same as the
@@ -426,7 +631,6 @@ class TrajectoryDB:
         Args:
             run_id: Run identifier
             traj_id: Trajectory identifier
-            ase_db: ASE database connection to query frames from
             
         Returns:
             List of Atoms objects from all passed chunks, in order, with duplicates removed
@@ -434,23 +638,27 @@ class TrajectoryDB:
         chunks = self.get_passed_chunks(run_id, traj_id)
         
         all_atoms = []
-        for i, chunk in enumerate(chunks):
-            # Query ASE DB for all frames in this chunk and attempt
-            # Passed chunks are the specific attempt that passed, so we query by attempt_index
-            frames = list(ase_db.select(
-                run_id=run_id,
-                traj_id=traj_id,
-                chunk_id=chunk['chunk_id'],
-                attempt_index=chunk['attempt_index']
-            ))
-            frames.sort(key=lambda row: row.id)
-            # Skip first frame of all chunks except chunk 0
-            # (first frame is duplicate of previous chunk's last frame)
-            if i > 0:
-                frames = frames[1:]
-            
-            all_atoms.extend([row.toatoms() for row in frames])
+        with self.session() as sess:
+            for i, chunk in enumerate(chunks):
+                # Query frames for this chunk and attempt
+                frames = sess.query(DBTrajectoryFrame).filter_by(
+                    run_id=run_id,
+                    traj_id=traj_id,
+                    chunk_id=chunk['chunk_id'],
+                    attempt_index=chunk['attempt_index']
+                ).order_by(DBTrajectoryFrame.frame_index).all()
+                
+                # Skip first frame of all chunks except chunk 0
+                # (first frame is duplicate of previous chunk's last frame)
+                if i > 0:
+                    frames = frames[1:]
+                
+                # Deserialize directly from ORM objects
+                for frame in frames:
+                    all_atoms.append(self._deserialize_atoms(frame.atoms_blob))
         
+        # Force garbage collection after deserializing large binary data
+        gc.collect()
         return all_atoms
     
     def get_trajectory(
@@ -481,6 +689,7 @@ class TrajectoryDB:
                 'traj_id': traj.traj_id,
                 'target_length': traj.target_length,
                 'chunks_completed': traj.chunks_completed,
+                'status': traj.status,
                 'init_atoms_json': traj.init_atoms_json,
                 'created_at': traj.created_at,
                 'updated_at': traj.updated_at
@@ -584,6 +793,46 @@ class TrajectoryDB:
                 'n_frames': chunk.n_frames
             }
     
+    def get_latest_chunk_attempt_atoms(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int
+    ) -> list[Atoms]:
+        """Get the atoms for the latest attempt of a chunk
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+        
+        Returns:
+            List of Atoms objects for the latest chunk attempt (empty if none found)
+        """
+        latest_attempt = self.get_latest_chunk_attempt(run_id, traj_id, chunk_id)
+        if not latest_attempt:
+            return []
+        
+        attempt_index = latest_attempt['attempt_index']
+        
+        with self.session() as sess:
+            frames = sess.query(DBTrajectoryFrame).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index
+            ).order_by(DBTrajectoryFrame.frame_index).all()
+            
+            if not frames:
+                return []
+            
+            # Deserialize directly from ORM objects
+            atoms_list = [self._deserialize_atoms(frame.atoms_blob) for frame in frames]
+        
+        # Force garbage collection after deserializing large binary data
+        gc.collect()
+        return atoms_list
+    
     def is_trajectory_done(
         self,
         run_id: str,
@@ -607,16 +856,29 @@ class TrajectoryDB:
             if not traj:
                 return False
             
-            # Return the stored done flag
-            return traj.done
+            return traj.status == TrajectoryStatus.COMPLETED
+
+    def get_trajectory_status(
+        self,
+        run_id: str,
+        traj_id: int,
+    ) -> Optional[TrajectoryStatus]:
+        """Return the lifecycle status for a trajectory, if it exists."""
+        with self.session() as sess:
+            traj = sess.query(DBTrajectory).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+            ).first()
+            if not traj:
+                return None
+            return traj.status
     
     def get_first_frame_from_chunk(
         self,
         run_id: str,
         traj_id: int,
         chunk_id: int,
-        attempt_index: int,
-        ase_db: ase.database.connect
+        attempt_index: int
     ) -> Optional[Atoms]:
         """Get the first frame from a chunk
         
@@ -625,35 +887,35 @@ class TrajectoryDB:
             traj_id: Trajectory identifier
             chunk_id: Chunk identifier
             attempt_index: Attempt index for this chunk
-            ase_db: ASE database connection to query frames from
             
         Returns:
             Atoms object for the first frame, or None if no frames found
         """
-        # Query ASE DB for all frames in this chunk and attempt
-        frames = list(ase_db.select(
-            run_id=run_id,
-            traj_id=traj_id,
-            chunk_id=chunk_id,
-            attempt_index=attempt_index
-        ))
+        with self.session() as sess:
+            frame = sess.query(DBTrajectoryFrame).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index,
+                frame_index=0
+            ).first()
+            
+            if not frame:
+                return None
+            
+            # Deserialize directly from ORM object
+            atoms = self._deserialize_atoms(frame.atoms_blob)
         
-        if not frames:
-            return None
-        
-        # Sort by id to ensure proper ordering
-        frames.sort(key=lambda row: row.id)
-        
-        # Return the first frame
-        return frames[0].toatoms()
+        # Force garbage collection after deserializing large binary data
+        gc.collect()
+        return atoms
     
     def get_last_frame_from_chunk(
         self,
         run_id: str,
         traj_id: int,
         chunk_id: int,
-        attempt_index: int,
-        ase_db: ase.database.connect
+        attempt_index: int
     ) -> Optional[Atoms]:
         """Get the last frame from a chunk
         
@@ -662,27 +924,61 @@ class TrajectoryDB:
             traj_id: Trajectory identifier
             chunk_id: Chunk identifier
             attempt_index: Attempt index for this chunk
-            ase_db: ASE database connection to query frames from
             
         Returns:
             Atoms object for the last frame, or None if no frames found
         """
-        # Query ASE DB for all frames in this chunk and attempt
-        frames = list(ase_db.select(
-            run_id=run_id,
-            traj_id=traj_id,
-            chunk_id=chunk_id,
-            attempt_index=attempt_index
-        ))
+        with self.session() as sess:
+            # Get the frame with the highest frame_index for this chunk/attempt
+            frame = sess.query(DBTrajectoryFrame).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index
+            ).order_by(DBTrajectoryFrame.frame_index.desc()).first()
+            
+            if not frame:
+                return None
+            
+            # Deserialize directly from ORM object
+            atoms = self._deserialize_atoms(frame.atoms_blob)
         
-        if not frames:
-            return None
+        # Force garbage collection after deserializing large binary data
+        gc.collect()
+        return atoms
+    
+    def get_chunk_frame_ids(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int
+    ) -> list[int]:
+        """Get frame IDs for a chunk, ordered by frame_index
         
-        # Sort by id to ensure proper ordering
-        frames.sort(key=lambda row: row.id)
+        Uses with_entities to only select the ID column, avoiding loading full ORM objects.
         
-        # Return the last frame
-        return frames[-1].toatoms()
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index for this chunk
+            
+        Returns:
+            List of frame IDs ordered by frame_index
+        """
+        with self.session() as sess:
+            # Query only the ID and frame_index columns, then extract IDs in order
+            frame_rows = sess.query(
+                DBTrajectoryFrame.id,
+                DBTrajectoryFrame.frame_index
+            ).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index
+            ).order_by(DBTrajectoryFrame.frame_index).all()
+            return [row[0] for row in frame_rows]
     
     def get_initial_trajectory_frame(
         self,
@@ -719,13 +1015,34 @@ class TrajectoryDB:
             
             if init_atoms_json.get('pbc') is not None:
                 atoms.set_pbc(init_atoms_json['pbc'])
+        
+        # Force garbage collection after reconstructing atoms
+        gc.collect()
+        return atoms
+    
+    def get_current_training_round(self, run_id: str) -> int:
+        """Get the current training round number for a run
+        
+        Returns the maximum training_round in the database, or 0 if none exists.
+        This represents the most recent training round that has frames.
+        
+        Args:
+            run_id: Run identifier
             
-            return atoms
+        Returns:
+            Current training round number (0-based)
+        """
+        with self.session() as sess:
+            max_round = sess.query(func.max(DBTrainingFrame.training_round)).filter_by(
+                run_id=run_id
+            ).scalar()
+            return max_round if max_round is not None else 0
+    
     
     def add_training_frame(
         self,
         run_id: str,
-        ase_db_id: int,
+        trajectory_frame_id: int,
         model_version_sampled_from: int,
         traj_id: int,
         chunk_id: int,
@@ -733,13 +1050,15 @@ class TrajectoryDB:
     ) -> DBTrainingFrame:
         """Add a training frame to the database
         
+        Training frames are immediately marked with the current training round.
+        
         Args:
             run_id: Run identifier
-            ase_db_id: ID of the frame in the ASE database
+            trajectory_frame_id: ID of the frame in the trajectory_frames table
             model_version_sampled_from: Model version that generated this frame
-            traj_id: Trajectory identifier (denormalized from ASE DB)
-            chunk_id: Chunk identifier (denormalized from ASE DB)
-            attempt_index: Attempt index (denormalized from ASE DB)
+            traj_id: Trajectory identifier (denormalized)
+            chunk_id: Chunk identifier (denormalized)
+            attempt_index: Attempt index (denormalized)
             
         Returns:
             DBTrainingFrame instance
@@ -748,21 +1067,24 @@ class TrajectoryDB:
             # Check if training frame already exists
             existing = sess.query(DBTrainingFrame).filter_by(
                 run_id=run_id,
-                ase_db_id=ase_db_id
+                trajectory_frame_id=trajectory_frame_id
             ).first()
             
             if existing:
                 return existing
             
-            # Create new training frame entry
+            # Get current training round
+            current_round = self.get_current_training_round(run_id)
+            
+            # Create new training frame entry with current training round
             db_training_frame = DBTrainingFrame(
                 run_id=run_id,
-                ase_db_id=ase_db_id,
+                trajectory_frame_id=trajectory_frame_id,
                 model_version_sampled_from=model_version_sampled_from,
                 traj_id=traj_id,
                 chunk_id=chunk_id,
                 attempt_index=attempt_index,
-                training_round=None  # Will be set when used in training
+                training_round=current_round  # Mark immediately with current round
             )
             sess.add(db_training_frame)
             sess.flush()
@@ -771,14 +1093,12 @@ class TrajectoryDB:
     
     def get_training_frames(
         self,
-        run_id: str,
-        ase_db: ase.database.connect
+        run_id: str
     ) -> list[Atoms]:
         """Get all training frames for a run
         
         Args:
             run_id: Run identifier
-            ase_db: ASE database connection to query frames from
             
         Returns:
             List of Atoms objects from all training frames
@@ -786,22 +1106,26 @@ class TrajectoryDB:
         with self.session() as sess:
             training_frames = sess.query(DBTrainingFrame).filter_by(
                 run_id=run_id
+            ).filter(
+                DBTrainingFrame.training_round.is_(None)
             ).all()
             
             if not training_frames:
                 return []
             
-            # Get actual Atoms objects from ASE DB
-            atoms_list = []
-            for tf in training_frames:
-                try:
-                    row = ase_db.get(tf.ase_db_id)
-                    atoms_list.append(row.toatoms())
-                except KeyError:
-                    # Frame might have been deleted from ASE DB
-                    continue
+            # Get trajectory frame IDs
+            frame_ids = [tf.trajectory_frame_id for tf in training_frames]
             
-            return atoms_list
+            # Deserialize directly from ORM objects
+            atoms_list = []
+            for frame_id in frame_ids:
+                frame = sess.query(DBTrajectoryFrame).filter_by(id=frame_id).first()
+                if frame:
+                    atoms_list.append(self._deserialize_atoms(frame.atoms_blob))
+        
+        # Force garbage collection after deserializing large binary data
+        gc.collect()
+        return atoms_list
     
     def count_training_frames(self, run_id: str) -> int:
         """Count the number of training frames for a run
@@ -839,54 +1163,14 @@ class TrajectoryDB:
             )
             return updated
     
-    def get_chunks_from_training_round(
-        self,
-        run_id: str,
-        training_round: int
-    ) -> list[dict]:
-        """Get unique chunks that generated frames used in a training round
-        
-        Args:
-            run_id: Run identifier
-            training_round: Training round number
-            
-        Returns:
-            List of dicts with unique (traj_id, chunk_id, attempt_index) tuples.
-            Each dict contains:
-                - traj_id: Trajectory identifier
-                - chunk_id: Chunk identifier
-                - attempt_index: Attempt index
-        """
-        with self.session() as sess:
-            # Get all frames from this training round
-            frames = sess.query(DBTrainingFrame).filter_by(
-                run_id=run_id,
-                training_round=training_round
-            ).all()
-            
-            # Extract unique (traj_id, chunk_id, attempt_index) tuples
-            unique_chunks = {}
-            for frame in frames:
-                key = (frame.traj_id, frame.chunk_id, frame.attempt_index)
-                if key not in unique_chunks:
-                    unique_chunks[key] = {
-                        'traj_id': frame.traj_id,
-                        'chunk_id': frame.chunk_id,
-                        'attempt_index': frame.attempt_index
-                    }
-            
-            return list(unique_chunks.values())
-    
     def get_sampled_traj_ids(
         self,
-        run_id: str,
-        ase_db
+        run_id: str
     ) -> set[int]:
         """Get unique trajectory IDs that have training frames sampled from them
         
         Args:
             run_id: Run identifier
-            ase_db: ASE database connection to query frames from
             
         Returns:
             Set of unique trajectory IDs from sampled frames
@@ -899,20 +1183,8 @@ class TrajectoryDB:
             if not training_frames:
                 return set()
             
-            # Extract ASE DB IDs while session is still active
-            ase_db_ids = [tf.ase_db_id for tf in training_frames]
-            
-            # Get unique trajectory IDs from ASE DB
-            unique_traj_ids = set()
-            for ase_db_id in ase_db_ids:
-                try:
-                    row = ase_db.get(ase_db_id)
-                    traj_id = row.get('traj_id')
-                    if traj_id is not None:
-                        unique_traj_ids.add(traj_id)
-                except KeyError:
-                    # Frame might have been deleted from ASE DB
-                    continue
+            # Extract unique trajectory IDs from denormalized data
+            unique_traj_ids = {tf.traj_id for tf in training_frames}
             
             return unique_traj_ids
     
@@ -1002,68 +1274,341 @@ class TrajectoryDB:
         if atoms_json.get('pbc') is not None:
             atoms.pbc = np.array(atoms_json['pbc'])
         
+        # Force garbage collection after reconstructing atoms
+        gc.collect()
         return atoms
     
-    def count_active_trajs_with_samples(
+    def record_chunk_event(
         self,
         run_id: str,
-        ase_db: ase.database.connect
-    ) -> tuple[int, int]:
-        """Count active trajectories and those with sampled training frames
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int,
+        event_type: ChunkEventType,
+        frame_id: Optional[int] = None
+    ) -> None:
+        """Record a chunk-level event
         
         Args:
             run_id: Run identifier
-            ase_db: ASE database connection to query frames from
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index
+            event_type: Type of event
+            frame_id: Optional frame ID for frame-level events
+        """
+        with self.session() as sess:
+            db_event = DBChunkEvent(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index,
+                frame_id=frame_id,
+                event_type=event_type
+            )
+            sess.add(db_event)
+    
+    def record_training_event(
+        self,
+        run_id: str,
+        event_type: ChunkEventType,
+        training_round: int
+    ) -> None:
+        """Record a training-level event
+        
+        Args:
+            run_id: Run identifier
+            event_type: Type of event (STARTED_TRAINING or FINISHED_TRAINING)
+            training_round: Training round number
+        """
+        with self.session() as sess:
+            db_event = DBTrainingEvent(
+                run_id=run_id,
+                event_type=event_type,
+                training_round=training_round
+            )
+            sess.add(db_event)
+    
+    def has_chunk_event(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int,
+        event_type: ChunkEventType
+    ) -> bool:
+        """Check if a chunk event exists (for idempotent checks)
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index
+            event_type: Type of event to check
             
         Returns:
-            Tuple of (total_active_trajectories, active_trajectories_with_samples)
+            True if event exists, False otherwise
         """
-        # Get training frames and trajectories outside the session to avoid deadlocks
         with self.session() as sess:
+            count = sess.query(DBChunkEvent).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index,
+                event_type=event_type
+            ).count()
+            return count > 0
+    
+    def get_latest_event_for_chunk(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int
+    ) -> Optional[ChunkEventType]:
+        """Get the most recent event type for a chunk
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index
+            
+        Returns:
+            Most recent event type, or None if no events exist
+        """
+        with self.session() as sess:
+            event = sess.query(DBChunkEvent).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index
+            ).order_by(DBChunkEvent.created_at.desc()).first()
+            
+            if not event:
+                return None
+            return event.event_type
+    
+    def get_latest_event_per_trajectory(self, run_id: str) -> list[dict]:
+        """For each trajectory, the latest chunk event (by created_at).
+
+        One row per traj_id. Returns list of dicts with traj_id, event_type,
+        chunk_id, attempt_index.
+        """
+        with self.session() as sess:
+            subq = (
+                sess.query(
+                    DBChunkEvent.traj_id,
+                    DBChunkEvent.event_type,
+                    DBChunkEvent.chunk_id,
+                    DBChunkEvent.attempt_index,
+                    func.row_number()
+                    .over(
+                        partition_by=DBChunkEvent.traj_id,
+                        order_by=DBChunkEvent.created_at.desc(),
+                    )
+                    .label("rn"),
+                )
+                .filter_by(run_id=run_id)
+                .subquery()
+            )
+            rows = (
+                sess.query(
+                    subq.c.traj_id,
+                    subq.c.event_type,
+                    subq.c.chunk_id,
+                    subq.c.attempt_index,
+                )
+                .filter(subq.c.rn == 1)
+                .all()
+            )
+            return [
+                {
+                    "traj_id": t,
+                    "event_type": e,
+                    "chunk_id": c,
+                    "attempt_index": a,
+                }
+                for t, e, c, a in rows
+            ]
+
+    def get_trajs_with_latest_event(
+        self,
+        run_id: str,
+        event_type: ChunkEventType
+    ) -> list[dict]:
+        """Trajectories whose latest chunk event (by created_at) matches the given type.
+
+        Returns list of dicts with traj_id, chunk_id, attempt_index (at most one per trajectory).
+        """
+        rows = self.get_latest_event_per_trajectory(run_id)
+        return [
+            {"traj_id": r["traj_id"], "chunk_id": r["chunk_id"], "attempt_index": r["attempt_index"]}
+            for r in rows
+            if r["event_type"] == event_type
+        ]
+    
+    def list_chunk_events(
+        self,
+        run_id: str,
+        traj_id: Optional[int] = None,
+        chunk_id: Optional[int] = None,
+        limit: Optional[int] = None
+    ) -> list[dict]:
+        """List chunk events for a run, optionally filtered by trajectory or chunk.
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Optional trajectory ID to filter by
+            chunk_id: Optional chunk ID to filter by
+            limit: Optional maximum number of events to return
+            
+        Returns:
+            List of dicts with run_id, traj_id, chunk_id, attempt_index, event_type,
+            frame_id, created_at. event_type is the enum name (e.g. 'STARTED_LABELING').
+            Ordered by traj_id, chunk_id, attempt_index, created_at.
+        """
+        with self.session() as sess:
+            q = sess.query(DBChunkEvent).filter_by(run_id=run_id)
+            if traj_id is not None:
+                q = q.filter_by(traj_id=traj_id)
+            if chunk_id is not None:
+                q = q.filter_by(chunk_id=chunk_id)
+            q = q.order_by(
+                DBChunkEvent.traj_id,
+                DBChunkEvent.chunk_id,
+                DBChunkEvent.attempt_index,
+                DBChunkEvent.created_at
+            )
+            if limit is not None:
+                q = q.limit(limit)
+            events = q.all()
+            
+            result = []
+            for e in events:
+                event_type_str = e.event_type.name if hasattr(e.event_type, 'name') else str(e.event_type)
+                result.append({
+                    'run_id': e.run_id,
+                    'traj_id': e.traj_id,
+                    'chunk_id': e.chunk_id,
+                    'attempt_index': e.attempt_index,
+                    'event_type': event_type_str,
+                    'frame_id': e.frame_id,
+                    'created_at': e.created_at
+                })
+            return result
+    
+    def count_active_trajs_with_labeling(
+        self,
+        run_id: str
+    ) -> tuple[int, int]:
+        """Count active trajectories and those with labeling since last training.
+        
+        Only FINISHED_LABELING events after the most recent FINISHED_TRAINING are
+        counted. If there is no previous training, all FINISHED_LABELING events count.
+        
+        Args:
+            run_id: Run identifier
+            
+        Returns:
+            Tuple of (total_active_trajectories, active_trajectories_with_labeling)
+        """
+        with self.session() as sess:
+            # Last training completion time; None if we haven't trained yet
+            last_train = (
+                sess.query(DBTrainingEvent.created_at)
+                .filter_by(
+                    run_id=run_id,
+                    event_type=ChunkEventType.FINISHED_TRAINING
+                )
+                .order_by(DBTrainingEvent.created_at.desc())
+                .limit(1)
+                .scalar()
+            )
+            
             # Get all trajectories for this run
             all_trajectories = sess.query(DBTrajectory).filter_by(
                 run_id=run_id
             ).all()
             
-            # Get all training frames for this run
-            training_frames = sess.query(DBTrainingFrame).filter_by(
-                run_id=run_id
-            ).all()
+            # Unique traj_ids with FINISHED_LABELING since last training
+            q = sess.query(DBChunkEvent.traj_id).filter_by(
+                run_id=run_id,
+                event_type=ChunkEventType.FINISHED_LABELING
+            )
+            if last_train is not None:
+                q = q.filter(DBChunkEvent.created_at > last_train)
+            labeled_traj_ids = {r[0] for r in q.distinct().all()}
             
-            # Extract ASE DB IDs while session is active
-            ase_db_ids = [tf.ase_db_id for tf in training_frames]
-            
-            # Extract trajectory info while session is active to avoid DetachedInstanceError
+            # Extract trajectory info while session is active
             trajectory_info = [
-                {'traj_id': traj.traj_id, 'target_length': traj.target_length, 'done': traj.done}
+                {'traj_id': traj.traj_id, 'status': traj.status}
                 for traj in all_trajectories
             ]
         
-        # Get unique trajectory IDs from sampled frames (outside session to avoid deadlock)
-        sampled_traj_ids = set()
-        for ase_db_id in ase_db_ids:
-            try:
-                row = ase_db.get(ase_db_id)
-                traj_id = row.get('traj_id')
-                if traj_id is not None:
-                    sampled_traj_ids.add(traj_id)
-            except KeyError:
-                # Frame might have been deleted from ASE DB
-                continue
-        
-        # Now check which trajectories are active and have samples
+        # Now check which trajectories are active and have labeling
         active_count = 0
-        active_with_samples_count = 0
+        active_with_labeling_count = 0
         
         for traj_info in trajectory_info:
             # Check if trajectory is active (not done)
-            if not traj_info['done']:
+            if traj_info['status'] == TrajectoryStatus.RUNNING:
                 active_count += 1
-                # Check if this trajectory has been sampled from
-                if traj_info['traj_id'] in sampled_traj_ids:
-                    active_with_samples_count += 1
+                # Check if this trajectory has been labeled
+                if traj_info['traj_id'] in labeled_traj_ids:
+                    active_with_labeling_count += 1
         
-        return (active_count, active_with_samples_count)
+        return (active_count, active_with_labeling_count)
+    
+    def get_last_training_completion_time(
+        self,
+        run_id: str
+    ) -> Optional[datetime]:
+        """Get the timestamp of the most recent FINISHED_TRAINING event
+        
+        Args:
+            run_id: Run identifier
+            
+        Returns:
+            Timestamp of most recent training completion, or None if no training events
+        """
+        with self.session() as sess:
+            event = sess.query(DBTrainingEvent).filter_by(
+                run_id=run_id,
+                event_type=ChunkEventType.FINISHED_TRAINING
+            ).order_by(DBTrainingEvent.created_at.desc()).first()
+            
+            if not event:
+                return None
+            return event.created_at
+    
+    def count_labeled_frames_for_chunk(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int
+    ) -> int:
+        """Count FINISHED_LABELING_FRAME events for a chunk
+        
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier
+            chunk_id: Chunk identifier
+            attempt_index: Attempt index
+            
+        Returns:
+            Number of frames labeled for this chunk
+        """
+        with self.session() as sess:
+            count = sess.query(DBChunkEvent).filter_by(
+                run_id=run_id,
+                traj_id=traj_id,
+                chunk_id=chunk_id,
+                attempt_index=attempt_index,
+                event_type=ChunkEventType.FINISHED_LABELING_FRAME
+            ).count()
+            return count
     
     def list_runs(self) -> list[dict]:
         """List all unique runs in the database with metadata
@@ -1084,7 +1629,7 @@ class TrajectoryDB:
                 func.min(DBTrajectory.created_at).label('first_created'),
                 func.max(DBTrajectory.updated_at).label('last_updated'),
                 func.count(DBTrajectory.id).label('n_trajectories'),
-                func.sum(func.cast(DBTrajectory.done, Integer)).label('n_done_trajectories')
+                func.sum(func.cast(DBTrajectory.status == TrajectoryStatus.COMPLETED, Integer)).label('n_done_trajectories')
             ).group_by(DBTrajectory.run_id).all()
             
             result = []
@@ -1131,7 +1676,7 @@ class TrajectoryDB:
             # Get trajectory statistics
             traj_stats = sess.query(
                 func.count(DBTrajectory.id).label('n_trajectories'),
-                func.sum(func.cast(DBTrajectory.done, Integer)).label('n_done'),
+                func.sum(func.cast(DBTrajectory.status == TrajectoryStatus.COMPLETED, Integer)).label('n_done'),
                 func.min(DBTrajectory.created_at).label('first_created'),
                 func.max(DBTrajectory.updated_at).label('last_updated')
             ).filter_by(run_id=run_id).first()
@@ -1199,7 +1744,6 @@ class TrajectoryDB:
                 'traj_id': traj.traj_id,
                 'target_length': traj.target_length,
                 'chunks_completed': traj.chunks_completed,
-                'done': traj.done,
                 'created_at': traj.created_at,
                 'updated_at': traj.updated_at
             }
@@ -1323,7 +1867,7 @@ class TrajectoryDB:
         Returns:
             List of dicts with trajectory metadata, sorted by traj_id.
             Each dict contains:
-                - traj_id, target_length, chunks_completed, done
+                - traj_id, target_length, chunks_completed, status, done
                 - created_at, updated_at
         """
         with self.session() as sess:
@@ -1337,7 +1881,7 @@ class TrajectoryDB:
                     'traj_id': traj.traj_id,
                     'target_length': traj.target_length,
                     'chunks_completed': traj.chunks_completed,
-                    'done': traj.done,
+                    'status': traj.status,
                     'created_at': traj.created_at,
                     'updated_at': traj.updated_at
                 })
