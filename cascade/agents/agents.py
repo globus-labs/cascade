@@ -10,23 +10,18 @@ In addition to de-stubbing, we have the following todos:
 from __future__ import annotations
 
 import asyncio
-from asyncio import Queue
-from threading import Event
+from asyncio import Queue, Event, Lock, wrap_future
 import gc
 import logging
 from functools import cached_property
 from typing import Any, Awaitable, Callable, NamedTuple, Optional, cast
 from concurrent.futures import Executor, Future as ConcurrentFuture
 
-import os
-import numpy as np
 from ase import Atoms
 from academy.handle import Handle
 from academy.agent import Agent, action, loop
 from ase.optimize.optimize import Dynamics
 from mace.calculators import mace_mp
-from parsl.concurrent import ParslPoolExecutor
-from parsl.config import Config
 
 try:
     import psutil
@@ -37,20 +32,15 @@ except ImportError:
     _PSUTIL_WARNING_LOGGED = False
 
 from cascade.learning.base import BaseLearnableForcefield
-from cascade.utils import canonicalize
 from cascade.model import AuditStatus, AdvanceSpec, AuditResult, TrajectoryStatus, ChunkEventType
 from cascade.agents.config import (
-    CascadeAgentConfig,
-    DatabaseConfig,
-    DynamicsRunnerConfig,
     AuditorConfig,
     SamplerConfig,
     LabelerConfig,
-    TrainerConfig,
     DatabaseMonitorConfig
 )
 from cascade.agents.db_orm import TrajectoryDB
-from cascade.model import ChunkSpec, TrainingFrame, TrainingFrameSpec
+from cascade.model import ChunkSpec, TrainingFrameSpec
 
 class CascadeAgent(Agent):
     """Base class for all cascade agents"""
@@ -83,11 +73,6 @@ class CascadeAgent(Agent):
     @cached_property
     def _traj_db(self) -> TrajectoryDB:
         """A TrajectoryDB object for managing trajectory and chunk metadata"""
-        CascadeAgent._resource_counts['traj_db_instances_created'] += 1
-        self.logger.info(
-            f"Creating TrajectoryDB instance #{CascadeAgent._resource_counts['traj_db_instances_created']} "
-            f"for {self.__class__.__name__}"
-        )
         traj_db = TrajectoryDB(self.config.db_url, logger=self.logger)
         traj_db.create_tables()  # Ensure tables exist
         return traj_db
@@ -110,6 +95,7 @@ class DynamicsRunner(CascadeAgent):
         dyn_kws: dict[str, object] | None,
         run_kws: dict[str, object] | None,
         device: str = 'cpu',
+        model_version: int = 0
     ):
         """Runs dynamics in a loop until done, or a shutdown message is received
 
@@ -127,6 +113,7 @@ class DynamicsRunner(CascadeAgent):
             dyn_kws: arguments to the dynamics constructor
             run_kws: arguments to the dynamics run method
             device: for torch execution
+            model_version: index of current model version
         """
         super().__init__(executor)
         self.atoms = atoms
@@ -148,13 +135,12 @@ class DynamicsRunner(CascadeAgent):
         self.chunk = 0
         self.attempt = 0
         self.done = False
+        self.model_version = model_version
 
+        self.received_weights = Event()
+        self.new_model_lock = Lock()
+        self.new_model: tuple[bytes, int] | None = None  # weights, version
 
-    @action
-    async def receive_weights(self, weights: bytes) -> None:
-        self.weights = weights
-        self.model_version += 1
-        self.logger.info(f"Received new weights, now on model version {self.model_version}")
 
     @loop
     async def run(
@@ -164,6 +150,8 @@ class DynamicsRunner(CascadeAgent):
         """Run dynamics until done, or a shutdown message is received"""
         while not (shutdown.is_set() or self.done):
 
+            # there are two conditions to release this lock: we finish, or we are waiting for new weights
+            # await self.weights_lock.acquire()
             # submit dynamics for evaluation
             spec = AdvanceSpec(
                 atoms=self.atoms,
@@ -184,16 +172,22 @@ class DynamicsRunner(CascadeAgent):
             )
             self.logger.info(f"Running dynamics for {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
 
-            atoms_future = self.executor.submit(
-                self.advance_dynamics_task,
-                spec=spec,
-                learner=self.learner,
-                weights=self.weights,
-                db_url=self.db_url,
-                device=self.device,
-                dyn_cls=self.dyn_cls,
-                dyn_kws=self.dyn_kws
-            )
+            async with self.new_model_lock:
+
+                if self.new_model:
+                    self.weights, self.model_version = self.new_model
+                    self.new_model = None
+
+                atoms_future = self.executor.submit(
+                    self.advance_dynamics_task,
+                    spec=spec,
+                    learner=self.learner,
+                    weights=self.weights,
+                    db_url=self.db_url,
+                    device=self.device,
+                    dyn_cls=self.dyn_cls,
+                    dyn_kws=self.dyn_kws
+                )
 
             # save finished dynamics event
             self._traj_db.record_chunk_event(
@@ -206,7 +200,9 @@ class DynamicsRunner(CascadeAgent):
             self.logger.info(f"Finished dynamics for {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
 
             # get future result
-            atoms = atoms_future.result()
+            wrapped_future = wrap_future(atoms_future.result())
+            await wrapped_future
+            atoms = wrapped_future.result()
 
             # submit to auditor
             chunk_spec = ChunkSpec(traj_id=self.traj_id, chunk_id=self.chunk)
@@ -224,20 +220,26 @@ class DynamicsRunner(CascadeAgent):
                     # audit passed but not done, use the new atoms to run a new chunk
                     self.atoms = atoms
                     self.chunk += 1
-                    self.timestep += self.chunk_size
                     self.attempt = 0
             else:
                 # audit failed, try a new attempt once new model is received
                 self.attempt += 1
-                # wait for new weights
-                # not sure how best to do this
-                # await_event_async from academy?
+                self.received_weights.clear()
+                await self.received_weights.wait()
+
+    @action
+    async def receive_weights(self, weights: bytes, model_version: int) -> None:
+        async with self.new_model_lock:
+            self.new_model = (weights, model_version)
+        self.logger.info(f"Received weights for model version {self.model_version}")
+        self.received_weights.set()
 
 
 class Auditor(CascadeAgent):
 
     def __init__(
             self,
+            run_id: int, # todo should every agent have this? for DB reasons?
             config: AuditorConfig,
             sampler: Handle[Sampler],
             dynamics_engine: Handle[DynamicsRunner],
@@ -251,12 +253,11 @@ class Auditor(CascadeAgent):
         self.audit_task = audit_task
 
     @action
-    async def submit(self, chunk_spec: ChunkSpec):
+    async def audit(self, chunk_spec: ChunkSpec):
         """Submit a chunk for audit"""
         self.logger.info(f'Received chunk {chunk_spec.chunk_id} from traj {chunk_spec.traj_id}')
 
         latest_attempt = self._traj_db.get_latest_chunk_attempt(
-            run_id=self.config.run_id,
             traj_id=chunk_spec.traj_id,
             chunk_id=chunk_spec.chunk_id
         )
@@ -690,22 +691,6 @@ class DatabaseMonitor(CascadeAgent):
             else:
                 await asyncio.sleep(1)
 
-    def _log_and_check_resource_counts(self) -> None:
-        """Log resource creation counts and alert if counts are unexpectedly high"""
-        # Log resource creation counts
-        self.logger.info(
-            f"Resource counts: agents={CascadeAgent._resource_counts['agents_created']}, "
-            f"traj_db_instances={CascadeAgent._resource_counts['traj_db_instances_created']}"
-        )
-        
-        # Alert if resource counts are unexpectedly high
-        if CascadeAgent._resource_counts['traj_db_instances_created'] > CascadeAgent._resource_counts['agents_created'] * 2:
-            self.logger.warning(
-                f"More TrajectoryDB instances ({CascadeAgent._resource_counts['traj_db_instances_created']}) "
-                f"than expected for {CascadeAgent._resource_counts['agents_created']} agents. "
-                "Instances may be recreated unnecessarily."
-            )
-
     @loop
     async def periodic_retrain(self, shutdown: asyncio.Event) -> None:
         """Monitor for enough training frames and trigger retraining.
@@ -723,8 +708,6 @@ class DatabaseMonitor(CascadeAgent):
         """
         self.logger.info("periodic_retrain loop started")
         while not shutdown.is_set():
-            self._log_and_check_resource_counts()
-            
             # Check if we have enough new training frames
             current_count = self._traj_db.count_training_frames(self.config.run_id)
             new_frames = current_count - self.last_train_count
