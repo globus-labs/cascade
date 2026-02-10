@@ -233,62 +233,6 @@ class DynamicsRunner(CascadeAgent):
                 # not sure how best to do this
                 # await_event_async from academy?
 
-    async def _advance_dynamics_callback(
-        self,
-        future: ConcurrentFuture[Any]
-    ) -> None:
-        """Handle the results of an advance dynamics call
-        
-        Args:
-            future: The future that contains the result of the advance dynamics call
-
-        Returns:
-            None
-
-        Track the chunk metadata in the database and submit to auditor.
-        """
-        self.logger.debug('Advance dynamics callback started')
-        self.logger.info('Getting future result')
-        spec = future.result()
-        if isinstance(spec, dict):
-            spec = AdvanceSpec(**spec)
-
-        run_id = spec.run_id
-        traj_id = spec.traj_id
-        chunk_id = spec.chunk_id
-        attempt_index = spec.attempt_index
-        steps = spec.steps
-
-        # Calculate number of frames from steps and loginterval
-        loginterval = self.config.dyn_kws.get('loginterval', 1)
-        n_frames = steps // loginterval
-
-        # Record chunk metadata in ORM
-        success = self._traj_db.add_chunk_attempt(
-            run_id=run_id,
-            traj_id=traj_id,
-            chunk_id=chunk_id,
-            model_version=self.model_version,
-            n_frames=n_frames,
-            audit_status=AuditStatus.PENDING,
-            attempt_index=attempt_index
-        )
-        if success:
-            self.logger.info(f"Recorded chunk {chunk_id} of traj {traj_id} in database (attempt {attempt_index}, {n_frames} frames)")
-            self._traj_db.record_chunk_event(
-                run_id=run_id,
-                traj_id=traj_id,
-                chunk_id=chunk_id,
-                attempt_index=attempt_index,
-                event_type=ChunkEventType.FINISHED_DYNAMICS
-            )
-        else:
-            self.logger.error(f"Failed to record chunk {chunk_id} of traj {traj_id} in database (attempt {attempt_index})")
-
-        # submit to auditor
-        self.logger.info(f"Submitting audit for chunk {chunk_id} of traj {traj_id} attempt {attempt_index}.")
-        await self.auditor.submit(ChunkSpec(traj_id=traj_id, chunk_id=chunk_id))
-
 
 class Auditor(CascadeAgent):
 
