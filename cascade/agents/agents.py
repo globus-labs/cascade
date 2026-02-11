@@ -216,6 +216,7 @@ class DynamicsRunner(CascadeAgent):
 
                 if self.done:
                     self._traj_db.mark_trajectory_completed(run_id=self.run_id, traj_id=self.traj_id)
+                    self.agent_shutdown()
                 else:
                     # audit passed but not done, use the new atoms to run a new chunk
                     self.atoms = atoms
