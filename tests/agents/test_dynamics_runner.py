@@ -2,6 +2,7 @@ import pathlib
 import pytest
 from pytest import fixture
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import datetime
 
 from mace.calculators import mace_mp
 from ase import Atoms
@@ -10,6 +11,7 @@ from ase import units
 from ase.md.verlet import VelocityVerlet
 from academy.exchange import LocalExchangeFactory
 from academy.manager import Manager
+from academy.logging import init_logging
 
 from cascade.agents.agents import DynamicsRunner, CascadeAgent
 from cascade.learning.mace import MACEInterface
@@ -36,17 +38,18 @@ def atoms() -> Atoms:
 
 @pytest.mark.asyncio
 async def test_dynamics_runner(atoms: Atoms):
-    run_id = 'test'
+    start_time = datetime.datetime.utcnow().strftime("%Y.%m.%d-%H:%M:%S")
+    run_id = f'test-{start_time}'
     target_length = 10
     chunk_size = 5
     db_url = 'postgresql://ase:pw@localhost:5432/cascade'
 
-    run_dir = pathlib.Path("run") / (
-        f"run-{run_id}"
-    )
+    run_dir = pathlib.Path("run") / run_id
     run_dir.mkdir(parents=True)
     learner = MACEInterface()
     init_weights = learner.serialize_model(learner.get_model(mace_mp('small').models[0]))
+    logfile = run_dir / "runtime.log"
+    logger = init_logging(level='INFO', logfile=logfile)
 
     # Initialize trajectories in the database
     traj_db = TrajectoryDB(db_url)
@@ -108,5 +111,7 @@ async def test_dynamics_runner(atoms: Atoms):
         DeterministicAuditor,
         sequence=[AuditStatus.PASSED, AuditStatus.FAILED, AuditStatus.PASSED],
     )
+
+    await manager.wait([dyn_handle]) # this should wait until it shuts itself down
 
     # todo: use caplog to assert things happen as expected
