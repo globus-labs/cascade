@@ -23,7 +23,7 @@ from academy.logging import init_logging
 
 from cascade.agents.agents import (
     DatabaseMonitor,
-    DynamicsEngine,
+    DynamicsRunner,
     Auditor,
     Sampler,
     DummyLabeler,
@@ -32,7 +32,7 @@ from cascade.agents.agents import (
 from cascade.agents.config import (
     DatabaseConfig,
     DatabaseMonitorConfig,
-    DynamicsEngineConfig,
+    DynamicsRunnerConfig,
     AuditorConfig,
     SamplerConfig,
     LabelerConfig,
@@ -221,7 +221,7 @@ async def main():
         labeler_reg = await manager.register_agent(DummyLabeler)
         sampler_reg = await manager.register_agent(Sampler)
         auditor_reg = await manager.register_agent(Auditor)
-        dynamics_reg = await manager.register_agent(DynamicsEngine)
+        dynamics_reg = await manager.register_agent(DynamicsRunner)
 
         # get handles to all agents
         db_handle = manager.get_handle(db_reg)
@@ -240,32 +240,6 @@ async def main():
             dynamics_handle
         ]
 
-        # create config objects
-        db_config = DatabaseMonitorConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            retrain_len=args.retrain_len,
-            target_length=args.target_length,
-            chunk_size=args.chunk_size,
-            retrain_fraction=args.retrain_fraction,
-            retrain_min_frames=args.retrain_min_frames
-        )
-        dynamics_config = DynamicsEngineConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            #init_specs=initial_specs,
-            learner=learner,
-            weights=init_weights,
-            dyn_cls=get_dynamics_cls(args.dyn_cls),
-            dyn_kws={'timestep': args.dt_fs * units.fs, 'loginterval': args.loginterval},
-            run_kws={}
-        )
-        auditor_config = AuditorConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            accept_rate=args.accept_rate,
-            chunk_size=args.chunk_size
-        )
         sampler_config = SamplerConfig(
             run_id=run_id,
             db_url=args.db_url,
@@ -277,53 +251,74 @@ async def main():
         # launch all agents
         await manager.launch(
             DatabaseMonitor,
-            args=(
-                db_config,
-                trainer_handle,
-                dynamics_handle,
+            kwargs=dict(
+                run_id=run_id,
+                db_url=args.db_url,
+                retrain_len=args.retrain_len,
+                target_length=args.target_length,
+                chunk_size=args.chunk_size,
+                retrain_fraction=args.retrain_fraction,
+                retrain_min_frames=args.retrain_min_frames,
+                trainer=trainer_handle,
+                dynamics_engine=dynamics_handle,
             ),
-            registration=db_reg
+            registration=db_reg,
         )
         await manager.launch(
-            DynamicsEngine,
-            args=(
-                dynamics_config,
-                auditor_handle,
-                ProcessPoolExecutor(max_workers=10),
-                advance_dynamics,
+            DynamicsRunner,
+            kwargs=dict(
+                atoms=atoms,
+                run_id=run_id,
+                traj_id=0,
+                chunk_size=chunk_size,
+                n_steps=target_length,
+                auditor=aud_handle,
+                executor=ProcessPoolExecutor(max_workers=10),
+                advance_dynamics_task=advance_dynamics,
+                learner=learner,
+                weights=init_weights,
+                dyn_cls=VelocityVerlet,
+                dyn_kws={'timestep': 1 * units.fs},
+                run_kws={},
+                device='cpu',
+                model_version=0
             ),
-            registration=dynamics_reg
+            registration=dyn_reg
         )
         await manager.launch(
             Auditor,
-            args=(
-                auditor_config,
-                sampler_handle,
-                dynamics_handle,
-                random_audit,
-                ProcessPoolExecutor(max_workers=10)
-
+            kwargs=dict(
+                sampler=sampler_handle,
+                dynamics=dynamics_handle,
+                audit_task=random_audit,
+                executor=ProcessPoolExecutor(max_workers=10),
+                run_id=run_id,
+                db_url=args.db_url,
+                audit_kwargs=dict(accept_rate=args.accept_rate,),
+                chunk_size=args.chunk_size,
             ),
-            registration=auditor_reg,
+            registrations=auditor_reg,
         )
         await manager.launch(
             Sampler,
-            args=(
-                sampler_config,
-                labeler_handle,
-                ProcessPoolExecutor(max_workers=10),
-                random_sample,
+            kwargs=dict(
+                run_id=run_id,
+                db_url=db_url,
+                n_frames=n_frames,
+                labeler=labeler_handle,
+                executor=ProcessPoolExecutor(max_workers=10),
+                sample_task=random_sample,
             ),
             registration=sampler_reg,
         )
         await manager.launch(
             DummyLabeler,
-            args=(labeler_config,),
+            kwargs=dict(run_id=run_id, db_url=args.db_url),
             registration=labeler_reg,
         )
         await manager.launch(
             DummyTrainer,
-            args=(trainer_config,),
+            kwargs=dict(run_id=run_id, db_url=args.db_url, learner=learner),
             registration=trainer_reg
         )        
 
