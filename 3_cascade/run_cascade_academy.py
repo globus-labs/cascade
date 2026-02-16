@@ -240,16 +240,6 @@ async def main():
             dynamics_handle
         ]
 
-        # create config objects
-        db_config = DatabaseMonitorConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            retrain_len=args.retrain_len,
-            target_length=args.target_length,
-            chunk_size=args.chunk_size,
-            retrain_fraction=args.retrain_fraction,
-            retrain_min_frames=args.retrain_min_frames
-        )
         sampler_config = SamplerConfig(
             run_id=run_id,
             db_url=args.db_url,
@@ -261,12 +251,18 @@ async def main():
         # launch all agents
         await manager.launch(
             DatabaseMonitor,
-            args=(
-                db_config,
-                trainer_handle,
-                dynamics_handle,
+            kwargs=dict(
+                run_id=run_id,
+                db_url=args.db_url,
+                retrain_len=args.retrain_len,
+                target_length=args.target_length,
+                chunk_size=args.chunk_size,
+                retrain_fraction=args.retrain_fraction,
+                retrain_min_frames=args.retrain_min_frames,
+                trainer=trainer_handle,
+                dynamics_engine=dynamics_handle,
             ),
-            registration=db_reg
+            registration=db_reg,
         )
         await manager.launch(
             DynamicsRunner,
@@ -305,22 +301,24 @@ async def main():
         )
         await manager.launch(
             Sampler,
-            args=(
-                sampler_config,
-                labeler_handle,
-                ProcessPoolExecutor(max_workers=10),
-                random_sample,
+            kwargs=dict(
+                run_id=run_id,
+                db_url=db_url,
+                n_frames=n_frames,
+                labeler=labeler_handle,
+                executor=ProcessPoolExecutor(max_workers=10),
+                sample_task=random_sample,
             ),
             registration=sampler_reg,
         )
         await manager.launch(
             DummyLabeler,
-            args=(labeler_config,),
+            kwargs=dict(run_id=run_id, db_url=args.db_url),
             registration=labeler_reg,
         )
         await manager.launch(
             DummyTrainer,
-            args=(trainer_config,),
+            kwargs=dict(run_id=run_id, db_url=args.db_url, learner=learner),
             registration=trainer_reg
         )        
 
