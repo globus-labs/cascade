@@ -241,20 +241,26 @@ class Auditor(CascadeAgent):
     def __init__(
             self,
             run_id: int, # todo should every agent have this? for DB reasons?
-            config: AuditorConfig,
             sampler: Handle[Sampler],
             dynamics_engine: Handle[DynamicsRunner],
             audit_task: Callable[[ChunkSpec], AuditResult],
-            executor: Executor
+            executor: Executor,
+            db_url: str,
+            chunk_size: int,
+            audit_kwargs: dict = None,
     ):
         super().__init__(config, executor)
         self.sampler = sampler
         self.dynamics_engine = dynamics_engine
         self.queue = Queue()
         self.audit_task = audit_task
+        self.audit_kwargs = audit_kwargs or {}
+        self.db_url = db_url
+        self.chunk_size = chunk_size
+        self.executor = executor
 
     @action
-    async def audit(self, chunk_spec: ChunkSpec):
+    async def audit(self, chunk_spec: ChunkSpec) -> AuditResult:
         """Submit a chunk for audit"""
         self.logger.info(f'Received chunk {chunk_spec.chunk_id} from traj {chunk_spec.traj_id}')
 
@@ -271,53 +277,33 @@ class Auditor(CascadeAgent):
             return
         attempt_index = latest_attempt['attempt_index']
         self._traj_db.record_chunk_event(
-            run_id=self.config.run_id,
+            run_id=self.run_id,
             traj_id=chunk_spec.traj_id,
             chunk_id=chunk_spec.chunk_id,
             attempt_index=attempt_index,
             event_type=ChunkEventType.STARTED_AUDIT
         )
         chunk_atoms = self._traj_db.get_latest_chunk_attempt_atoms(
-            self.config.run_id,
+            self.run_id,
             chunk_spec.traj_id,
             chunk_spec.chunk_id
         )
 
         self.logger.info(f'Submitting audit of chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id} to executor')
 
-        initial_future = self.executor.submit(
+        future = self.executor.submit(
             self.audit_task,
             chunk_atoms=chunk_atoms,
             chunk_spec=chunk_spec,
             attempt_index=latest_attempt['attempt_index'],
+            **audit_kwargs
         )
-
-        self.schedule_future_callback(
-            initial_future,
-            self._audit_callback,
-        )
-    async def _audit_callback(self, future: ConcurrentFuture[Any]) -> None:
-        """Handle the results of an audit
-    
-        If the audit fails, the chunk is submitted to the sampler.
-        If the audit passes and the trajectory is done, this is recorded in the database.
-        If the audit passes and the trajectory is NOT done, the next chunk is submitted to the dynamics engine.
-
-        Args:
-            future: The future that contains the result of the audit
-
-        Returns:
-            None
-        """
-        self.logger.debug('Audit callback started')
-        self.logger.info('Getting future result')
-        result = future.result()
+        wrapped_future = wrap_future(future.result())
+        await wrapped_future
+        result = wrapped_future.result()
         status = result.status
-        self.logger.info(
-            'Audit result status: %s (traj_id=%d, chunk_id=%d, attempt_index=%d)',
-            status, result.traj_id, result.chunk_id, result.attempt_index
-        )
 
+        # todo: should we keep this?
         if status not in [AuditStatus.PASSED, AuditStatus.FAILED]:
             self.logger.error(
                 'Audit result is not PASSED or FAILED: %s (traj_id=%d, chunk_id=%d, attempt_index=%d)',
@@ -326,7 +312,7 @@ class Auditor(CascadeAgent):
             return
 
         self._traj_db.update_chunk_audit_done_status(
-            run_id=self.config.run_id,
+            run_id=self.run_id,
             traj_id=result.traj_id,
             chunk_id=result.chunk_id,
             attempt_index=result.attempt_index,
@@ -336,7 +322,7 @@ class Auditor(CascadeAgent):
         # Record audit result event
         event_type = ChunkEventType.AUDIT_PASSED if status == AuditStatus.PASSED else ChunkEventType.AUDIT_FAILED
         self._traj_db.record_chunk_event(
-            run_id=self.config.run_id,
+            run_id=self.run_id,
             traj_id=result.traj_id,
             chunk_id=result.chunk_id,
             attempt_index=result.attempt_index,
@@ -347,16 +333,11 @@ class Auditor(CascadeAgent):
             self.logger.info(
                 f'Audit passed for traj {result.traj_id} chunk {result.chunk_id} attempt {result.attempt_index}'
             )
-            
-            # Check if trajectory is done using the data model
-            done = self._traj_db.is_trajectory_done(
-                run_id=self.config.run_id,
-                traj_id=result.traj_id
-            )
+
             if done:
                 self.logger.info(f"Traj {result.traj_id} is complete")
                 self._traj_db.record_chunk_event(
-                    run_id=self.config.run_id,
+                    run_id=self.run_id,
                     traj_id=result.traj_id,
                     chunk_id=result.chunk_id,
                     attempt_index=result.attempt_index,
@@ -366,24 +347,22 @@ class Auditor(CascadeAgent):
                 # Trajectory not done - submit next chunk
                 # Get the last frame from the current chunk to use as starting point
                 last_frame = self._traj_db.get_last_frame_from_chunk(
-                    run_id=self.config.run_id,
+                    run_id=self.run_id,
                     traj_id=result.traj_id,
                     chunk_id=result.chunk_id,
                     attempt_index=result.attempt_index
-                ) # todo maybe we want to just query once
-                # Force garbage collection after retrieving atoms
-                gc.collect()
+                )
                 
                 # Create and submit next advance spec
                 next_chunk_id = result.chunk_id + 1
                 next_attempt_index = 0
                 next_spec = AdvanceSpec(
                     atoms=last_frame,
-                    run_id=self.config.run_id,
+                    run_id=self.run_id,
                     traj_id=result.traj_id,
                     chunk_id=next_chunk_id,
                     attempt_index=next_attempt_index,
-                    steps=self.config.chunk_size
+                    steps=self.chunk_size
                 )
                 await self.dynamics_engine.submit(next_spec)
                 self.logger.info(f"Submitted next chunk {result.chunk_id + 1} for traj {result.traj_id} (attempt {next_attempt_index}, after chunk {result.chunk_id} attempt {result.attempt_index} passed)")
@@ -399,8 +378,10 @@ class Auditor(CascadeAgent):
             )
             self.logger.info(f'Submitting failed chunk {result.chunk_id} of traj {result.traj_id} to sampler')
             await self.sampler.submit(spec)
+            
+        return status 
 
-    
+
 class Sampler(CascadeAgent):
 
     def __init__(
@@ -418,34 +399,6 @@ class Sampler(CascadeAgent):
     @action
     async def submit(self, chunk_spec: ChunkSpec):
         await self.queue.put(chunk_spec)
-
-    def _make_sample_callback(self, chunk_spec: ChunkSpec):
-        async def _sample_frames_callback(future: ConcurrentFuture[Any]) -> None:
-            specs = future.result()
-            if len(specs) != self.config.n_frames:
-                self.logger.warning(
-                    "Sampling returned %d frames for traj %s chunk %s (attempt %s), "
-                    "expected n_frames=%d",
-                    len(specs),
-                    chunk_spec.traj_id,
-                    chunk_spec.chunk_id,
-                    chunk_spec.attempt_index,
-                    self.config.n_frames,
-                )
-            for spec in specs:
-                self.logger.info(
-                    f'Submitting training frame from traj {chunk_spec.traj_id} '
-                    f'chunk {chunk_spec.chunk_id} to labeler'
-                )
-                await self.labeler.submit(spec)
-            self._traj_db.record_chunk_event(
-                run_id=self.config.run_id,
-                traj_id=chunk_spec.traj_id,
-                chunk_id=chunk_spec.chunk_id,
-                attempt_index=chunk_spec.attempt_index,
-                event_type=ChunkEventType.FINISHED_SAMPLING,
-            )
-        return _sample_frames_callback
 
     @loop
     async def sample_frames(
@@ -532,8 +485,33 @@ class Sampler(CascadeAgent):
                 model_version=model_version,
                 n_frames=self.config.n_frames,
             )
-            self.schedule_future_callback(
-                future, self._make_sample_callback(resolved_spec)
+            wrapped_future = wrap_future(future)
+            await wrapped_future
+            specs = wrapped_future.result()
+            
+            if len(specs) != self.config.n_frames:
+                self.logger.warning(
+                    "Sampling returned %d frames for traj %s chunk %s (attempt %s), "
+                    "expected n_frames=%d",
+                    len(specs),
+                    chunk_spec.traj_id,
+                    chunk_spec.chunk_id,
+                    chunk_spec.attempt_index,
+                    self.config.n_frames,
+                )
+            for spec in specs:
+                self.logger.info(
+                    f'Submitting training frame from traj {chunk_spec.traj_id} '
+                    f'chunk {chunk_spec.chunk_id} to labeler'
+                )
+                await self.labeler.submit(spec)
+            
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=chunk_spec.traj_id,
+                chunk_id=chunk_spec.chunk_id,
+                attempt_index=chunk_spec.attempt_index,
+                event_type=ChunkEventType.FINISHED_SAMPLING,
             )
 
 

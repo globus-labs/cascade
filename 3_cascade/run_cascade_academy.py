@@ -250,22 +250,6 @@ async def main():
             retrain_fraction=args.retrain_fraction,
             retrain_min_frames=args.retrain_min_frames
         )
-        dynamics_config = DynamicsRunnerConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            #init_specs=initial_specs,
-            learner=learner,
-            weights=init_weights,
-            dyn_cls=get_dynamics_cls(args.dyn_cls),
-            dyn_kws={'timestep': args.dt_fs * units.fs, 'loginterval': args.loginterval},
-            run_kws={}
-        )
-        auditor_config = AuditorConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            accept_rate=args.accept_rate,
-            chunk_size=args.chunk_size
-        )
         sampler_config = SamplerConfig(
             run_id=run_id,
             db_url=args.db_url,
@@ -286,25 +270,38 @@ async def main():
         )
         await manager.launch(
             DynamicsRunner,
-            args=(
-                dynamics_config,
-                auditor_handle,
-                ProcessPoolExecutor(max_workers=10),
-                advance_dynamics,
+            kwargs=dict(
+                atoms=atoms,
+                run_id=run_id,
+                traj_id=0,
+                chunk_size=chunk_size,
+                n_steps=target_length,
+                auditor=aud_handle,
+                executor=ProcessPoolExecutor(max_workers=10),
+                advance_dynamics_task=advance_dynamics,
+                learner=learner,
+                weights=init_weights,
+                dyn_cls=VelocityVerlet,
+                dyn_kws={'timestep': 1 * units.fs},
+                run_kws={},
+                device='cpu',
+                model_version=0
             ),
-            registration=dynamics_reg
+            registration=dyn_reg
         )
         await manager.launch(
             Auditor,
-            args=(
-                auditor_config,
-                sampler_handle,
-                dynamics_handle,
-                random_audit,
-                ProcessPoolExecutor(max_workers=10)
-
+            kwargs=dict(
+                sampler=sampler_handle,
+                dynamics=dynamics_handle,
+                audit_task=random_audit,
+                executor=ProcessPoolExecutor(max_workers=10),
+                run_id=run_id,
+                db_url=args.db_url,
+                audit_kwargs=dict(accept_rate=args.accept_rate,),
+                chunk_size=args.chunk_size,
             ),
-            registration=auditor_reg,
+            registrations=auditor_reg,
         )
         await manager.launch(
             Sampler,
