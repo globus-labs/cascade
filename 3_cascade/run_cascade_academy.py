@@ -300,7 +300,7 @@ async def main():
                     chunk_size=args.chunk_size,
                     n_steps=args.target_length,
                     auditor=auditor_handle,
-                    executor=ProcessPoolExecutor(max_workers=10),
+                    executor=ProcessPoolExecutor(max_workers=1),
                     advance_dynamics_task=advance_dynamics,
                     learner=learner,
                     weights=init_weights,
