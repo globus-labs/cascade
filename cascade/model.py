@@ -19,6 +19,13 @@ class TrainingFrame:
     model_version: int
 
 @dataclass
+class TrajectoryState:
+    atoms: Atoms
+    timestep: int
+    chunk: int
+    attempt: int
+
+@dataclass
 class TrainingFrameSpec:
     """Training frame specification with all metadata needed for processing.
     

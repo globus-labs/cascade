@@ -23,7 +23,7 @@ from academy.logging import init_logging
 
 from cascade.agents.agents import (
     DatabaseMonitor,
-    DynamicsEngine,
+    DynamicsRunner,
     Auditor,
     Sampler,
     DummyLabeler,
@@ -32,7 +32,7 @@ from cascade.agents.agents import (
 from cascade.agents.config import (
     DatabaseConfig,
     DatabaseMonitorConfig,
-    DynamicsEngineConfig,
+    DynamicsRunnerConfig,
     AuditorConfig,
     SamplerConfig,
     LabelerConfig,
@@ -221,7 +221,6 @@ async def main():
         labeler_reg = await manager.register_agent(DummyLabeler)
         sampler_reg = await manager.register_agent(Sampler)
         auditor_reg = await manager.register_agent(Auditor)
-        dynamics_reg = await manager.register_agent(DynamicsEngine)
 
         # get handles to all agents
         db_handle = manager.get_handle(db_reg)
@@ -229,7 +228,6 @@ async def main():
         labeler_handle = manager.get_handle(labeler_reg)
         sampler_handle = manager.get_handle(sampler_reg)
         auditor_handle = manager.get_handle(auditor_reg)
-        dynamics_handle = manager.get_handle(dynamics_reg)
 
         handles = [
             db_handle,
@@ -237,35 +235,8 @@ async def main():
             labeler_handle,
             sampler_handle,
             auditor_handle,
-            dynamics_handle
         ]
 
-        # create config objects
-        db_config = DatabaseMonitorConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            retrain_len=args.retrain_len,
-            target_length=args.target_length,
-            chunk_size=args.chunk_size,
-            retrain_fraction=args.retrain_fraction,
-            retrain_min_frames=args.retrain_min_frames
-        )
-        dynamics_config = DynamicsEngineConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            #init_specs=initial_specs,
-            learner=learner,
-            weights=init_weights,
-            dyn_cls=get_dynamics_cls(args.dyn_cls),
-            dyn_kws={'timestep': args.dt_fs * units.fs, 'loginterval': args.loginterval},
-            run_kws={}
-        )
-        auditor_config = AuditorConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            accept_rate=args.accept_rate,
-            chunk_size=args.chunk_size
-        )
         sampler_config = SamplerConfig(
             run_id=run_id,
             db_url=args.db_url,
@@ -276,61 +247,88 @@ async def main():
 
         # launch all agents
         await manager.launch(
-            DatabaseMonitor,
-            args=(
-                db_config,
-                trainer_handle,
-                dynamics_handle,
-            ),
-            registration=db_reg
-        )
-        await manager.launch(
-            DynamicsEngine,
-            args=(
-                dynamics_config,
-                auditor_handle,
-                ProcessPoolExecutor(max_workers=10),
-                advance_dynamics,
-            ),
-            registration=dynamics_reg
-        )
-        await manager.launch(
             Auditor,
-            args=(
-                auditor_config,
-                sampler_handle,
-                dynamics_handle,
-                random_audit,
-                ProcessPoolExecutor(max_workers=10)
-
+            kwargs=dict(
+                sampler=sampler_handle,
+                audit_task=random_audit,
+                executor=ProcessPoolExecutor(max_workers=10),
+                run_id=run_id,
+                db_url=args.db_url,
+                audit_kwargs=dict(accept_prob=args.accept_rate,),
+                chunk_size=args.chunk_size,
             ),
             registration=auditor_reg,
         )
         await manager.launch(
             Sampler,
-            args=(
-                sampler_config,
-                labeler_handle,
-                ProcessPoolExecutor(max_workers=10),
-                random_sample,
+            kwargs=dict(
+                run_id=run_id,
+                db_url=args.db_url,
+                n_frames=args.n_sample_frames,
+                labeler=labeler_handle,
+                executor=ProcessPoolExecutor(max_workers=10),
+                sample_task=random_sample,
             ),
             registration=sampler_reg,
         )
         await manager.launch(
             DummyLabeler,
-            args=(labeler_config,),
+            kwargs=dict(run_id=run_id, db_url=args.db_url),
             registration=labeler_reg,
         )
         await manager.launch(
             DummyTrainer,
-            args=(trainer_config,),
+            kwargs=dict(run_id=run_id, db_url=args.db_url, learner=learner),
             registration=trainer_reg
-        )        
+        )
 
-        # submit initial specs to dynamics engine
+        dyn_handles = []
         for spec in initial_specs:
-            logger.info(f"Submitting initial spec to dynamics engine: {spec}")
-            await dynamics_handle.submit(spec)
+            reg = await manager.register_agent(DynamicsRunner)
+            handle = manager.get_handle(reg)
+
+            handles.append(handle)
+            dyn_handles.append(handle)
+
+            await manager.launch(
+                DynamicsRunner,
+                kwargs=dict(
+                    atoms=spec.atoms,
+                    run_id=run_id,
+                    db_url=args.db_url,
+                    traj_id=spec.traj_id,
+                    chunk_size=args.chunk_size,
+                    n_steps=args.target_length,
+                    auditor=auditor_handle,
+                    executor=ProcessPoolExecutor(max_workers=1),
+                    advance_dynamics_task=advance_dynamics,
+                    learner=learner,
+                    weights=init_weights,
+                    dyn_cls=VelocityVerlet,
+                    dyn_kws={'timestep': 1 * units.fs},
+                    run_kws={},
+                    device='cpu',
+                    model_version=0
+                ),
+                registration=reg
+            )
+
+        await manager.launch(
+            DatabaseMonitor,
+            kwargs=dict(
+                run_id=run_id,
+                db_url=args.db_url,
+                retrain_len=args.retrain_len,
+                target_length=args.target_length,
+                chunk_size=args.chunk_size,
+                retrain_fraction=args.retrain_fraction,
+                retrain_min_frames=args.retrain_min_frames,
+                trainer=trainer_handle,
+                dynamics_runners=dyn_handles
+            ),
+            registration=db_reg,
+        )
+        # wait for it to finish!
         try:
             await manager.wait([db_handle])
         except KeyboardInterrupt:

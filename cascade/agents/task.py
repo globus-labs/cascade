@@ -80,14 +80,22 @@ def advance_dynamics(
     learner: BaseLearnableForcefield,
     weights: bytes,
     db_url: str,
-    device: str = 'cpu',
-    dyn_cls: type[Dynamics] = Dynamics,
-    dyn_kws: dict[str, object] = {},
-    run_kws: dict[str, object] = {},
-) -> None:
+    device: str,
+    dyn_cls: type[Dynamics],
+    dyn_kws: dict[str, object],
+    run_kws: dict[str, object],
+) -> Atoms:
     """Advance dynamics of a chunk of a trajectory
-    
-    Intended to be used as a stub for a real advance dynamics function.
+
+    Arguments:
+        spec: contains atoms and metadata about trajectory
+        learner: used to make the calculator
+        weights: weights to add to the calculator
+        db_url: url to write frames to
+        device: for torch
+        dyn_cls: ASE dynamics class
+        dyn_kws: kws to the dynamics constructor
+        run_kws: kws to the dynamics run method
     """
     import numpy as np
     from cascade.utils import canonicalize
@@ -125,5 +133,5 @@ def advance_dynamics(
 
     dyn.run(spec.steps, **run_kws)
     
-    return spec
+    return atoms
 
