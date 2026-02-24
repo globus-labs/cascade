@@ -132,7 +132,7 @@ class DynamicsRunner(CascadeAgent):
             # submit dynamics for evaluation
             spec = AdvanceSpec(
                 atoms=self.atoms,
-                steps=self.n_steps,
+                steps=self.chunk_size,
                 run_id=self.run_id,
                 traj_id=self.traj_id,
                 chunk_id=self.chunk,
@@ -147,7 +147,7 @@ class DynamicsRunner(CascadeAgent):
                 attempt_index=spec.attempt_index,
                 event_type=ChunkEventType.STARTED_DYNAMICS
             )
-            self.logger.info(f"Running dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
+            self.logger.info(f"Running dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index} with {spec.steps} steps")
 
             async with self.new_model_lock:
 
