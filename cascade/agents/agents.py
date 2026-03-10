@@ -14,9 +14,9 @@ from asyncio import Queue, Event, Lock, wrap_future
 import gc
 import logging
 from functools import cached_property
-from typing import Any, Awaitable, Callable, NamedTuple, Optional, cast
+from typing import Any, Awaitable, Callable, NamedTuple, Optional, cast, TYPE_CHECKING
 from concurrent.futures import Executor, Future as ConcurrentFuture
-
+from pathlib import Path
 from ase import Atoms
 from academy.handle import Handle
 from academy.agent import Agent, action, loop
@@ -61,6 +61,7 @@ class DynamicsRunner(CascadeAgent):
         traj_id: int,
         chunk_size: int,
         n_steps: int,
+        run_dir: str,
         auditor: Handle[Auditor],
         executor: Executor,
         advance_dynamics_task: Callable[[AdvanceSpec], None],
@@ -96,6 +97,7 @@ class DynamicsRunner(CascadeAgent):
         self.executor = executor
         self.run_id = run_id
         self.traj_id = traj_id
+        self.run_dir = run_dir
         self.chunk_size = chunk_size
         self.n_steps = n_steps
         self.dyn_cls = dyn_cls
@@ -154,7 +156,8 @@ class DynamicsRunner(CascadeAgent):
                 if self.new_model:
                     self.weights, self.model_version = self.new_model
                     self.new_model = None
-
+                self.logger.debug(
+                    f"Submitting dynamics to executor dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index} with {spec.steps} steps")
                 atoms_future = self.executor.submit(
                     self.advance_dynamics_task,
                     spec=spec,
@@ -164,7 +167,8 @@ class DynamicsRunner(CascadeAgent):
                     device=self.device,
                     dyn_cls=self.dyn_cls,
                     dyn_kws=self.dyn_kws,
-                    run_kws=self.run_kws
+                    run_kws=self.run_kws,
+                    run_dir=str(self.run_dir)
                 )
 
             self._traj_db.add_chunk_attempt(
@@ -182,7 +186,7 @@ class DynamicsRunner(CascadeAgent):
             await wrapped_future
             atoms = wrapped_future.result()
 
-            self.logger.info(f"Finished dynamics for {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
+            self.logger.info(f"Finished dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
             # save finished dynamics event
             self._traj_db.record_chunk_event(
                 run_id=self.run_id,
@@ -200,7 +204,7 @@ class DynamicsRunner(CascadeAgent):
             # handle audit result
             if audit_status == AuditStatus.PASSED:
 
-                self.logger.info(f"Audit passed for traj {self.traj_id} chunk {self.chunk} attempt {self.attempt}")
+                self.logger.info(f"Audit status passed for traj {self.traj_id} chunk {self.chunk} attempt {self.attempt}")
                 self.timestep += self.chunk_size
                 self.logger.info(f"On timestep {self.timestep} of {self.n_steps}")
                 self.done = self.timestep >= self.n_steps
@@ -216,7 +220,7 @@ class DynamicsRunner(CascadeAgent):
                     self.logger.info(f"Updating traj {self.traj_id} to chunk {self.chunk} attempt {self.attempt}")
             else:
                 # audit failed, try a new attempt once new model is received
-                self.logger.info(f'Audit failed for traj {self.traj_id} chunk {self.chunk} attempt {self.attempt}, waiting for new weights...')
+                self.logger.info(f'Audit status failed for traj {self.traj_id} chunk {self.chunk} attempt {self.attempt}, waiting for new weights...')
                 self.attempt += 1
                 self.received_weights.clear()
                 await self.received_weights.wait()
@@ -226,7 +230,7 @@ class DynamicsRunner(CascadeAgent):
     async def receive_weights(self, weights: bytes, model_version: int) -> None:
         async with self.new_model_lock:
             self.new_model = (weights, model_version)
-        self.logger.info(f"Received weights for model version {self.model_version}")
+        self.logger.info(f"Received weights for model version {model_version}")
         self.received_weights.set()
 
 
@@ -690,7 +694,7 @@ class DatabaseMonitor(CascadeAgent):
             sampled_fraction = active_with_labeling / total_active if total_active > 0 else 0.
             
             self.logger.info(
-                f"Retrain check: new={new_frames}, active={total_active}, labeled={active_with_labeling}, "
+                f"Retrain check: new training frames={new_frames}, active trajectories={total_active}, trajectories with labeled frames={active_with_labeling}, "
                 f"fraction={sampled_fraction:.2%}"
             )
             

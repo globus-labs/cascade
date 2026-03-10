@@ -6,6 +6,7 @@ if TYPE_CHECKING:
     from cascade.model import AdvanceSpec, TrainingFrameSpec
     from cascade.learning.base import BaseLearnableForcefield
     from ase import Atoms
+    from pathlib import Path
 from ase.optimize.optimize import Dynamics
 
 # can make this a classmethod on some audittask class
@@ -74,13 +75,13 @@ def random_sample(
         result.append(spec)
     return result
 
-
 def advance_dynamics(
     spec: AdvanceSpec,
     learner: BaseLearnableForcefield,
     weights: bytes,
     db_url: str,
     device: str,
+    run_dir: str,
     dyn_cls: type[Dynamics],
     dyn_kws: dict[str, object],
     run_kws: dict[str, object],
@@ -100,24 +101,40 @@ def advance_dynamics(
     import numpy as np
     from cascade.utils import canonicalize
     from cascade.agents.db_orm import TrajectoryDB
-    
-    # Create TrajectoryDB instance in the worker process
+    from pathlib import Path
+
+    import logging
+    import os
+
+    # todo: stop this from writing to the screen
+    logfile = str(Path(run_dir) / f'traj-{spec.traj_id}_chunk-{spec.chunk_id}_att-{spec.attempt_index}_md.log')
+    logger = logging.getLogger(logfile)
+    file_handler = logging.FileHandler(logfile)
+    formatter = logging.Formatter('%(asctime)s : %(levelname)s : %(name)s : %(message)s')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    logger.info('Connecting to traj DB...')
     traj_db = TrajectoryDB(db_url)
     
     atoms = spec.atoms
+    logger.info('Creating calculator')
     calc = learner.make_calculator(weights, device=device)
     atoms.calc = calc
 
+    logger.info('Creating dynamics class')
     dyn = dyn_cls(atoms, **dyn_kws)
     
     frame_index = 0  # Track frame index within this chunk
 
     def write_to_db():
         nonlocal frame_index
+        logger.info('getting results from calc')
         f = atoms.calc.results['forces']
         atoms.calc.results['forces'] = f.astype(np.float64)
         canonical_atoms = canonicalize(atoms)
-        
+
+        logger.info('writing frame to db')
         # Write frame to database
         traj_db.write_frame(
             run_id=spec.run_id,
@@ -128,10 +145,12 @@ def advance_dynamics(
             atoms=canonical_atoms
         )
         frame_index += 1
-    
+
     dyn.attach(write_to_db)
 
+    logger.info('Starting dynamics')
     dyn.run(spec.steps, **run_kws)
+    os.remove(logfile)
     
     return atoms
 

@@ -212,7 +212,7 @@ async def main():
     # initialize manager, exchange
     async with await Manager.from_exchange_factory(
         factory=LocalExchangeFactory(),
-        executors=ThreadPoolExecutor(max_workers=10),
+        executors=ThreadPoolExecutor(max_workers=5+len(initial_specs)),
     ) as manager:
 
         # register all agents with manager
@@ -283,6 +283,7 @@ async def main():
         )
 
         dyn_handles = []
+        dyn_pool = ProcessPoolExecutor(max_workers=len(initial_specs))
         for spec in initial_specs:
             reg = await manager.register_agent(DynamicsRunner)
             handle = manager.get_handle(reg)
@@ -300,9 +301,10 @@ async def main():
                     chunk_size=args.chunk_size,
                     n_steps=args.target_length,
                     auditor=auditor_handle,
-                    executor=ProcessPoolExecutor(max_workers=1),
+                    executor=dyn_pool,
                     advance_dynamics_task=advance_dynamics,
                     learner=learner,
+                    run_dir=run_dir,
                     weights=init_weights,
                     dyn_cls=VelocityVerlet,
                     dyn_kws={'timestep': 1 * units.fs},
