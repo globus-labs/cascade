@@ -85,7 +85,7 @@ def advance_dynamics(
     dyn_cls: type[Dynamics],
     dyn_kws: dict[str, object],
     run_kws: dict[str, object],
-) -> Atoms:
+) -> list[Atoms]:
     """Advance dynamics of a chunk of a trajectory
 
     Arguments:
@@ -114,9 +114,6 @@ def advance_dynamics(
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    logger.info('Connecting to traj DB...')
-    traj_db = TrajectoryDB(db_url)
-    
     atoms = spec.atoms
     logger.info('Creating calculator')
     calc = learner.make_calculator(weights, device=device)
@@ -125,32 +122,21 @@ def advance_dynamics(
     logger.info('Creating dynamics class')
     dyn = dyn_cls(atoms, **dyn_kws)
     
-    frame_index = 0  # Track frame index within this chunk
-
-    def write_to_db():
-        nonlocal frame_index
+    frames = []
+    def write_frame():
         logger.info('getting results from calc')
         f = atoms.calc.results['forces']
         atoms.calc.results['forces'] = f.astype(np.float64)
         canonical_atoms = canonicalize(atoms)
 
         logger.info('writing frame to db')
-        # Write frame to database
-        traj_db.write_frame(
-            run_id=spec.run_id,
-            traj_id=spec.traj_id,
-            chunk_id=spec.chunk_id,
-            attempt_index=spec.attempt_index,
-            frame_index=frame_index,
-            atoms=canonical_atoms
-        )
-        frame_index += 1
+        frames.append(canonical_atoms)
 
-    dyn.attach(write_to_db)
+    dyn.attach(write_frame)
 
     logger.info('Starting dynamics')
     dyn.run(spec.steps, **run_kws)
     os.remove(logfile)
     
-    return atoms
+    return frames
 
