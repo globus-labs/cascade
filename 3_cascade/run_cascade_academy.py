@@ -1,12 +1,18 @@
 import asyncio
 import argparse
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from parsl.concurrent import ParslPoolExecutor
 import logging
 import warnings
 import datetime
 import hashlib
 import json
 import pathlib
+
+from parsl.config import Config
+from parsl.executors import HighThroughputExecutor
+from parsl.providers import LocalProvider
+from parsl.usage_tracking.levels import LEVEL_1
 
 import ase
 from ase.io import read
@@ -171,7 +177,11 @@ async def main():
     (run_dir / "params.json").write_text(json.dumps(params))
     logfile = run_dir / "runtime.log"
 
-    logger = init_logging(level=args.log_level, logfile=logfile)
+    #logger = init_logging(level=args.log_level, logfile=logfile)
+    logger = logging.getLogger(__file__)
+    logger.setLevel(logging.DEBUG)
+
+
     logger.info("Loaded run params")
     logger.info("Created run directory: %s", run_dir)
     
@@ -209,133 +219,148 @@ async def main():
             )
         )
 
-    # initialize manager, exchange
-    async with await Manager.from_exchange_factory(
-        factory=LocalExchangeFactory(),
-        executors=ThreadPoolExecutor(max_workers=5+len(initial_specs)),
-    ) as manager:
+    # set up parsl pool
+    config = Config(
+        executors=[
+            HighThroughputExecutor(
+                label="htex_local",
+                cores_per_worker=len(initial_specs),
+                provider=LocalProvider(
+                    init_blocks=1,
+                    max_blocks=1,
+                ),
+            )
+        ],
+        usage_tracking=LEVEL_1,
+    )
 
-        # register all agents with manager
-        db_reg = await manager.register_agent(DatabaseMonitor)
-        trainer_reg = await manager.register_agent(DummyTrainer)
-        labeler_reg = await manager.register_agent(DummyLabeler)
-        sampler_reg = await manager.register_agent(Sampler)
-        auditor_reg = await manager.register_agent(Auditor)
+    with ParslPoolExecutor(config=config) as dyn_pool:
+        async with await Manager.from_exchange_factory(
+            factory=LocalExchangeFactory(),
+            executors=ThreadPoolExecutor(max_workers=5+len(initial_specs)),
+        ) as manager:
 
-        # get handles to all agents
-        db_handle = manager.get_handle(db_reg)
-        trainer_handle = manager.get_handle(trainer_reg)
-        labeler_handle = manager.get_handle(labeler_reg)
-        sampler_handle = manager.get_handle(sampler_reg)
-        auditor_handle = manager.get_handle(auditor_reg)
+            # register all agents with manager
+            db_reg = await manager.register_agent(DatabaseMonitor)
+            trainer_reg = await manager.register_agent(DummyTrainer)
+            labeler_reg = await manager.register_agent(DummyLabeler)
+            sampler_reg = await manager.register_agent(Sampler)
+            auditor_reg = await manager.register_agent(Auditor)
 
-        handles = [
-            db_handle,
-            trainer_handle,
-            labeler_handle,
-            sampler_handle,
-            auditor_handle,
-        ]
+            # get handles to all agents
+            db_handle = manager.get_handle(db_reg)
+            trainer_handle = manager.get_handle(trainer_reg)
+            labeler_handle = manager.get_handle(labeler_reg)
+            sampler_handle = manager.get_handle(sampler_reg)
+            auditor_handle = manager.get_handle(auditor_reg)
 
-        sampler_config = SamplerConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            n_frames=args.n_sample_frames
-        )
-        labeler_config = LabelerConfig(run_id=run_id, db_url=args.db_url)
-        trainer_config = TrainerConfig(run_id=run_id, db_url=args.db_url, learner=learner)
+            handles = [
+                db_handle,
+                trainer_handle,
+                labeler_handle,
+                sampler_handle,
+                auditor_handle,
+            ]
 
-        # launch all agents
-        await manager.launch(
-            Auditor,
-            kwargs=dict(
-                sampler=sampler_handle,
-                audit_task=random_audit,
-                executor=ProcessPoolExecutor(max_workers=10),
+            sampler_config = SamplerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
-                audit_kwargs=dict(accept_prob=args.accept_rate,),
-                chunk_size=args.chunk_size,
-            ),
-            registration=auditor_reg,
-        )
-        await manager.launch(
-            Sampler,
-            kwargs=dict(
-                run_id=run_id,
-                db_url=args.db_url,
-                n_frames=args.n_sample_frames,
-                labeler=labeler_handle,
-                executor=ProcessPoolExecutor(max_workers=10),
-                sample_task=random_sample,
-            ),
-            registration=sampler_reg,
-        )
-        await manager.launch(
-            DummyLabeler,
-            kwargs=dict(run_id=run_id, db_url=args.db_url),
-            registration=labeler_reg,
-        )
-        await manager.launch(
-            DummyTrainer,
-            kwargs=dict(run_id=run_id, db_url=args.db_url, learner=learner),
-            registration=trainer_reg
-        )
+                n_frames=args.n_sample_frames
+            )
+            labeler_config = LabelerConfig(run_id=run_id, db_url=args.db_url)
+            trainer_config = TrainerConfig(run_id=run_id, db_url=args.db_url, learner=learner)
 
-        dyn_handles = []
-        dyn_pool = ProcessPoolExecutor(max_workers=len(initial_specs))
-        for spec in initial_specs:
-            reg = await manager.register_agent(DynamicsRunner)
-            handle = manager.get_handle(reg)
-
-            handles.append(handle)
-            dyn_handles.append(handle)
-
+            # launch all agents
             await manager.launch(
-                DynamicsRunner,
+                Auditor,
                 kwargs=dict(
-                    atoms=spec.atoms,
+                    sampler=sampler_handle,
+                    audit_task=random_audit,
+                    executor=ProcessPoolExecutor(max_workers=10),
                     run_id=run_id,
                     db_url=args.db_url,
-                    traj_id=spec.traj_id,
+                    audit_kwargs=dict(accept_prob=args.accept_rate,),
                     chunk_size=args.chunk_size,
-                    n_steps=args.target_length,
-                    auditor=auditor_handle,
-                    executor=dyn_pool,
-                    advance_dynamics_task=advance_dynamics,
-                    learner=learner,
-                    run_dir=run_dir,
-                    weights=init_weights,
-                    dyn_cls=VelocityVerlet,
-                    dyn_kws={'timestep': 1 * units.fs},
-                    run_kws={},
-                    device='cpu',
-                    model_version=0
                 ),
-                registration=reg
+                registration=auditor_reg,
+            )
+            await manager.launch(
+                Sampler,
+                kwargs=dict(
+                    run_id=run_id,
+                    db_url=args.db_url,
+                    n_frames=args.n_sample_frames,
+                    labeler=labeler_handle,
+                    executor=ProcessPoolExecutor(max_workers=10),
+                    sample_task=random_sample,
+                ),
+                registration=sampler_reg,
+            )
+            await manager.launch(
+                DummyLabeler,
+                kwargs=dict(run_id=run_id, db_url=args.db_url),
+                registration=labeler_reg,
+            )
+            await manager.launch(
+                DummyTrainer,
+                kwargs=dict(run_id=run_id, db_url=args.db_url, learner=learner),
+                registration=trainer_reg
             )
 
-        await manager.launch(
-            DatabaseMonitor,
-            kwargs=dict(
-                run_id=run_id,
-                db_url=args.db_url,
-                retrain_len=args.retrain_len,
-                target_length=args.target_length,
-                chunk_size=args.chunk_size,
-                retrain_fraction=args.retrain_fraction,
-                retrain_min_frames=args.retrain_min_frames,
-                trainer=trainer_handle,
-                dynamics_runners=dyn_handles
-            ),
-            registration=db_reg,
-        )
-        # wait for it to finish!
-        try:
-            await manager.wait([db_handle])
-        except KeyboardInterrupt:
-            for handle in handles:
-                await manager.shutdown(handle, blocking=False)
+            dyn_handles = []
+            #dyn_pool = ProcessPoolExecutor(max_workers=len(initial_specs))
+            for spec in initial_specs:
+                reg = await manager.register_agent(DynamicsRunner)
+                handle = manager.get_handle(reg)
+
+                handles.append(handle)
+                dyn_handles.append(handle)
+
+                await manager.launch(
+                    DynamicsRunner,
+                    kwargs=dict(
+                        atoms=spec.atoms,
+                        run_id=run_id,
+                        db_url=args.db_url,
+                        traj_id=spec.traj_id,
+                        chunk_size=args.chunk_size,
+                        n_steps=args.target_length,
+                        auditor=auditor_handle,
+                        executor=dyn_pool,
+                        advance_dynamics_task=advance_dynamics,
+                        learner=learner,
+                        run_dir=run_dir,
+                        weights=init_weights,
+                        dyn_cls=VelocityVerlet,
+                        dyn_kws={'timestep': 1 * units.fs},
+                        run_kws={},
+                        device='cpu',
+                        model_version=0
+                    ),
+                    registration=reg
+                )
+
+            await manager.launch(
+                DatabaseMonitor,
+                kwargs=dict(
+                    run_id=run_id,
+                    db_url=args.db_url,
+                    retrain_len=args.retrain_len,
+                    target_length=args.target_length,
+                    chunk_size=args.chunk_size,
+                    retrain_fraction=args.retrain_fraction,
+                    retrain_min_frames=args.retrain_min_frames,
+                    trainer=trainer_handle,
+                    dynamics_runners=dyn_handles
+                ),
+                registration=db_reg,
+            )
+            # wait for it to finish!
+            try:
+                await manager.wait([db_handle])
+            except KeyboardInterrupt:
+                for handle in handles:
+                    await manager.shutdown(handle, blocking=False)
 
 if __name__ == '__main__':
     asyncio.run(main())
