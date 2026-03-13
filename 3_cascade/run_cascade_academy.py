@@ -1,12 +1,19 @@
 import asyncio
 import argparse
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from parsl.concurrent import ParslPoolExecutor
 import logging
 import warnings
 import datetime
 import hashlib
 import json
 import pathlib
+import sys
+
+from parsl.config import Config
+from parsl.executors import HighThroughputExecutor
+from parsl.providers import LocalProvider
+from parsl.usage_tracking.levels import LEVEL_1
 
 import ase
 from ase.io import read
@@ -23,7 +30,7 @@ from academy.logging import init_logging
 
 from cascade.agents.agents import (
     DatabaseMonitor,
-    DynamicsEngine,
+    DynamicsRunner,
     Auditor,
     Sampler,
     DummyLabeler,
@@ -32,7 +39,7 @@ from cascade.agents.agents import (
 from cascade.agents.config import (
     DatabaseConfig,
     DatabaseMonitorConfig,
-    DynamicsEngineConfig,
+    DynamicsRunnerConfig,
     AuditorConfig,
     SamplerConfig,
     LabelerConfig,
@@ -171,7 +178,29 @@ async def main():
     (run_dir / "params.json").write_text(json.dumps(params))
     logfile = run_dir / "runtime.log"
 
-    logger = init_logging(level=args.log_level, logfile=logfile)
+    #logger = init_logging(level=args.log_level, logfile=logfile)
+    logger = logging.getLogger(__file__)
+    handlers = [logging.StreamHandler(sys.stdout), logging.FileHandler(run_dir / 'run.log')]
+    for l in [logger, logging.getLogger('academy')]:
+        for handler in handlers:
+            handler.setFormatter(
+                logging.Formatter('%(asctime)s - %(name)s - %(funcName)s:%(lineno)s - %(levelname)s - %(message)s'))
+            l.addHandler(handler)
+        l.setLevel(logging.INFO)
+    logger.info(f'Running job in {run_dir}')
+    parsl_logger = logging.getLogger('parsl')
+    parsl_logger.addHandler(logging.FileHandler(run_dir / 'parsl.log'))
+    def remove_stdout_handler(logger):
+        """Removes the StreamHandler connected to sys.stdout from the logger."""
+        for handler in logger.handlers[:]:  # Iterate over a copy of the list
+            if isinstance(handler, logging.StreamHandler) and handler.stream is sys.stdout:
+                logger.removeHandler(handler)
+                print("Removed stdout handler.")
+    remove_stdout_handler(parsl_logger)
+
+    logger.setLevel(logging.DEBUG)
+
+
     logger.info("Loaded run params")
     logger.info("Created run directory: %s", run_dir)
     
@@ -209,133 +238,148 @@ async def main():
             )
         )
 
-    # initialize manager, exchange
-    async with await Manager.from_exchange_factory(
-        factory=LocalExchangeFactory(),
-        executors=ThreadPoolExecutor(max_workers=10),
-    ) as manager:
+    # set up parsl pool
+    config = Config(
+        executors=[
+            HighThroughputExecutor(
+                label="htex_local",
+                cores_per_worker=len(initial_specs),
+                provider=LocalProvider(
+                    init_blocks=1,
+                    max_blocks=1,
+                ),
+            )
+        ],
+        usage_tracking=LEVEL_1,
+    )
 
-        # register all agents with manager
-        db_reg = await manager.register_agent(DatabaseMonitor)
-        trainer_reg = await manager.register_agent(DummyTrainer)
-        labeler_reg = await manager.register_agent(DummyLabeler)
-        sampler_reg = await manager.register_agent(Sampler)
-        auditor_reg = await manager.register_agent(Auditor)
-        dynamics_reg = await manager.register_agent(DynamicsEngine)
+    with ParslPoolExecutor(config=config) as dyn_pool:
+        async with await Manager.from_exchange_factory(
+            factory=LocalExchangeFactory(),
+            executors=ThreadPoolExecutor(max_workers=5+len(initial_specs)),
+        ) as manager:
 
-        # get handles to all agents
-        db_handle = manager.get_handle(db_reg)
-        trainer_handle = manager.get_handle(trainer_reg)
-        labeler_handle = manager.get_handle(labeler_reg)
-        sampler_handle = manager.get_handle(sampler_reg)
-        auditor_handle = manager.get_handle(auditor_reg)
-        dynamics_handle = manager.get_handle(dynamics_reg)
+            # register all agents with manager
+            db_reg = await manager.register_agent(DatabaseMonitor)
+            trainer_reg = await manager.register_agent(DummyTrainer)
+            labeler_reg = await manager.register_agent(DummyLabeler)
+            sampler_reg = await manager.register_agent(Sampler)
+            auditor_reg = await manager.register_agent(Auditor)
 
-        handles = [
-            db_handle,
-            trainer_handle,
-            labeler_handle,
-            sampler_handle,
-            auditor_handle,
-            dynamics_handle
-        ]
+            # get handles to all agents
+            db_handle = manager.get_handle(db_reg)
+            trainer_handle = manager.get_handle(trainer_reg)
+            labeler_handle = manager.get_handle(labeler_reg)
+            sampler_handle = manager.get_handle(sampler_reg)
+            auditor_handle = manager.get_handle(auditor_reg)
 
-        # create config objects
-        db_config = DatabaseMonitorConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            retrain_len=args.retrain_len,
-            target_length=args.target_length,
-            chunk_size=args.chunk_size,
-            retrain_fraction=args.retrain_fraction,
-            retrain_min_frames=args.retrain_min_frames
-        )
-        dynamics_config = DynamicsEngineConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            #init_specs=initial_specs,
-            learner=learner,
-            weights=init_weights,
-            dyn_cls=get_dynamics_cls(args.dyn_cls),
-            dyn_kws={'timestep': args.dt_fs * units.fs, 'loginterval': args.loginterval},
-            run_kws={}
-        )
-        auditor_config = AuditorConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            accept_rate=args.accept_rate,
-            chunk_size=args.chunk_size
-        )
-        sampler_config = SamplerConfig(
-            run_id=run_id,
-            db_url=args.db_url,
-            n_frames=args.n_sample_frames
-        )
-        labeler_config = LabelerConfig(run_id=run_id, db_url=args.db_url)
-        trainer_config = TrainerConfig(run_id=run_id, db_url=args.db_url, learner=learner)
-
-        # launch all agents
-        await manager.launch(
-            DatabaseMonitor,
-            args=(
-                db_config,
+            handles = [
+                db_handle,
                 trainer_handle,
-                dynamics_handle,
-            ),
-            registration=db_reg
-        )
-        await manager.launch(
-            DynamicsEngine,
-            args=(
-                dynamics_config,
-                auditor_handle,
-                ProcessPoolExecutor(max_workers=10),
-                advance_dynamics,
-            ),
-            registration=dynamics_reg
-        )
-        await manager.launch(
-            Auditor,
-            args=(
-                auditor_config,
-                sampler_handle,
-                dynamics_handle,
-                random_audit,
-                ProcessPoolExecutor(max_workers=10)
-
-            ),
-            registration=auditor_reg,
-        )
-        await manager.launch(
-            Sampler,
-            args=(
-                sampler_config,
                 labeler_handle,
-                ProcessPoolExecutor(max_workers=10),
-                random_sample,
-            ),
-            registration=sampler_reg,
-        )
-        await manager.launch(
-            DummyLabeler,
-            args=(labeler_config,),
-            registration=labeler_reg,
-        )
-        await manager.launch(
-            DummyTrainer,
-            args=(trainer_config,),
-            registration=trainer_reg
-        )        
+                sampler_handle,
+                auditor_handle,
+            ]
 
-        # submit initial specs to dynamics engine
-        for spec in initial_specs:
-            logger.info(f"Submitting initial spec to dynamics engine: {spec}")
-            await dynamics_handle.submit(spec)
-        try:
-            await manager.wait([db_handle])
-        except KeyboardInterrupt:
-            for handle in handles:
-                await manager.shutdown(handle, blocking=False)
+            sampler_config = SamplerConfig(
+                run_id=run_id,
+                db_url=args.db_url,
+                n_frames=args.n_sample_frames
+            )
+            labeler_config = LabelerConfig(run_id=run_id, db_url=args.db_url)
+            trainer_config = TrainerConfig(run_id=run_id, db_url=args.db_url, learner=learner)
+
+            # launch all agents
+            await manager.launch(
+                Auditor,
+                kwargs=dict(
+                    sampler=sampler_handle,
+                    audit_task=random_audit,
+                    executor=ProcessPoolExecutor(max_workers=10),
+                    run_id=run_id,
+                    db_url=args.db_url,
+                    audit_kwargs=dict(accept_prob=args.accept_rate,),
+                    chunk_size=args.chunk_size,
+                ),
+                registration=auditor_reg,
+            )
+            await manager.launch(
+                Sampler,
+                kwargs=dict(
+                    run_id=run_id,
+                    db_url=args.db_url,
+                    n_frames=args.n_sample_frames,
+                    labeler=labeler_handle,
+                    executor=ProcessPoolExecutor(max_workers=10),
+                    sample_task=random_sample,
+                ),
+                registration=sampler_reg,
+            )
+            await manager.launch(
+                DummyLabeler,
+                kwargs=dict(run_id=run_id, db_url=args.db_url),
+                registration=labeler_reg,
+            )
+            await manager.launch(
+                DummyTrainer,
+                kwargs=dict(run_id=run_id, db_url=args.db_url, learner=learner),
+                registration=trainer_reg
+            )
+
+            dyn_handles = []
+            #dyn_pool = ProcessPoolExecutor(max_workers=len(initial_specs))
+            for spec in initial_specs:
+                reg = await manager.register_agent(DynamicsRunner)
+                handle = manager.get_handle(reg)
+
+                handles.append(handle)
+                dyn_handles.append(handle)
+
+                await manager.launch(
+                    DynamicsRunner,
+                    kwargs=dict(
+                        atoms=spec.atoms,
+                        run_id=run_id,
+                        db_url=args.db_url,
+                        traj_id=spec.traj_id,
+                        chunk_size=args.chunk_size,
+                        n_steps=args.target_length,
+                        auditor=auditor_handle,
+                        executor=dyn_pool,
+                        advance_dynamics_task=advance_dynamics,
+                        learner=learner,
+                        run_dir=run_dir,
+                        weights=init_weights,
+                        dyn_cls=VelocityVerlet,
+                        dyn_kws={'timestep': 1 * units.fs},
+                        run_kws={},
+                        device='cpu',
+                        model_version=0
+                    ),
+                    registration=reg
+                )
+
+            await manager.launch(
+                DatabaseMonitor,
+                kwargs=dict(
+                    run_id=run_id,
+                    db_url=args.db_url,
+                    retrain_len=args.retrain_len,
+                    target_length=args.target_length,
+                    chunk_size=args.chunk_size,
+                    retrain_fraction=args.retrain_fraction,
+                    retrain_min_frames=args.retrain_min_frames,
+                    trainer=trainer_handle,
+                    dynamics_runners=dyn_handles
+                ),
+                registration=db_reg,
+            )
+            # wait for it to finish!
+            try:
+                await manager.wait([db_handle])
+            except KeyboardInterrupt:
+                for handle in handles:
+                    await manager.shutdown(handle, blocking=False)
 
 if __name__ == '__main__':
     asyncio.run(main())

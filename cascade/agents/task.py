@@ -6,6 +6,7 @@ if TYPE_CHECKING:
     from cascade.model import AdvanceSpec, TrainingFrameSpec
     from cascade.learning.base import BaseLearnableForcefield
     from ase import Atoms
+    from pathlib import Path
 from ase.optimize.optimize import Dynamics
 
 # can make this a classmethod on some audittask class
@@ -74,56 +75,68 @@ def random_sample(
         result.append(spec)
     return result
 
-
 def advance_dynamics(
     spec: AdvanceSpec,
     learner: BaseLearnableForcefield,
     weights: bytes,
     db_url: str,
-    device: str = 'cpu',
-    dyn_cls: type[Dynamics] = Dynamics,
-    dyn_kws: dict[str, object] = {},
-    run_kws: dict[str, object] = {},
-) -> None:
+    device: str,
+    run_dir: str,
+    dyn_cls: type[Dynamics],
+    dyn_kws: dict[str, object],
+    run_kws: dict[str, object],
+) -> list[Atoms]:
     """Advance dynamics of a chunk of a trajectory
-    
-    Intended to be used as a stub for a real advance dynamics function.
+
+    Arguments:
+        spec: contains atoms and metadata about trajectory
+        learner: used to make the calculator
+        weights: weights to add to the calculator
+        db_url: url to write frames to
+        device: for torch
+        dyn_cls: ASE dynamics class
+        dyn_kws: kws to the dynamics constructor
+        run_kws: kws to the dynamics run method
     """
     import numpy as np
     from cascade.utils import canonicalize
     from cascade.agents.db_orm import TrajectoryDB
-    
-    # Create TrajectoryDB instance in the worker process
-    traj_db = TrajectoryDB(db_url)
-    
+    from pathlib import Path
+
+    import logging
+    import os
+
+    # todo: stop this from writing to the screen
+    logfile = str(Path(run_dir) / f'traj-{spec.traj_id}_chunk-{spec.chunk_id}_att-{spec.attempt_index}_md.log')
+    logger = logging.getLogger(logfile)
+    file_handler = logging.FileHandler(logfile)
+    formatter = logging.Formatter('%(asctime)s : %(levelname)s : %(name)s : %(message)s')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
     atoms = spec.atoms
+    logger.info('Creating calculator')
     calc = learner.make_calculator(weights, device=device)
     atoms.calc = calc
 
+    logger.info('Creating dynamics class')
     dyn = dyn_cls(atoms, **dyn_kws)
     
-    frame_index = 0  # Track frame index within this chunk
-
-    def write_to_db():
-        nonlocal frame_index
+    frames = []
+    def write_frame():
+        logger.info('getting results from calc')
         f = atoms.calc.results['forces']
         atoms.calc.results['forces'] = f.astype(np.float64)
         canonical_atoms = canonicalize(atoms)
-        
-        # Write frame to database
-        traj_db.write_frame(
-            run_id=spec.run_id,
-            traj_id=spec.traj_id,
-            chunk_id=spec.chunk_id,
-            attempt_index=spec.attempt_index,
-            frame_index=frame_index,
-            atoms=canonical_atoms
-        )
-        frame_index += 1
-    
-    dyn.attach(write_to_db)
 
+        logger.info('writing frame to db')
+        frames.append(canonical_atoms)
+
+    dyn.attach(write_frame)
+
+    logger.info('Starting dynamics')
     dyn.run(spec.steps, **run_kws)
+    os.remove(logfile)
     
-    return spec
+    return frames
 
