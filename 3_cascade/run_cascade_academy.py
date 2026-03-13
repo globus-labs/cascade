@@ -8,6 +8,7 @@ import datetime
 import hashlib
 import json
 import pathlib
+import sys
 
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
@@ -179,6 +180,24 @@ async def main():
 
     #logger = init_logging(level=args.log_level, logfile=logfile)
     logger = logging.getLogger(__file__)
+    handlers = [logging.StreamHandler(sys.stdout), logging.FileHandler(run_dir / 'run.log')]
+    for l in [logger, logging.getLogger('academy')]:
+        for handler in handlers:
+            handler.setFormatter(
+                logging.Formatter('%(asctime)s - %(name)s - %(funcName)s:%(lineno)s - %(levelname)s - %(message)s'))
+            l.addHandler(handler)
+        l.setLevel(logging.INFO)
+    logger.info(f'Running job in {run_dir}')
+    parsl_logger = logging.getLogger('parsl')
+    parsl_logger.addHandler(logging.FileHandler(run_dir / 'parsl.log'))
+    def remove_stdout_handler(logger):
+        """Removes the StreamHandler connected to sys.stdout from the logger."""
+        for handler in logger.handlers[:]:  # Iterate over a copy of the list
+            if isinstance(handler, logging.StreamHandler) and handler.stream is sys.stdout:
+                logger.removeHandler(handler)
+                print("Removed stdout handler.")
+    remove_stdout_handler(parsl_logger)
+
     logger.setLevel(logging.DEBUG)
 
 
