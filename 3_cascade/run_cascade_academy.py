@@ -1,7 +1,6 @@
 import asyncio
 import argparse
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-from parsl.concurrent import ParslPoolExecutor
 import logging
 import warnings
 import datetime
@@ -10,23 +9,19 @@ import json
 import pathlib
 import sys
 
-from parsl.config import Config
-from parsl.executors import HighThroughputExecutor
-from parsl.providers import LocalProvider
-from parsl.usage_tracking.levels import LEVEL_1
-
 import ase
 from ase.io import read
 from ase import units
 from ase.md.verlet import VelocityVerlet
-
-# Suppress FutureWarning about torch.load weights_only parameter from MACE
-warnings.filterwarnings("ignore", category=FutureWarning, module="mace.calculators")
-
 from mace.calculators import mace_mp
+from parsl.config import Config
+from parsl.executors import HighThroughputExecutor
+from parsl.providers import LocalProvider
+from parsl.usage_tracking.levels import LEVEL_1
+from parsl.concurrent import ParslPoolExecutor
+from academy.logging import init_logging
 from academy.exchange import LocalExchangeFactory
 from academy.manager import Manager
-from academy.logging import init_logging
 
 from cascade.agents.agents import (
     DatabaseMonitor,
@@ -49,6 +44,9 @@ from cascade.model import AdvanceSpec
 from cascade.learning.mace import MACEInterface
 from cascade.agents.db_orm import TrajectoryDB
 from cascade.agents.task import random_audit, advance_dynamics, random_sample
+
+# Suppress FutureWarning about torch.load weights_only parameter from MACE
+warnings.filterwarnings("ignore", category=FutureWarning, module="mace.calculators")
 
 
 def parse_args() -> argparse.Namespace:
@@ -146,11 +144,13 @@ def parse_args() -> argparse.Namespace:
 
     return args
 
+
 def get_learner(learner_name: str) -> type[ase.calculators.calculator.Calculator]:
     if learner_name == 'mace':
         return MACEInterface()
     else:
         raise ValueError(f'Unknown learner: {learner_name}')
+
 
 def get_dynamics_cls(cls_name: str) -> type[ase.md.md.MolecularDynamics]:
     if cls_name == 'velocity-verlet':
@@ -160,7 +160,6 @@ def get_dynamics_cls(cls_name: str) -> type[ase.md.md.MolecularDynamics]:
 
 
 async def main():
-    
     # parse arguments
     args = parse_args()
 
@@ -178,32 +177,18 @@ async def main():
     (run_dir / "params.json").write_text(json.dumps(params))
     logfile = run_dir / "runtime.log"
 
-    #logger = init_logging(level=args.log_level, logfile=logfile)
-    logger = logging.getLogger(__file__)
-    handlers = [logging.StreamHandler(sys.stdout), logging.FileHandler(run_dir / 'run.log')]
-    for l in [logger, logging.getLogger('academy')]:
-        for handler in handlers:
-            handler.setFormatter(
-                logging.Formatter('%(asctime)s - %(name)s - %(funcName)s:%(lineno)s - %(levelname)s - %(message)s'))
-            l.addHandler(handler)
-        l.setLevel(logging.INFO)
-    logger.info(f'Running job in {run_dir}')
-    parsl_logger = logging.getLogger('parsl')
-    parsl_logger.addHandler(logging.FileHandler(run_dir / 'parsl.log'))
-    def remove_stdout_handler(logger):
-        """Removes the StreamHandler connected to sys.stdout from the logger."""
-        for handler in logger.handlers[:]:  # Iterate over a copy of the list
-            if isinstance(handler, logging.StreamHandler) and handler.stream is sys.stdout:
-                logger.removeHandler(handler)
-                print("Removed stdout handler.")
-    remove_stdout_handler(parsl_logger)
+    logger = init_logging(level=args.log_level, logfile=logfile)
 
     logger.setLevel(logging.DEBUG)
 
-
     logger.info("Loaded run params")
-    logger.info("Created run directory: %s", run_dir)
+    logger.info(f'Running job in {run_dir}')
+    parsl_logger = logging.getLogger('parsl')
     
+    for handler in parsl_logger.handlers[:]:  # Iterate over a copy of the list
+        parsl_logger.removeHandler(handler)
+    parsl_logger.addHandler(logging.FileHandler(run_dir / 'parsl.log'))
+
     init_strc = args.initial_structures
     learner = get_learner(args.learner)
     init_weights = learner.serialize_model(learner.get_model(mace_mp('small').models[0]))
