@@ -11,26 +11,15 @@ from __future__ import annotations
 
 import asyncio
 from asyncio import Queue, Event, Lock, wrap_future
-import gc
+from typing import TYPE_CHECKING
 import logging
-from functools import cached_property
-from typing import Any, Awaitable, Callable, NamedTuple, Optional, cast, TYPE_CHECKING
-from concurrent.futures import Executor, Future as ConcurrentFuture
-from pathlib import Path
-from ase import Atoms
+from concurrent.futures import Executor
+
+from ase.optimize.optimize import Dynamics
+from mace.calculators import mace_mp
 from academy.handle import Handle
 from academy.agent import Agent, action, loop
 from academy.exception import AgentTerminatedError
-from ase.optimize.optimize import Dynamics
-from mace.calculators import mace_mp
-
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-    _PSUTIL_WARNING_LOGGED = False
-except ImportError:
-    PSUTIL_AVAILABLE = False
-    _PSUTIL_WARNING_LOGGED = False
 
 from cascade.learning.base import BaseLearnableForcefield
 from cascade.model import AuditStatus, AdvanceSpec, AuditResult, TrajectoryStatus, ChunkEventType
@@ -43,6 +32,11 @@ from cascade.agents.config import (
 from cascade.agents.db_orm import TrajectoryDB
 from cascade.model import ChunkSpec, TrainingFrameSpec
 
+if TYPE_CHECKING:
+    from typing import Callable
+    from ase import Atoms
+
+
 class CascadeAgent(Agent):
     """Base class for all cascade agents"""
 
@@ -50,6 +44,7 @@ class CascadeAgent(Agent):
         self.logger = logging.getLogger(self.__class__.__name__)
         self._traj_db = TrajectoryDB(self.db_url, logger=self.logger)
         self._traj_db.create_tables()
+
 
 class DynamicsRunner(CascadeAgent):
 
@@ -141,14 +136,6 @@ class DynamicsRunner(CascadeAgent):
                 attempt_index=self.attempt,
             )
 
-            # save started dynamics event
-            # self._traj_db.record_chunk_event(
-            #     run_id=self.run_id,
-            #     traj_id=spec.traj_id,
-            #     chunk_id=spec.chunk_id,
-            #     attempt_index=spec.attempt_index,
-            #     event_type=ChunkEventType.STARTED_DYNAMICS
-            # )
             self.logger.info(f"Running dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index} with {spec.steps} steps")
 
             async with self.new_model_lock:
@@ -197,16 +184,7 @@ class DynamicsRunner(CascadeAgent):
                     frame_index=frame_index,
                     atoms=_atoms
                 )
-
             self.logger.info(f"Finished dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
-            # save finished dynamics event
-            # self._traj_db.record_chunk_event(
-            #     run_id=self.run_id,
-            #     traj_id=spec.traj_id,
-            #     chunk_id=spec.chunk_id,
-            #     attempt_index=spec.attempt_index,
-            #     event_type=ChunkEventType.FINISHED_DYNAMICS
-            # )
 
             # submit to auditor
             chunk_spec = ChunkSpec(traj_id=self.traj_id, chunk_id=self.chunk)
@@ -285,19 +263,6 @@ class Auditor(CascadeAgent):
                 chunk_spec.chunk_id,
             )
             return
-        attempt_index = latest_attempt['attempt_index']
-        # self._traj_db.record_chunk_event(
-        #     run_id=self.run_id,
-        #     traj_id=chunk_spec.traj_id,
-        #     chunk_id=chunk_spec.chunk_id,
-        #     attempt_index=attempt_index,
-        #     event_type=ChunkEventType.STARTED_AUDIT
-        # )
-        # chunk_atoms = self._traj_db.get_latest_chunk_attempt_atoms(
-        #     self.run_id,
-        #     chunk_spec.traj_id,
-        #     chunk_spec.chunk_id
-        # )
 
         self.logger.info(f'Submitting audit of chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id} to executor')
 
@@ -313,14 +278,6 @@ class Auditor(CascadeAgent):
         result = wrapped_future.result()
         status = result.status
 
-        # todo: should we keep this?
-        if status not in [AuditStatus.PASSED, AuditStatus.FAILED]:
-            self.logger.error(
-                'Audit result is not PASSED or FAILED: %s (traj_id=%d, chunk_id=%d, attempt_index=%d)',
-                status, result.traj_id, result.chunk_id, result.attempt_index
-            )
-            return
-
         self._traj_db.update_chunk_audit_done_status(
             run_id=self.run_id,
             traj_id=result.traj_id,
@@ -328,16 +285,6 @@ class Auditor(CascadeAgent):
             attempt_index=result.attempt_index,
             audit_status=status
         )
-        
-        # Record audit result event
-        event_type = ChunkEventType.AUDIT_PASSED if status == AuditStatus.PASSED else ChunkEventType.AUDIT_FAILED
-        # self._traj_db.record_chunk_event(
-        #     run_id=self.run_id,
-        #     traj_id=result.traj_id,
-        #     chunk_id=result.chunk_id,
-        #     attempt_index=result.attempt_index,
-        #     event_type=event_type
-        # )
         if status == AuditStatus.PASSED:
             self.logger.info(
                 f'Audit passed for traj {result.traj_id} chunk {result.chunk_id} attempt {result.attempt_index}'
@@ -354,8 +301,7 @@ class Auditor(CascadeAgent):
             )
             self.logger.info(f'Submitting failed chunk {result.chunk_id} of traj {result.traj_id} to sampler')
             await self.sampler.submit(spec, chunk_atoms)
-        return status 
-
+        return status
 
 class Sampler(CascadeAgent):
 
@@ -426,21 +372,6 @@ class Sampler(CascadeAgent):
                 attempt_index=attempt_index,
                 model_version=model_version,
             )
-
-            # Get frames from trajectory_frames table for this chunk
-            atoms_list = chunk_atoms #self._traj_db.get_latest_chunk_attempt_atoms(
-            #     run_id=self.run_id,
-            #     traj_id=chunk_spec.traj_id,
-            #     chunk_id=chunk_spec.chunk_id,
-            # )
-
-            if not atoms_list:
-                self.logger.warning(
-                    f"No frames found for chunk {chunk_spec.chunk_id} of "
-                    f"traj {chunk_spec.traj_id}"
-                )
-                continue
-
             # Get frame IDs for the sampled frames
             frame_ids = self._traj_db.get_chunk_frame_ids(
                 run_id=self.run_id,
@@ -449,19 +380,10 @@ class Sampler(CascadeAgent):
                 attempt_index=attempt_index,
             )
 
-            # # Record STARTED_SAMPLING (only when we have atoms to process)
-            # self._traj_db.record_chunk_event(
-            #     run_id=self.run_id,
-            #     traj_id=resolved_spec.traj_id,
-            #     chunk_id=resolved_spec.chunk_id,
-            #     attempt_index=resolved_spec.attempt_index,
-            #     event_type=ChunkEventType.STARTED_SAMPLING,
-            # )
-
             future = self.executor.submit(
                 self.sample_task,
-                atoms_list=atoms_list,
-                frame_ids=frame_ids, # todo: fixme
+                atoms_list=chunk_atoms,
+                frame_ids=frame_ids,
                 chunk_spec=resolved_spec,
                 model_version=model_version,
                 n_frames=self.n_frames,
@@ -469,7 +391,7 @@ class Sampler(CascadeAgent):
             wrapped_future = wrap_future(future)
             await wrapped_future
             specs = wrapped_future.result()
-            
+
             if len(specs) != self.n_frames:
                 self.logger.warning(
                     "Sampling returned %d frames for traj %s chunk %s (attempt %s), "
@@ -486,14 +408,6 @@ class Sampler(CascadeAgent):
                     f'chunk {chunk_spec.chunk_id} to labeler'
                 )
                 await self.labeler.submit(spec)
-            #
-            # self._traj_db.record_chunk_event(
-            #     run_id=self.run_id,
-            #     traj_id=chunk_spec.traj_id,
-            #     chunk_id=chunk_spec.chunk_id,
-            #     attempt_index=chunk_spec.attempt_index,
-            #     event_type=ChunkEventType.FINISHED_SAMPLING,
-            # )
 
 
 class DummyLabeler(CascadeAgent):
@@ -519,6 +433,34 @@ class DummyLabeler(CascadeAgent):
         while not shutdown.is_set():
             training_frame_spec = await self.queue.get()
             
+            
+            # # Check if STARTED_LABELING exists for this chunk (idempotent)
+            # if not self._traj_db.has_chunk_event(
+            #     run_id=self.run_id,
+            #     traj_id=training_frame_spec.traj_id,
+            #     chunk_id=training_frame_spec.chunk_id,
+            #     attempt_index=training_frame_spec.attempt_index,
+            #     event_type=ChunkEventType.STARTED_LABELING
+            # ):
+            #     self._traj_db.record_chunk_event(
+            #         run_id=self.run_id,
+            #         traj_id=training_frame_spec.traj_id,
+            #         chunk_id=training_frame_spec.chunk_id,
+            #         attempt_index=training_frame_spec.attempt_index,
+            #         event_type=ChunkEventType.STARTED_LABELING
+            #     )
+            #
+            # # Record STARTED_LABELING_FRAME
+            # self._traj_db.record_chunk_event(
+            #     run_id=self.run_id,
+            #     traj_id=training_frame_spec.traj_id,
+            #     chunk_id=training_frame_spec.chunk_id,
+            #     attempt_index=training_frame_spec.attempt_index,
+            #     event_type=ChunkEventType.STARTED_LABELING_FRAME,
+            #     frame_id=training_frame_spec.trajectory_frame_id
+            # )
+            
+
             # # Check if STARTED_LABELING exists for this chunk (idempotent)
             # if not self._traj_db.has_chunk_event(
             #     run_id=self.run_id,
@@ -561,6 +503,36 @@ class DummyLabeler(CascadeAgent):
                 )
                 continue
             
+            
+            # # Record FINISHED_LABELING_FRAME after successfully adding training frame
+            # self._traj_db.record_chunk_event(
+            #     run_id=self.run_id,
+            #     traj_id=training_frame_spec.traj_id,
+            #     chunk_id=training_frame_spec.chunk_id,
+            #     attempt_index=training_frame_spec.attempt_index,
+            #     event_type=ChunkEventType.FINISHED_LABELING_FRAME,
+            #     frame_id=training_frame_spec.trajectory_frame_id
+            # )
+            
+            # Check if all frames for chunk are done
+            labeled_count = self._traj_db.count_labeled_frames_for_chunk(
+                run_id=self.run_id,
+                traj_id=training_frame_spec.traj_id,
+                chunk_id=training_frame_spec.chunk_id,
+                attempt_index=training_frame_spec.attempt_index
+            )
+            
+            # if labeled_count >= training_frame_spec.total_frames_in_chunk:
+                # All frames labeled, record FINISHED_LABELING
+                # self._traj_db.record_chunk_event(
+                #     run_id=self.run_id,
+                #     traj_id=training_frame_spec.traj_id,
+                #     chunk_id=training_frame_spec.chunk_id,
+                #     attempt_index=training_frame_spec.attempt_index,
+                #     event_type=ChunkEventType.FINISHED_LABELING
+                # )
+            
+
             # # Record FINISHED_LABELING_FRAME after successfully adding training frame
             # self._traj_db.record_chunk_event(
             #     run_id=self.run_id,
@@ -618,7 +590,7 @@ class DummyTrainer(CascadeAgent):
             event_type=ChunkEventType.STARTED_TRAINING,
             training_round=training_round
         )
-        
+
         calc = mace_mp('small', device='cpu', default_dtype="float32") #todo: mt.2025.11.04 this should be configurable
         model = calc.models[0]
         model_msg = self.learner.serialize_model(model)
@@ -660,16 +632,16 @@ class DatabaseMonitor(CascadeAgent):
         while not shutdown.is_set():
             # Check if all trajectories are complete
             trajectories = self._traj_db.list_trajectories_in_run(self.run_id)
-            
+
             if len(trajectories) == 0:
                 await asyncio.sleep(1)
                 continue
-            
+
             all_finished = all(
                 traj['status'] in (TrajectoryStatus.COMPLETED, TrajectoryStatus.FAILED)
                 for traj in trajectories
             )
-            
+
             if all_finished:
                 self.logger.info("All trajs done, setting shutdown")
                 shutdown.set()
@@ -680,16 +652,16 @@ class DatabaseMonitor(CascadeAgent):
     @loop
     async def periodic_retrain(self, shutdown: asyncio.Event) -> None:
         """Monitor for enough training frames and trigger retraining.
-        
+
         Retraining is triggered when either condition is met:
         - Absolute threshold: number of new training frames >= retrain_len
         - Fraction threshold: fraction of active trajectories with samples >= retrain_fraction
-        
+
         The absolute condition ensures retraining happens after accumulating a minimum
         number of frames, while the fraction condition ensures retraining occurs when
         a sufficient proportion of active trajectories have been sampled, even if the
         absolute count is low.
-        
+
         After retraining, frames are resubmitted for execution with the new model.
         """
         self.logger.info("periodic_retrain loop started")
@@ -698,37 +670,37 @@ class DatabaseMonitor(CascadeAgent):
             # Check if we have enough new training frames
             current_count = self._traj_db.count_training_frames(self.run_id)
             new_frames = current_count - self.last_train_count
-            
+
             # Check fraction-based condition
             total_active, active_with_labeling = self._traj_db.count_active_trajs_with_labeling(
                 run_id=self.run_id
             )
             sampled_fraction = active_with_labeling / total_active if total_active > 0 else 0.
-            
+
             self.logger.info(
                 f"Retrain check: new training frames={new_frames}, active trajectories={total_active}, trajectories with labeled frames={active_with_labeling}, "
                 f"fraction={sampled_fraction:.2%}"
             )
-            
+
             # Determine which condition triggered retraining
             absolute_condition = new_frames >= self.retrain_len
             fraction_condition = sampled_fraction >= self.retrain_fraction
             should_retrain = absolute_condition or fraction_condition
-            
+
             if should_retrain:
                 trigger_reason = []
                 if absolute_condition:
                     trigger_reason.append(f"absolute threshold ({new_frames} >= {self.retrain_len})")
                 if fraction_condition:
                     trigger_reason.append(f"fraction threshold ({sampled_fraction:.2%} >= {self.retrain_fraction:.2%})")
-                
+
                 # Get the training round for frames that will be used in this retraining
                 # (frames created before this retraining will have the current max training_round)
                 training_round_for_retrain = self._traj_db.get_current_training_round(self.run_id)
-                
+
                 # Increment training round - new frames created after this will use the new round
                 self.current_training_round = training_round_for_retrain + 1
-                
+
                 self.logger.info(
                     f"Starting retraining (round {self.current_training_round}) triggered by: {', '.join(trigger_reason)}\n"
                     f"Training frame count: current={current_count}, last_train={self.last_train_count}, "
@@ -738,7 +710,7 @@ class DatabaseMonitor(CascadeAgent):
 
                 # Train model and update weights in dynamics engine
                 weights = await self.trainer.train_model(self.current_training_round)
-                
+
                 # Record FINISHED_TRAINING event after training completes
                 self._traj_db.record_training_event(
                     run_id=self.run_id,
