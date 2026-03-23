@@ -581,36 +581,31 @@ class DatabaseMonitor(CascadeAgent):
 
     def __init__(
         self,
-        run_id: str,
-        db_url: str,
-        retrain_len: int,
-        target_length: int,
-        chunk_size: int,
-        retrain_fraction: float,
-        retrain_min_frames: int,
+        config: DatabaseMonitorConfig,
         trainer: Handle[DummyTrainer],
         dynamics_runners: list[Handle[DynamicsRunner]]
     ):
+        self.db_url = config.db_url
+        self.config = config
         super().__init__()
         self.trainer = trainer
         self.dynamics_runners = dynamics_runners
         self.last_train_count = 0
         self.current_training_round = 0
         self.model_version = 0
-        self.db_url = db_url
-        self.run_id = run_id
-        self.retrain_len = retrain_len
-        self.target_length = target_length
-        self.chunk_size = chunk_size
-        self.retrain_fraction = retrain_fraction
-        self.retrain_min_frames = retrain_min_frames
+
+        # pull out config vars that might change
+        self.chunk_size = self.config.chunk_size
+        self.retrain_len = self.config.retrain_len
+        self.retrain_fraction = self.config.retrain_fraction
+        self.retrain_min_frames = self.config.retrain_min_frames
 
     @loop
     async def monitor_completion(self, shutdown: asyncio.Event) -> None:
         """Monitor if all trajectories are done and set shutdown"""
         while not shutdown.is_set():
             # Check if all trajectories are complete
-            trajectories = self._traj_db.list_trajectories_in_run(self.run_id)
+            trajectories = self._traj_db.list_trajectories_in_run(self.config.run_id)
 
             if len(trajectories) == 0:
                 await asyncio.sleep(1)
@@ -647,12 +642,12 @@ class DatabaseMonitor(CascadeAgent):
         while not shutdown.is_set():
             await asyncio.sleep(5)
             # Check if we have enough new training frames
-            current_count = self._traj_db.count_training_frames(self.run_id)
+            current_count = self._traj_db.count_training_frames(self.config.run_id)
             new_frames = current_count - self.last_train_count
 
             # Check fraction-based condition
             total_active, active_with_labeling = self._traj_db.count_active_trajs_with_labeling(
-                run_id=self.run_id
+                run_id=self.config.run_id
             )
             sampled_fraction = active_with_labeling / total_active if total_active > 0 else 0.
 
@@ -675,7 +670,7 @@ class DatabaseMonitor(CascadeAgent):
 
                 # Get the training round for frames that will be used in this retraining
                 # (frames created before this retraining will have the current max training_round)
-                training_round_for_retrain = self._traj_db.get_current_training_round(self.run_id)
+                training_round_for_retrain = self._traj_db.get_current_training_round(self.config.run_id)
 
                 # Increment training round - new frames created after this will use the new round
                 self.current_training_round = training_round_for_retrain + 1
@@ -692,7 +687,7 @@ class DatabaseMonitor(CascadeAgent):
 
                 # Record FINISHED_TRAINING event after training completes
                 self._traj_db.record_training_event(
-                    run_id=self.run_id,
+                    run_id=self.config.run_id,
                     event_type=ChunkEventType.FINISHED_TRAINING,
                     training_round=self.current_training_round
                 )

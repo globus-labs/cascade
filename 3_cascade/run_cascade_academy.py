@@ -266,7 +266,14 @@ async def main():
                 auditor_handle,
             ]
 
-            
+            db_monitor_config = DatabaseMonitorConfig(
+                run_id=run_id,
+                db_url=args.db_url,
+                retrain_len=args.retrain_len,
+                chunk_size=args.chunk_size,
+                retrain_fraction=args.retrain_fraction,
+                retrain_min_frames=args.retrain_min_frames,
+            )
 
             sampler_config = SamplerConfig(
                 run_id=run_id,
@@ -351,13 +358,7 @@ async def main():
             await manager.launch(
                 DatabaseMonitor,
                 kwargs=dict(
-                    run_id=run_id,
-                    db_url=args.db_url,
-                    retrain_len=args.retrain_len,
-                    target_length=args.target_length,
-                    chunk_size=args.chunk_size,
-                    retrain_fraction=args.retrain_fraction,
-                    retrain_min_frames=args.retrain_min_frames,
+                    config=db_monitor_config,
                     trainer=trainer_handle,
                     dynamics_runners=dyn_handles
                 ),

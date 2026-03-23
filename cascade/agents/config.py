@@ -80,9 +80,9 @@ class TrainerConfig(CascadeAgentConfig):
 @dataclass
 class DatabaseMonitorConfig(CascadeAgentConfig):
     """Configuration for DatabaseMonitor agent"""
+    run_id: int
+    db_url: str
     retrain_len: int
-    target_length: int
     chunk_size: int
     retrain_fraction: float = 0.5
     retrain_min_frames: int = 10
-
