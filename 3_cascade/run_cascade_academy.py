@@ -266,6 +266,8 @@ async def main():
                 auditor_handle,
             ]
 
+            
+
             sampler_config = SamplerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
@@ -319,17 +321,13 @@ async def main():
 
                 handles.append(handle)
                 dyn_handles.append(handle)
-
-                await manager.launch(
-                    DynamicsRunner,
-                    kwargs=dict(
+                dyn_config = DynamicsRunnerConfig(
                         atoms=spec.atoms,
                         run_id=run_id,
                         db_url=args.db_url,
                         traj_id=spec.traj_id,
                         chunk_size=args.chunk_size,
                         n_steps=args.target_length,
-                        auditor=auditor_handle,
                         executor=dyn_pool,
                         advance_dynamics_task=advance_dynamics,
                         learner=learner,
@@ -340,6 +338,12 @@ async def main():
                         run_kws={},
                         device='cpu',
                         model_version=0
+                )
+                await manager.launch(
+                    DynamicsRunner,
+                    kwargs=dict(
+                        config=dyn_config,
+                        auditor=auditor_handle
                     ),
                     registration=reg
                 )

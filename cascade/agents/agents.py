@@ -27,7 +27,8 @@ from cascade.agents.config import (
     AuditorConfig,
     SamplerConfig,
     LabelerConfig,
-    DatabaseMonitorConfig
+    DatabaseMonitorConfig,
+    DynamicsRunnerConfig
 )
 from cascade.agents.db_orm import TrajectoryDB
 from cascade.model import ChunkSpec, TrainingFrameSpec
@@ -50,23 +51,8 @@ class DynamicsRunner(CascadeAgent):
 
     def __init__(
         self,
-        atoms: Atoms,
-        run_id: str,
-        db_url: str,
-        traj_id: int,
-        chunk_size: int,
-        n_steps: int,
-        run_dir: str,
         auditor: Handle[Auditor],
-        executor: Executor,
-        advance_dynamics_task: Callable[[AdvanceSpec], None],
-        learner: BaseLearnableForcefield,
-        weights: bytes,
-        dyn_cls: type[Dynamics],
-        dyn_kws: dict[str, object] | None,
-        run_kws: dict[str, object] | None,
-        device: str = 'cpu',
-        model_version: int = 0
+        config: DynamicsRunnerConfig
     ):
         """Runs dynamics in a loop until done, or a shutdown message is received
 
@@ -86,35 +72,28 @@ class DynamicsRunner(CascadeAgent):
             device: for torch execution
             model_version: index of current model version
         """
+        self.db_url = config.db_url
         super().__init__()
-        self.atoms = atoms
-        self.db_url = db_url
-        self.executor = executor
-        self.run_id = run_id
-        self.traj_id = traj_id
-        self.run_dir = run_dir
-        self.chunk_size = chunk_size
-        self.n_steps = n_steps
-        self.dyn_cls = dyn_cls
-        self.weights = weights
-        self.learner = learner
-        self.weights = weights
+        self.config = config
         self.auditor = auditor
-        self.advance_dynamics_task = advance_dynamics_task
-        self.dyn_kws = dyn_kws or {}
-        self.run_kws = run_kws or {}
-        self.device = device
 
+        # pull out variables that may change from config
+        self.atoms = config.atoms.copy()
+        self.init_chunk_size = config.chunk_size
+        self.chunk_size = config.chunk_size
+        self.model_version = config.model_version
+        self.weights = config.weights
+
+        # track progress
         self.timestep = 0
         self.chunk = 0
         self.attempt = 0
         self.done = False
-        self.model_version = model_version
 
+        # for handling weight updates
         self.received_weights = Event()
         self.new_model_lock = Lock()
         self.new_model: tuple[bytes, int] | None = None  # weights, version
-
 
     @loop
     async def run(
@@ -130,8 +109,8 @@ class DynamicsRunner(CascadeAgent):
             spec = AdvanceSpec(
                 atoms=self.atoms,
                 steps=self.chunk_size,
-                run_id=self.run_id,
-                traj_id=self.traj_id,
+                run_id=self.config.run_id,
+                traj_id=self.config.traj_id,
                 chunk_id=self.chunk,
                 attempt_index=self.attempt,
             )
@@ -145,21 +124,21 @@ class DynamicsRunner(CascadeAgent):
                     self.new_model = None
                 self.logger.debug(
                     f"Submitting dynamics to executor dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index} with {spec.steps} steps")
-                chunk_future = self.executor.submit(
-                    self.advance_dynamics_task,
+                chunk_future = self.config.executor.submit(
+                    self.config.advance_dynamics_task,
                     spec=spec,
-                    learner=self.learner,
-                    weights=self.weights,
-                    db_url=self.db_url,
-                    device=self.device,
-                    dyn_cls=self.dyn_cls,
-                    dyn_kws=self.dyn_kws,
-                    run_kws=self.run_kws,
-                    run_dir=str(self.run_dir)
+                    learner=self.config.learner,
+                    weights=self.config.weights,
+                    db_url=self.config.db_url,
+                    device=self.config.device,
+                    dyn_cls=self.config.dyn_cls,
+                    dyn_kws=self.config.dyn_kws,
+                    run_kws=self.config.run_kws,
+                    run_dir=str(self.config.run_dir)
                 )
 
             self._traj_db.add_chunk_attempt(
-                run_id=self.run_id,
+                run_id=self.config.run_id,
                 traj_id=spec.traj_id,
                 chunk_id=spec.chunk_id,
                 model_version=self.model_version,
@@ -187,30 +166,30 @@ class DynamicsRunner(CascadeAgent):
             self.logger.info(f"Finished dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
 
             # submit to auditor
-            chunk_spec = ChunkSpec(traj_id=self.traj_id, chunk_id=self.chunk)
-            self.logger.info(f"Submitting audit for traj {self.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
+            chunk_spec = ChunkSpec(traj_id=self.config.traj_id, chunk_id=self.chunk)
+            self.logger.info(f"Submitting audit for traj {self.config.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
             audit_status = await self.auditor.audit(chunk_spec, chunk)
 
             # handle audit result
             if audit_status == AuditStatus.PASSED:
 
-                self.logger.info(f"Audit status passed for traj {self.traj_id} chunk {self.chunk} attempt {self.attempt}")
+                self.logger.info(f"Audit status passed for traj {self.config.traj_id} chunk {self.chunk} attempt {self.attempt}")
                 self.timestep += self.chunk_size
-                self.logger.info(f"On timestep {self.timestep} of {self.n_steps}")
-                self.done = self.timestep >= self.n_steps
+                self.logger.info(f"On timestep {self.timestep} of {self.config.n_steps}")
+                self.done = self.timestep >= self.config.n_steps
                 if self.done:
-                    self.logger.info(f"Finished dynamics for traj {self.traj_id} on {self.chunk} attempt {self.attempt}, shutting down")
-                    self._traj_db.mark_trajectory_completed(run_id=self.run_id, traj_id=self.traj_id)
+                    self.logger.info(f"Finished dynamics for traj {self.config.traj_id} on {self.chunk} attempt {self.attempt}, shutting down")
+                    self._traj_db.mark_trajectory_completed(run_id=self.config.run_id, traj_id=self.config.traj_id)
                     self.agent_shutdown()
                 else:
                     # audit passed but not done, use the new atoms to run a new chunk
                     self.atoms = chunk[-1]
                     self.chunk += 1
                     self.attempt = 0
-                    self.logger.info(f"Updating traj {self.traj_id} to chunk {self.chunk} attempt {self.attempt}")
+                    self.logger.info(f"Updating traj {self.config.traj_id} to chunk {self.chunk} attempt {self.attempt}")
             else:
                 # audit failed, try a new attempt once new model is received
-                self.logger.info(f'Audit status failed for traj {self.traj_id} chunk {self.chunk} attempt {self.attempt}, waiting for new weights...')
+                self.logger.info(f'Audit status failed for traj {self.config.traj_id} chunk {self.chunk} attempt {self.attempt}, waiting for new weights...')
                 self.attempt += 1
                 self.received_weights.clear()
                 await self.received_weights.wait()

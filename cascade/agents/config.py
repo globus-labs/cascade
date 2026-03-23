@@ -4,10 +4,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ase import Atoms
     from ase.optimize.optimize import Dynamics
     from cascade.model import Trajectory
     from cascade.learning.base import BaseLearnableForcefield
     import numpy as np
+    from concurrent.futures import Executor
+    from typing import Callable
+    from cascade.model import AdvanceSpec
 
 
 @dataclass
@@ -17,6 +21,7 @@ class CascadeAgentConfig:
     """Run ID"""
     db_url: str
     """Database URL"""
+
 
 @dataclass
 class DatabaseConfig(CascadeAgentConfig):
@@ -29,12 +34,22 @@ class DatabaseConfig(CascadeAgentConfig):
 @dataclass
 class DynamicsRunnerConfig(CascadeAgentConfig):
     """Configuration for DynamicsEngine agent"""
+    atoms: Atoms
+    run_id: str
+    db_url: str
+    traj_id: int
+    chunk_size: int
+    n_steps: int
+    run_dir: str
+    executor: Executor
+    advance_dynamics_task: Callable[[AdvanceSpec], None]
     learner: BaseLearnableForcefield
     weights: bytes
     dyn_cls: type[Dynamics]
     dyn_kws: dict[str, object] | None
     run_kws: dict[str, object] | None
     device: str = 'cpu'
+    model_version: int = 0
 
 
 @dataclass
