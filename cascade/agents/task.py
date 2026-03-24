@@ -7,6 +7,7 @@ if TYPE_CHECKING:
     from cascade.learning.base import BaseLearnableForcefield
     from ase import Atoms
     from pathlib import Path
+    import numpy as np
 from ase.optimize.optimize import Dynamics
 
 
@@ -20,7 +21,7 @@ def random_audit(
     sleep_time: float = 0.,
 ) -> AuditResult:
     """Random audit of a chunk of a trajectory
-    
+
     Intended to be used as a stub for a real audit function.
     """
     from cascade.model import AuditResult, AuditStatus
@@ -76,6 +77,7 @@ def random_sample(
         result.append(spec)
     return result
 
+
 def advance_dynamics(
     spec: AdvanceSpec,
     learner: BaseLearnableForcefield,
@@ -101,7 +103,6 @@ def advance_dynamics(
     """
     import numpy as np
     from cascade.utils import canonicalize
-    from cascade.agents.db_orm import TrajectoryDB
     from pathlib import Path
 
     import logging
@@ -122,8 +123,9 @@ def advance_dynamics(
 
     logger.info('Creating dynamics class')
     dyn = dyn_cls(atoms, **dyn_kws)
-    
+
     frames = []
+
     def write_frame():
         logger.info('getting results from calc')
         f = atoms.calc.results['forces']
@@ -138,6 +140,10 @@ def advance_dynamics(
     logger.info('Starting dynamics')
     dyn.run(spec.steps, **run_kws)
     os.remove(logfile)
-    
+
     return frames
 
+
+def label_noop(spec: TrainingFrameSpec) -> TrainingFrameSpec:
+    """Returns forces from the training frame spec unmodified"""
+    return spec

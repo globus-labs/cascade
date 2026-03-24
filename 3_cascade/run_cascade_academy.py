@@ -28,7 +28,7 @@ from cascade.agents.agents import (
     DynamicsRunner,
     Auditor,
     Sampler,
-    DummyLabeler,
+    Labeler,
     DummyTrainer
 )
 from cascade.agents.config import (
@@ -43,7 +43,12 @@ from cascade.agents.config import (
 from cascade.model import AdvanceSpec
 from cascade.learning.mace import MACEInterface
 from cascade.agents.db_orm import TrajectoryDB
-from cascade.agents.task import random_audit, advance_dynamics, random_sample
+from cascade.agents.task import (
+    random_audit,
+    advance_dynamics,
+    random_sample,
+    label_noop
+)
 
 # Suppress FutureWarning about torch.load weights_only parameter from MACE
 warnings.filterwarnings("ignore", category=FutureWarning, module="mace.calculators")
@@ -184,7 +189,7 @@ async def main():
     logger.info("Loaded run params")
     logger.info(f'Running job in {run_dir}')
     parsl_logger = logging.getLogger('parsl')
-    
+
     for handler in parsl_logger.handlers[:]:  # Iterate over a copy of the list
         parsl_logger.removeHandler(handler)
     parsl_logger.addHandler(logging.FileHandler(run_dir / 'parsl.log'))
@@ -247,7 +252,7 @@ async def main():
             # register all agents with manager
             db_reg = await manager.register_agent(DatabaseMonitor)
             trainer_reg = await manager.register_agent(DummyTrainer)
-            labeler_reg = await manager.register_agent(DummyLabeler)
+            labeler_reg = await manager.register_agent(Labeler)
             sampler_reg = await manager.register_agent(Sampler)
             auditor_reg = await manager.register_agent(Auditor)
 
@@ -289,7 +294,12 @@ async def main():
                 executor=ProcessPoolExecutor(max_workers=10),
                 sample_task=random_sample,
             )
-            labeler_config = LabelerConfig(run_id=run_id, db_url=args.db_url)
+            labeler_config = LabelerConfig(
+                run_id=run_id,
+                db_url=args.db_url,
+                executor=ProcessPoolExecutor(max_workers=10),
+                label_task=label_noop
+                )
             trainer_config = TrainerConfig(run_id=run_id, db_url=args.db_url, learner=learner)
 
             # launch all agents
@@ -310,8 +320,8 @@ async def main():
                 registration=sampler_reg,
             )
             await manager.launch(
-                DummyLabeler,
-                kwargs=dict(run_id=run_id, db_url=args.db_url),
+                Labeler,
+                kwargs=dict(config=labeler_config),
                 registration=labeler_reg,
             )
             await manager.launch(

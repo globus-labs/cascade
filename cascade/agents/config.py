@@ -77,9 +77,14 @@ class SamplerConfig(CascadeAgentConfig):
     executor: Executor
     sample_task: Callable[..., list[TrainingFrameSpec]]
 
+
 @dataclass
 class LabelerConfig(CascadeAgentConfig):
     """Configuration for DummyLabeler agent"""
+    run_id: str
+    db_url: str
+    executor: Executor
+    label_task: Callable[TrainingFrameSpec, TrainingFrameSpec]
 
 
 @dataclass

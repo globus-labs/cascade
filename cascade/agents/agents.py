@@ -280,7 +280,7 @@ class Sampler(CascadeAgent):
     def __init__(
         self,
         config: SamplerConfig,
-        labeler: Handle[DummyLabeler],
+        labeler: Handle[Labeler],
     ):
         self.db_url = config.db_url
         super().__init__()
@@ -376,16 +376,15 @@ class Sampler(CascadeAgent):
                 await self.labeler.submit(spec)
 
 
-class DummyLabeler(CascadeAgent):
+class Labeler(CascadeAgent):
 
     def __init__(
         self,
-        run_id: int,
-        db_url: str,
+        config: LabelerConfig
     ):
+        self.db_url = config.db_url
         super().__init__()
-        self.run_id = run_id
-        self.db_url = db_url
+        self.config = config
         self.queue = Queue()
 
     @action
@@ -396,141 +395,24 @@ class DummyLabeler(CascadeAgent):
     @loop
     async def label_data(self, shutdown: asyncio.Event) -> None:
 
+        # todo: is there any reason not to just do this in the submit?
         while not shutdown.is_set():
             training_frame_spec = await self.queue.get()
-            
-            
-            # # Check if STARTED_LABELING exists for this chunk (idempotent)
-            # if not self._traj_db.has_chunk_event(
-            #     run_id=self.run_id,
-            #     traj_id=training_frame_spec.traj_id,
-            #     chunk_id=training_frame_spec.chunk_id,
-            #     attempt_index=training_frame_spec.attempt_index,
-            #     event_type=ChunkEventType.STARTED_LABELING
-            # ):
-            #     self._traj_db.record_chunk_event(
-            #         run_id=self.run_id,
-            #         traj_id=training_frame_spec.traj_id,
-            #         chunk_id=training_frame_spec.chunk_id,
-            #         attempt_index=training_frame_spec.attempt_index,
-            #         event_type=ChunkEventType.STARTED_LABELING
-            #     )
-            #
-            # # Record STARTED_LABELING_FRAME
-            # self._traj_db.record_chunk_event(
-            #     run_id=self.run_id,
-            #     traj_id=training_frame_spec.traj_id,
-            #     chunk_id=training_frame_spec.chunk_id,
-            #     attempt_index=training_frame_spec.attempt_index,
-            #     event_type=ChunkEventType.STARTED_LABELING_FRAME,
-            #     frame_id=training_frame_spec.trajectory_frame_id
-            # )
-            
 
-            # # Check if STARTED_LABELING exists for this chunk (idempotent)
-            # if not self._traj_db.has_chunk_event(
-            #     run_id=self.run_id,
-            #     traj_id=training_frame_spec.traj_id,
-            #     chunk_id=training_frame_spec.chunk_id,
-            #     attempt_index=training_frame_spec.attempt_index,
-            #     event_type=ChunkEventType.STARTED_LABELING
-            # ):
-            #     self._traj_db.record_chunk_event(
-            #         run_id=self.run_id,
-            #         traj_id=training_frame_spec.traj_id,
-            #         chunk_id=training_frame_spec.chunk_id,
-            #         attempt_index=training_frame_spec.attempt_index,
-            #         event_type=ChunkEventType.STARTED_LABELING
-            #     )
-            #
-            # # Record STARTED_LABELING_FRAME
-            # self._traj_db.record_chunk_event(
-            #     run_id=self.run_id,
-            #     traj_id=training_frame_spec.traj_id,
-            #     chunk_id=training_frame_spec.chunk_id,
-            #     attempt_index=training_frame_spec.attempt_index,
-            #     event_type=ChunkEventType.STARTED_LABELING_FRAME,
-            #     frame_id=training_frame_spec.trajectory_frame_id
-            # )
-            
-            try:
-                self._traj_db.add_training_frame(
-                    run_id=self.run_id,
-                    trajectory_frame_id=training_frame_spec.trajectory_frame_id,
-                    model_version_sampled_from=training_frame_spec.training_frame.model_version,
-                    traj_id=training_frame_spec.traj_id,
-                    chunk_id=training_frame_spec.chunk_id,
-                    attempt_index=training_frame_spec.attempt_index
-                )
-            except Exception as e:
-                self.logger.warning(
-                    f"Could not add training frame for trajectory_frame_id "
-                    f"{training_frame_spec.trajectory_frame_id}: {e}, skipping training frame"
-                )
-                continue
-            
-            
-            # # Record FINISHED_LABELING_FRAME after successfully adding training frame
-            # self._traj_db.record_chunk_event(
-            #     run_id=self.run_id,
-            #     traj_id=training_frame_spec.traj_id,
-            #     chunk_id=training_frame_spec.chunk_id,
-            #     attempt_index=training_frame_spec.attempt_index,
-            #     event_type=ChunkEventType.FINISHED_LABELING_FRAME,
-            #     frame_id=training_frame_spec.trajectory_frame_id
-            # )
-            
-            # Check if all frames for chunk are done
-            labeled_count = self._traj_db.count_labeled_frames_for_chunk(
-                run_id=self.run_id,
+            frame_future = self.config.executor.submit(
+                self.config.label_task,
+                training_frame_spec
+            )
+            wrapped_future = wrap_future(frame_future)
+            await wrapped_future
+            training_frame_spec = wrapped_future.result()
+            self._traj_db.add_training_frame(
+                run_id=self.config.run_id,
+                trajectory_frame_id=training_frame_spec.trajectory_frame_id,
+                model_version_sampled_from=training_frame_spec.training_frame.model_version,
                 traj_id=training_frame_spec.traj_id,
                 chunk_id=training_frame_spec.chunk_id,
                 attempt_index=training_frame_spec.attempt_index
-            )
-            
-            # if labeled_count >= training_frame_spec.total_frames_in_chunk:
-                # All frames labeled, record FINISHED_LABELING
-                # self._traj_db.record_chunk_event(
-                #     run_id=self.run_id,
-                #     traj_id=training_frame_spec.traj_id,
-                #     chunk_id=training_frame_spec.chunk_id,
-                #     attempt_index=training_frame_spec.attempt_index,
-                #     event_type=ChunkEventType.FINISHED_LABELING
-                # )
-            
-
-            # # Record FINISHED_LABELING_FRAME after successfully adding training frame
-            # self._traj_db.record_chunk_event(
-            #     run_id=self.run_id,
-            #     traj_id=training_frame_spec.traj_id,
-            #     chunk_id=training_frame_spec.chunk_id,
-            #     attempt_index=training_frame_spec.attempt_index,
-            #     event_type=ChunkEventType.FINISHED_LABELING_FRAME,
-            #     frame_id=training_frame_spec.trajectory_frame_id
-            # )
-            
-            # Check if all frames for chunk are done
-            labeled_count = self._traj_db.count_labeled_frames_for_chunk(
-                run_id=self.run_id,
-                traj_id=training_frame_spec.traj_id,
-                chunk_id=training_frame_spec.chunk_id,
-                attempt_index=training_frame_spec.attempt_index
-            )
-            
-            # if labeled_count >= training_frame_spec.total_frames_in_chunk:
-                # All frames labeled, record FINISHED_LABELING
-                # self._traj_db.record_chunk_event(
-                #     run_id=self.run_id,
-                #     traj_id=training_frame_spec.traj_id,
-                #     chunk_id=training_frame_spec.chunk_id,
-                #     attempt_index=training_frame_spec.attempt_index,
-                #     event_type=ChunkEventType.FINISHED_LABELING
-                # )
-            
-            self.logger.info(
-                f"Added training frame to database: traj={training_frame_spec.traj_id}, "
-                f"chunk={training_frame_spec.chunk_id}, attempt={training_frame_spec.attempt_index}, "
-                f"model_version={training_frame_spec.training_frame.model_version}"
             )
 
 

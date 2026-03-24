@@ -15,18 +15,11 @@ class ChunkSpec:
     model_version: int | None = None
 
 
+# todo: rethink this frame/spec model. I am not sure this makes sense anymore
 @dataclass
 class TrainingFrame:
     atoms: Atoms
     model_version: int
-
-
-@dataclass
-class TrajectoryState:
-    atoms: Atoms
-    timestep: int
-    chunk: int
-    attempt: int
 
 
 @dataclass
@@ -48,6 +41,14 @@ class TrainingFrameSpec:
     """Attempt index for this chunk"""
     total_frames_in_chunk: int
     """Total number of frames that will be labeled for this chunk"""
+
+
+@dataclass
+class TrajectoryState:
+    atoms: Atoms
+    timestep: int
+    chunk: int
+    attempt: int
 
 
 @dataclass
