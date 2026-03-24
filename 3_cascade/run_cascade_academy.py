@@ -274,7 +274,14 @@ async def main():
                 retrain_fraction=args.retrain_fraction,
                 retrain_min_frames=args.retrain_min_frames,
             )
-
+            auditor_config = AuditorConfig(
+                audit_task=random_audit,
+                executor=ProcessPoolExecutor(max_workers=10),
+                run_id=run_id,
+                db_url=args.db_url,
+                audit_kwargs=dict(accept_prob=args.accept_rate,),
+                chunk_size=args.chunk_size,
+            )
             sampler_config = SamplerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
@@ -287,13 +294,8 @@ async def main():
             await manager.launch(
                 Auditor,
                 kwargs=dict(
+                    config=auditor_config,
                     sampler=sampler_handle,
-                    audit_task=random_audit,
-                    executor=ProcessPoolExecutor(max_workers=10),
-                    run_id=run_id,
-                    db_url=args.db_url,
-                    audit_kwargs=dict(accept_prob=args.accept_rate,),
-                    chunk_size=args.chunk_size,
                 ),
                 registration=auditor_reg,
             )

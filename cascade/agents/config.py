@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     import numpy as np
     from concurrent.futures import Executor
     from typing import Callable
-    from cascade.model import AdvanceSpec
+    from cascade.model import AdvanceSpec, AuditResult, ChunkSpec
 
 
 @dataclass
@@ -55,7 +55,11 @@ class DynamicsRunnerConfig(CascadeAgentConfig):
 @dataclass
 class AuditorConfig(CascadeAgentConfig):
     """Configuration for DummyAuditor agent"""
-    accept_rate: float
+    run_id: int
+    db_url: str
+    audit_task: Callable[[ChunkSpec], AuditResult]
+    audit_kwargs: dict
+    executor: Executor
     chunk_size: int
 
 

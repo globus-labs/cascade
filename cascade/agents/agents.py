@@ -207,23 +207,15 @@ class Auditor(CascadeAgent):
 
     def __init__(
             self,
-            run_id: int, # todo should every agent have this? for DB reasons?
             sampler: Handle[Sampler],
-            audit_task: Callable[[ChunkSpec], AuditResult],
-            executor: Executor,
-            db_url: str,
-            chunk_size: int,
-            audit_kwargs: dict = None,
+            config=AuditorConfig
     ):
+        self.db_url = config.db_url
         super().__init__()
-        self.run_id = run_id
+        self.config = config
         self.sampler = sampler
         self.queue = Queue()
-        self.audit_task = audit_task
-        self.audit_kwargs = audit_kwargs or {}
-        self.db_url = db_url
-        self.chunk_size = chunk_size
-        self.executor = executor
+        self.chunk_size = config.chunk_size
 
     @action
     async def audit(self, chunk_spec: ChunkSpec, chunk_atoms: list[Atoms]) -> AuditResult:
@@ -231,7 +223,7 @@ class Auditor(CascadeAgent):
         self.logger.info(f'Received chunk {chunk_spec.chunk_id} from traj {chunk_spec.traj_id}')
 
         latest_attempt = self._traj_db.get_latest_chunk_attempt(
-            run_id=self.run_id,
+            run_id=self.config.run_id,
             traj_id=chunk_spec.traj_id,
             chunk_id=chunk_spec.chunk_id
         )
@@ -245,12 +237,12 @@ class Auditor(CascadeAgent):
 
         self.logger.info(f'Submitting audit of chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id} to executor')
 
-        future = self.executor.submit(
-            self.audit_task,
+        future = self.config.executor.submit(
+            self.config.audit_task,
             chunk_atoms=chunk_atoms,
             chunk_spec=chunk_spec,
             attempt_index=latest_attempt['attempt_index'],
-            **self.audit_kwargs
+            **self.config.audit_kwargs
         )
         wrapped_future = wrap_future(future)
         await wrapped_future
@@ -258,7 +250,7 @@ class Auditor(CascadeAgent):
         status = result.status
 
         self._traj_db.update_chunk_audit_done_status(
-            run_id=self.run_id,
+            run_id=self.config.run_id,
             traj_id=result.traj_id,
             chunk_id=result.chunk_id,
             attempt_index=result.attempt_index,
