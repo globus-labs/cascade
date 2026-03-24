@@ -274,25 +274,20 @@ class Auditor(CascadeAgent):
             await self.sampler.submit(spec, chunk_atoms)
         return status
 
+
 class Sampler(CascadeAgent):
 
     def __init__(
         self,
-        run_id: int,
-        db_url: str,
-        n_frames: int,
+        config: SamplerConfig,
         labeler: Handle[DummyLabeler],
-        executor: Executor,
-        sample_task: Callable[..., list[TrainingFrameSpec]],
     ):
+        self.db_url = config.db_url
         super().__init__()
-        self.run_id = run_id
-        self.db_url = db_url
-        self.executor = executor
-        self.n_frames = n_frames
+        self.config = config
         self.queue = Queue()
         self.labeler = labeler
-        self.sample_task = sample_task
+        self.n_frames = config.n_frames
 
     @action
     async def submit(self, chunk_spec: ChunkSpec, chunk_atoms: list[Atoms]):
@@ -317,7 +312,7 @@ class Sampler(CascadeAgent):
             attempt_index = chunk_spec.attempt_index
             if model_version is None or attempt_index is None:
                 latest = self._traj_db.get_latest_chunk_attempt(
-                    self.run_id,
+                    self.config.run_id,
                     chunk_spec.traj_id,
                     chunk_spec.chunk_id,
                 )
@@ -345,25 +340,25 @@ class Sampler(CascadeAgent):
             )
             # Get frame IDs for the sampled frames
             frame_ids = self._traj_db.get_chunk_frame_ids(
-                run_id=self.run_id,
+                run_id=self.config.run_id,
                 traj_id=chunk_spec.traj_id,
                 chunk_id=chunk_spec.chunk_id,
                 attempt_index=attempt_index,
             )
 
-            future = self.executor.submit(
-                self.sample_task,
+            future = self.config.executor.submit(
+                self.config.sample_task,
                 atoms_list=chunk_atoms,
                 frame_ids=frame_ids,
                 chunk_spec=resolved_spec,
                 model_version=model_version,
-                n_frames=self.n_frames,
+                n_frames=self.config.n_frames,
             )
             wrapped_future = wrap_future(future)
             await wrapped_future
             specs = wrapped_future.result()
 
-            if len(specs) != self.n_frames:
+            if len(specs) != self.config.n_frames:
                 self.logger.warning(
                     "Sampling returned %d frames for traj %s chunk %s (attempt %s), "
                     "expected n_frames=%d",

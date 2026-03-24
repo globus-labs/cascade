@@ -285,7 +285,9 @@ async def main():
             sampler_config = SamplerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
-                n_frames=args.n_sample_frames
+                n_frames=args.n_sample_frames,
+                executor=ProcessPoolExecutor(max_workers=10),
+                sample_task=random_sample,
             )
             labeler_config = LabelerConfig(run_id=run_id, db_url=args.db_url)
             trainer_config = TrainerConfig(run_id=run_id, db_url=args.db_url, learner=learner)
@@ -302,12 +304,8 @@ async def main():
             await manager.launch(
                 Sampler,
                 kwargs=dict(
-                    run_id=run_id,
-                    db_url=args.db_url,
-                    n_frames=args.n_sample_frames,
+                    config=sampler_config,
                     labeler=labeler_handle,
-                    executor=ProcessPoolExecutor(max_workers=10),
-                    sample_task=random_sample,
                 ),
                 registration=sampler_reg,
             )

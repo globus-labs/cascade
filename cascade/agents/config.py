@@ -11,7 +11,12 @@ if TYPE_CHECKING:
     import numpy as np
     from concurrent.futures import Executor
     from typing import Callable
-    from cascade.model import AdvanceSpec, AuditResult, ChunkSpec
+    from cascade.model import (
+        AdvanceSpec,
+        AuditResult,
+        ChunkSpec,
+        TrainingFrameSpec
+    )
 
 
 @dataclass
@@ -66,9 +71,11 @@ class AuditorConfig(CascadeAgentConfig):
 @dataclass
 class SamplerConfig(CascadeAgentConfig):
     """Configuration for Sampler agent"""
+    run_id: str
+    db_url: str
     n_frames: int
-    rng: np.random.Generator | None = None
-
+    executor: Executor
+    sample_task: Callable[..., list[TrainingFrameSpec]]
 
 @dataclass
 class LabelerConfig(CascadeAgentConfig):
