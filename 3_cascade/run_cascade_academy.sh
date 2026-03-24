@@ -20,8 +20,8 @@ python run_cascade_academy.py \
         ../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp \
     --chunk-size 10 \
     --target-length 40 \
-    --retrain-len 25 \
-    --retrain-fraction 0.75 \
+    --retrain-len 80 \
+    --retrain-fraction 0.5 \
     --n-sample-frames 5 \
     --accept-rate .5 \
     --learner mace \
