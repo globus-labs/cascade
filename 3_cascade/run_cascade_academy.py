@@ -29,7 +29,7 @@ from cascade.agents.agents import (
     Auditor,
     Sampler,
     Labeler,
-    DummyTrainer
+    Trainer
 )
 from cascade.agents.config import (
     DatabaseConfig,
@@ -47,7 +47,8 @@ from cascade.agents.task import (
     random_audit,
     advance_dynamics,
     random_sample,
-    label_noop
+    label_noop,
+    training_noop
 )
 
 # Suppress FutureWarning about torch.load weights_only parameter from MACE
@@ -251,7 +252,7 @@ async def main():
 
             # register all agents with manager
             db_reg = await manager.register_agent(DatabaseMonitor)
-            trainer_reg = await manager.register_agent(DummyTrainer)
+            trainer_reg = await manager.register_agent(Trainer)
             labeler_reg = await manager.register_agent(Labeler)
             sampler_reg = await manager.register_agent(Sampler)
             auditor_reg = await manager.register_agent(Auditor)
@@ -300,7 +301,15 @@ async def main():
                 executor=ProcessPoolExecutor(max_workers=10),
                 label_task=label_noop
                 )
-            trainer_config = TrainerConfig(run_id=run_id, db_url=args.db_url, learner=learner)
+            trainer_config = TrainerConfig(
+                run_id=run_id,
+                db_url=args.db_url,
+                executor=ProcessPoolExecutor(max_workers=10),
+                training_task=training_noop,
+                training_args=(),
+                training_kwargs={},
+                learner=learner
+            )
 
             # launch all agents
             await manager.launch(
@@ -325,8 +334,8 @@ async def main():
                 registration=labeler_reg,
             )
             await manager.launch(
-                DummyTrainer,
-                kwargs=dict(run_id=run_id, db_url=args.db_url, learner=learner),
+                Trainer,
+                kwargs=dict(config=trainer_config),
                 registration=trainer_reg
             )
 

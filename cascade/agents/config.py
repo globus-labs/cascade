@@ -90,7 +90,13 @@ class LabelerConfig(CascadeAgentConfig):
 @dataclass
 class TrainerConfig(CascadeAgentConfig):
     """Configuration for DummyTrainer agent"""
+    run_id: str
+    db_url: str
+    training_task: Callable[..., bytes]  # todo: come up with a signature
+    training_args: list | tuple
+    training_kwargs: dict
     learner: BaseLearnableForcefield
+    executor: Executor
 
 
 @dataclass

@@ -416,32 +416,28 @@ class Labeler(CascadeAgent):
             )
 
 
-class DummyTrainer(CascadeAgent):
+class Trainer(CascadeAgent):
 
-    def __init__(self,
-                 run_id: int,
-                 db_url: str,
-                 learner: BaseLearnableForcefield
-                 ):
-        self.run_id = run_id
-        self.db_url = db_url
-        self.learner = learner
+    def __init__(self, config):
+        self.db_url = config.db_url
+        super().__init__()
+        self.config = config
 
     @action
     async def train_model(
         self,
         training_round: int,
     ) -> bytes:
-        # Record STARTED_TRAINING event
-        self._traj_db.record_training_event(
-            run_id=self.run_id,
-            event_type=ChunkEventType.STARTED_TRAINING,
-            training_round=training_round
-        )
 
-        calc = mace_mp('small', device='cpu', default_dtype="float32") #todo: mt.2025.11.04 this should be configurable
-        model = calc.models[0]
-        model_msg = self.learner.serialize_model(model)
+        training_future = self.config.executor.submit(
+            self.config.training_task,
+            self.config.learner,
+            *self.config.training_args,
+            **self.config.training_kwargs
+        )
+        wrapped_future = wrap_future(training_future)
+        await wrapped_future
+        model_msg = wrapped_future.result()
         return model_msg
 
 
@@ -451,7 +447,7 @@ class DatabaseMonitor(CascadeAgent):
     def __init__(
         self,
         config: DatabaseMonitorConfig,
-        trainer: Handle[DummyTrainer],
+        trainer: Handle[Trainer],
         dynamics_runners: list[Handle[DynamicsRunner]]
     ):
         self.db_url = config.db_url

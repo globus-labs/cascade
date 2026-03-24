@@ -147,3 +147,14 @@ def advance_dynamics(
 def label_noop(spec: TrainingFrameSpec) -> TrainingFrameSpec:
     """Returns forces from the training frame spec unmodified"""
     return spec
+
+
+# todo: this should be configurable, or at least not hard code magic knowledge
+def training_noop(learner: BaseLearnableForcefield) -> bytes:
+    """just return a model"""
+    from mace.calculators import mace_mp
+
+    calc = mace_mp('small', device='cpu', default_dtype="float32")
+    model = calc.models[0]
+    model_msg = learner.serialize_model(model)
+    return model_msg
