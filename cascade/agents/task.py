@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 from ase.optimize.optimize import Dynamics
 
+
 # can make this a classmethod on some audittask class
 # to get some shared informaiton and inheritance
 def random_audit(
