@@ -6,6 +6,7 @@ from collections import namedtuple
 
 from ase import Atoms
 
+
 @dataclass
 class ChunkSpec:
     traj_id: int
@@ -13,10 +14,12 @@ class ChunkSpec:
     attempt_index: int | None = None
     model_version: int | None = None
 
+
 @dataclass
 class TrainingFrame:
     atoms: Atoms
     model_version: int
+
 
 @dataclass
 class TrajectoryState:
@@ -24,6 +27,7 @@ class TrajectoryState:
     timestep: int
     chunk: int
     attempt: int
+
 
 @dataclass
 class TrainingFrameSpec:
@@ -45,6 +49,7 @@ class TrainingFrameSpec:
     total_frames_in_chunk: int
     """Total number of frames that will be labeled for this chunk"""
 
+
 @dataclass
 class AuditResult:
     """The result of an audit"""
@@ -59,17 +64,20 @@ class AuditResult:
     attempt_index: int
     """The attempt index"""
 
+
 class AuditStatus(Enum):
     """Whether a trajectory chunk is awaiting or has passed/failed an audit"""
     PENDING = auto()
     FAILED = auto()
     PASSED = auto()
 
+
 class TrajectoryStatus(Enum):
     """Lifecycle state for a trajectory."""
     RUNNING = auto()
     COMPLETED = auto()
     FAILED = auto()
+
 
 class ChunkEventType(Enum):
     """Event types tracked for trajectory chunks"""
@@ -88,6 +96,7 @@ class ChunkEventType(Enum):
     STARTED_TRAINING = auto()
     FINISHED_TRAINING = auto()
 
+
 @dataclass
 class TrajectorySpec:
     """Enough information to initialize a trajectory"""
@@ -99,6 +108,7 @@ class TrajectorySpec:
     """The target length of the trajectory"""
     init_atoms: Atoms
     """The initial atoms for the trajectory"""
+
 
 @dataclass
 class AdvanceSpec:
