@@ -230,11 +230,13 @@ async def main():
         )
 
     # set up parsl pool
+    # a chunk can only be in one worker at a time + training happens concurrently
+    n_workers = len(initial_specs)+1
     config = Config(
         executors=[
             HighThroughputExecutor(
                 label="htex_local",
-                cores_per_worker=len(initial_specs),
+                cores_per_worker=n_workers,
                 provider=LocalProvider(
                     init_blocks=1,
                     max_blocks=1,
@@ -244,7 +246,7 @@ async def main():
         usage_tracking=LEVEL_1,
     )
 
-    with ParslPoolExecutor(config=config) as dyn_pool:
+    with ParslPoolExecutor(config=config) as pool:
         async with await Manager.from_exchange_factory(
             factory=LocalExchangeFactory(),
             executors=ThreadPoolExecutor(max_workers=5+len(initial_specs)),
@@ -282,7 +284,7 @@ async def main():
             )
             auditor_config = AuditorConfig(
                 audit_task=random_audit,
-                executor=ProcessPoolExecutor(max_workers=10),
+                executor=pool,
                 run_id=run_id,
                 db_url=args.db_url,
                 audit_kwargs=dict(accept_prob=args.accept_rate,),
@@ -292,19 +294,19 @@ async def main():
                 run_id=run_id,
                 db_url=args.db_url,
                 n_frames=args.n_sample_frames,
-                executor=ProcessPoolExecutor(max_workers=10),
+                executor=pool,
                 sample_task=random_sample,
             )
             labeler_config = LabelerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
-                executor=ProcessPoolExecutor(max_workers=10),
+                executor=pool,
                 label_task=label_noop
                 )
             trainer_config = TrainerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
-                executor=ProcessPoolExecutor(max_workers=10),
+                executor=pool,
                 training_task=training_noop,
                 training_args=(),
                 training_kwargs={},
@@ -340,7 +342,6 @@ async def main():
             )
 
             dyn_handles = []
-            #dyn_pool = ProcessPoolExecutor(max_workers=len(initial_specs))
             for spec in initial_specs:
                 reg = await manager.register_agent(DynamicsRunner)
                 handle = manager.get_handle(reg)
@@ -354,7 +355,7 @@ async def main():
                         traj_id=spec.traj_id,
                         chunk_size=args.chunk_size,
                         n_steps=args.target_length,
-                        executor=dyn_pool,
+                        executor=pool,
                         advance_dynamics_task=advance_dynamics,
                         learner=learner,
                         run_dir=run_dir,
