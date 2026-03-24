@@ -399,6 +399,59 @@ class Labeler(CascadeAgent):
         while not shutdown.is_set():
             training_frame_spec = await self.queue.get()
 
+
+            # Check if STARTED_LABELING exists for this chunk (idempotent)
+            if not self._traj_db.has_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=training_frame_spec.traj_id,
+                chunk_id=training_frame_spec.chunk_id,
+                attempt_index=training_frame_spec.attempt_index,
+                event_type=ChunkEventType.STARTED_LABELING
+            ):
+                self._traj_db.record_chunk_event(
+                    run_id=self.config.run_id,
+                    traj_id=training_frame_spec.traj_id,
+                    chunk_id=training_frame_spec.chunk_id,
+                    attempt_index=training_frame_spec.attempt_index,
+                    event_type=ChunkEventType.STARTED_LABELING
+                )
+
+            # Record STARTED_LABELING_FRAME
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=training_frame_spec.traj_id,
+                chunk_id=training_frame_spec.chunk_id,
+                attempt_index=training_frame_spec.attempt_index,
+                event_type=ChunkEventType.STARTED_LABELING_FRAME,
+                frame_id=training_frame_spec.trajectory_frame_id
+            )
+
+            # Check if STARTED_LABELING exists for this chunk (idempotent)
+            if not self._traj_db.has_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=training_frame_spec.traj_id,
+                chunk_id=training_frame_spec.chunk_id,
+                attempt_index=training_frame_spec.attempt_index,
+                event_type=ChunkEventType.STARTED_LABELING
+            ):
+                self._traj_db.record_chunk_event(
+                    run_id=self.config.run_id,
+                    traj_id=training_frame_spec.traj_id,
+                    chunk_id=training_frame_spec.chunk_id,
+                    attempt_index=training_frame_spec.attempt_index,
+                    event_type=ChunkEventType.STARTED_LABELING
+                )
+
+            # Record STARTED_LABELING_FRAME
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=training_frame_spec.traj_id,
+                chunk_id=training_frame_spec.chunk_id,
+                attempt_index=training_frame_spec.attempt_index,
+                event_type=ChunkEventType.STARTED_LABELING_FRAME,
+                frame_id=training_frame_spec.trajectory_frame_id
+            )
+
             frame_future = self.config.executor.submit(
                 self.config.label_task,
                 training_frame_spec
@@ -414,6 +467,42 @@ class Labeler(CascadeAgent):
                 chunk_id=training_frame_spec.chunk_id,
                 attempt_index=training_frame_spec.attempt_index
             )
+
+            # Record FINISHED_LABELING_FRAME after successfully adding training frame
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=training_frame_spec.traj_id,
+                chunk_id=training_frame_spec.chunk_id,
+                attempt_index=training_frame_spec.attempt_index,
+                event_type=ChunkEventType.FINISHED_LABELING_FRAME,
+                frame_id=training_frame_spec.trajectory_frame_id
+            )
+
+            # Check if all frames for chunk are done
+            labeled_count = self._traj_db.count_labeled_frames_for_chunk(
+                run_id=self.config.run_id,
+                traj_id=training_frame_spec.traj_id,
+                chunk_id=training_frame_spec.chunk_id,
+                attempt_index=training_frame_spec.attempt_index
+            )
+
+            if labeled_count >= training_frame_spec.total_frames_in_chunk:
+                # All frames labeled, record FINISHED_LABELING
+                self._traj_db.record_chunk_event(
+                    run_id=self.config.run_id,
+                    traj_id=training_frame_spec.traj_id,
+                    chunk_id=training_frame_spec.chunk_id,
+                    attempt_index=training_frame_spec.attempt_index,
+                    event_type=ChunkEventType.FINISHED_LABELING
+                )
+
+            self.logger.info(
+                f"Added training frame to database: traj={training_frame_spec.traj_id}, "
+                f"chunk={training_frame_spec.chunk_id}, attempt={training_frame_spec.attempt_index}, "
+                f"model_version={training_frame_spec.training_frame.model_version}"
+            )
+
+
 
 
 class Trainer(CascadeAgent):
@@ -516,15 +605,15 @@ class DatabaseMonitor(CascadeAgent):
             )
             sampled_fraction = active_with_labeling / total_active if total_active > 0 else 0.
 
-            self.logger.info(
-                f"Retrain check: new training frames={new_frames}, active trajectories={total_active}, trajectories with labeled frames={active_with_labeling}, "
-                f"fraction={sampled_fraction:.2%}"
-            )
-
             # Determine which condition triggered retraining
             absolute_condition = new_frames >= self.retrain_len
             fraction_condition = sampled_fraction >= self.retrain_fraction
             should_retrain = absolute_condition or fraction_condition
+
+            self.logger.info(
+                f"Retrain check: new training frames={new_frames}, active trajectories={total_active}, trajectories with labeled frames={active_with_labeling}, "
+                f"fraction={sampled_fraction:.2%}, should_retrain={should_retrain}"
+            )
 
             if should_retrain:
                 trigger_reason = []
