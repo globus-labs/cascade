@@ -236,7 +236,7 @@ async def main():
         executors=[
             HighThroughputExecutor(
                 label="htex_local",
-                cores_per_worker=n_workers,
+                max_workers_per_node=n_workers,
                 provider=LocalProvider(
                     init_blocks=1,
                     max_blocks=1,
