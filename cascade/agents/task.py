@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from cascade.model import ChunkSpec, AuditResult
+    from cascade.model import ChunkSpec, AuditResult, Chunk
     from cascade.model import AdvanceSpec, TrainingFrameSpec
     from cascade.learning.base import BaseLearnableForcefield
     from ase import Atoms
@@ -14,9 +14,7 @@ from ase.optimize.optimize import Dynamics
 # can make this a classmethod on some audittask class
 # to get some shared informaiton and inheritance
 def random_audit(
-    chunk_atoms: list[Atoms],
-    chunk_spec: ChunkSpec,
-    attempt_index: int,
+    chunk: Chunk,
     accept_prob: float = 0.5,
     sleep_time: float = 0.,
 ) -> AuditResult:
@@ -35,17 +33,14 @@ def random_audit(
     passed = rng.random() < accept_prob
     score = rng.random() if passed else 0.0
     status = AuditStatus.PASSED if passed else AuditStatus.FAILED
-    return AuditResult(status=status, score=score, traj_id=chunk_spec.traj_id, chunk_id=chunk_spec.chunk_id, attempt_index=attempt_index)
+    return AuditResult(status=status, score=score, traj_id=chunk.traj_id, chunk_id=spec.chunk_id, attempt_index=attempt_index)
 
 
 def random_sample(
-    atoms_list: list[Atoms],
-    frame_ids: list[int],
-    chunk_spec: ChunkSpec,
-    model_version: int,
+    chunk: Chunk,
     n_frames: int,
     sleep_time: float = 0.,
-) -> list:
+) -> list[TrainingFrame]:
     """Random sample of frames from a chunk.
 
     Intended to be used as a stub for a real sampling function.
@@ -58,23 +53,16 @@ def random_sample(
     # Create a new random generator seeded with OS entropy to ensure
     # each worker process gets a unique random state
     rng = np.random.default_rng(seed=None)
-    n_sample = min(n_frames, len(atoms_list))
-    indices = rng.choice(len(atoms_list), size=n_sample, replace=False)
-    sampled_frames = [atoms_list[i] for i in indices]
-    sampled_frame_ids = [frame_ids[i] for i in indices]
-
+    n_sample = min(n_frames, len(chunk.atoms))
+    indices = rng.choice(len(chunk.atoms), size=n_sample, replace=False)
     result = []
-    for frame, trajectory_frame_id in zip(sampled_frames, sampled_frame_ids):
-        training_frame = TrainingFrame(atoms=frame, model_version=model_version)
-        spec = TrainingFrameSpec(
-            training_frame=training_frame,
-            trajectory_frame_id=trajectory_frame_id,
-            traj_id=chunk_spec.traj_id,
-            chunk_id=chunk_spec.chunk_id,
-            attempt_index=chunk_spec.attempt_index,
-            total_frames_in_chunk=n_sample,
+    for i in indices:
+        result.append(
+            TrainingFrame(
+                atoms=chunk.atoms[i],
+                model_version=chunk.model_version,
+            )
         )
-        result.append(spec)
     return result
 
 

@@ -7,6 +7,23 @@ from collections import namedtuple
 from ase import Atoms
 
 
+
+@dataclass
+class Chunk:
+    atoms: list[Atoms]
+    traj_id: int
+    chunk_id: int
+    attempt_ix: int
+    model_version: int
+
+
+@dataclass
+class AuditResult:
+    """The result of an audit"""
+    status: AuditStatus
+    """Whether the chunk passed audit"""
+    score: float
+
 @dataclass
 class ChunkSpec:
     traj_id: int
@@ -20,6 +37,7 @@ class ChunkSpec:
 class TrainingFrame:
     atoms: Atoms
     model_version: int
+    labeled: bool = False
 
 
 @dataclass
@@ -51,19 +69,7 @@ class TrajectoryState:
     attempt: int
 
 
-@dataclass
-class AuditResult:
-    """The result of an audit"""
-    status: AuditStatus
-    """Whether the chunk passed audit"""
-    score: float
-    """The score assigned by the auditor"""
-    traj_id: int
-    """The trajectory ID"""
-    chunk_id: int
-    """The chunk ID""" 
-    attempt_index: int
-    """The attempt index"""
+
 
 
 class AuditStatus(Enum):

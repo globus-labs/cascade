@@ -31,7 +31,7 @@ from cascade.agents.config import (
     DynamicsRunnerConfig
 )
 from cascade.agents.db_orm import TrajectoryDB
-from cascade.model import ChunkSpec, TrainingFrameSpec
+from cascade.model import ChunkSpec, TrainingFrameSpec, Chunk
 
 if TYPE_CHECKING:
     from typing import Callable
@@ -86,7 +86,7 @@ class DynamicsRunner(CascadeAgent):
 
         # track progress
         self.timestep = 0
-        self.chunk = 0
+        self.chunk_ix = 0
         self.attempt = 0
         self.done = False
 
@@ -111,7 +111,7 @@ class DynamicsRunner(CascadeAgent):
                 steps=self.chunk_size,
                 run_id=self.config.run_id,
                 traj_id=self.config.traj_id,
-                chunk_id=self.chunk,
+                chunk_id=self.chunk_ix,
                 attempt_index=self.attempt,
             )
 
@@ -150,10 +150,10 @@ class DynamicsRunner(CascadeAgent):
             # get future result
             wrapped_future = wrap_future(chunk_future)
             await wrapped_future
-            chunk = wrapped_future.result()
+            chunk_atoms = wrapped_future.result()
 
             # write atoms # todo wrap this up
-            for frame_index, _atoms in enumerate(chunk):
+            for frame_index, _atoms in enumerate(chunk_atoms):
                 frame_index += self.timestep
                 self._traj_db.write_frame(
                     run_id=spec.run_id,
@@ -166,30 +166,36 @@ class DynamicsRunner(CascadeAgent):
             self.logger.info(f"Finished dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
 
             # submit to auditor
-            chunk_spec = ChunkSpec(traj_id=self.config.traj_id, chunk_id=self.chunk)
+            chunk = Chunk(
+                atoms=chunk_atoms,
+                traj_id=self.config.traj_id,
+                chunk_id=self.chunk_ix,
+                attempt_ix=self.attempt_ix,
+                model_version=self.model_version
+            )
             self.logger.info(f"Submitting audit for traj {self.config.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
-            audit_status = await self.auditor.audit(chunk_spec, chunk)
+            audit_result = await self.auditor.audit(chunk)
 
             # handle audit result
-            if audit_status == AuditStatus.PASSED:
+            if audit_result.status == AuditStatus.PASSED:
 
-                self.logger.info(f"Audit status passed for traj {self.config.traj_id} chunk {self.chunk} attempt {self.attempt}")
+                self.logger.info(f"Audit status passed for traj {self.config.traj_id} chunk {self.chunk_ix} attempt {self.attempt}")
                 self.timestep += self.chunk_size
                 self.logger.info(f"On timestep {self.timestep} of {self.config.n_steps}")
                 self.done = self.timestep >= self.config.n_steps
                 if self.done:
-                    self.logger.info(f"Finished dynamics for traj {self.config.traj_id} on {self.chunk} attempt {self.attempt}, shutting down")
+                    self.logger.info(f"Finished dynamics for traj {self.config.traj_id} on {self.chunk_ix} attempt {self.attempt}, shutting down")
                     self._traj_db.mark_trajectory_completed(run_id=self.config.run_id, traj_id=self.config.traj_id)
                     self.agent_shutdown()
                 else:
                     # audit passed but not done, use the new atoms to run a new chunk
-                    self.atoms = chunk[-1]
-                    self.chunk += 1
+                    self.atoms = chunk_atoms[-1]
+                    self.chunk_ix += 1
                     self.attempt = 0
-                    self.logger.info(f"Updating traj {self.config.traj_id} to chunk {self.chunk} attempt {self.attempt}")
+                    self.logger.info(f"Updating traj {self.config.traj_id} to chunk {self.chunk_ix} attempt {self.attempt}")
             else:
-                # audit failed, try a new attempt once new model is received
-                self.logger.info(f'Audit status failed for traj {self.config.traj_id} chunk {self.chunk} attempt {self.attempt}, waiting for new weights...')
+                # audit failed
+                self.logger.info(f'Audit status failed for traj {self.config.traj_id} chunk {self.chunk_ix} attempt {self.attempt}, waiting for new weights...')
                 self.attempt += 1
                 self.received_weights.clear()
                 await self.received_weights.wait()
@@ -218,30 +224,13 @@ class Auditor(CascadeAgent):
         self.chunk_size = config.chunk_size
 
     @action
-    async def audit(self, chunk_spec: ChunkSpec, chunk_atoms: list[Atoms]) -> AuditResult:
+    async def audit(self, chunk: Chunk) -> AuditResult:
         """Submit a chunk for audit"""
-        self.logger.info(f'Received chunk {chunk_spec.chunk_id} from traj {chunk_spec.traj_id}')
-
-        latest_attempt = self._traj_db.get_latest_chunk_attempt(
-            run_id=self.config.run_id,
-            traj_id=chunk_spec.traj_id,
-            chunk_id=chunk_spec.chunk_id
-        )
-        if not latest_attempt:
-            self.logger.warning(
-                'No attempt metadata found for traj %s chunk %s; skipping audit',
-                chunk_spec.traj_id,
-                chunk_spec.chunk_id,
-            )
-            return
-
-        self.logger.info(f'Submitting audit of chunk {chunk_spec.chunk_id} of traj {chunk_spec.traj_id} to executor')
+        self.logger.info(f'Submitting audit of traj {chunk.traj_id} chunk {chunk.chunk_id} attempt {chunk.attempt_ix} to executor')
 
         future = self.config.executor.submit(
             self.config.audit_task,
-            chunk_atoms=chunk_atoms,
-            chunk_spec=chunk_spec,
-            attempt_index=latest_attempt['attempt_index'],
+            chunk,
             **self.config.audit_kwargs
         )
         wrapped_future = wrap_future(future)
@@ -265,13 +254,8 @@ class Auditor(CascadeAgent):
             self.logger.info(
                 f'Audit failed for traj {result.traj_id} chunk {result.chunk_id} attempt {result.attempt_index}'
             )
-            spec = ChunkSpec(
-                traj_id=result.traj_id,
-                chunk_id=result.chunk_id,
-                attempt_index=result.attempt_index
-            )
             self.logger.info(f'Submitting failed chunk {result.chunk_id} of traj {result.traj_id} to sampler')
-            await self.sampler.submit(spec, chunk_atoms)
+            asyncio.create_task(self.sampler.submit(chunk))
         return status
 
 
@@ -289,91 +273,41 @@ class Sampler(CascadeAgent):
         self.labeler = labeler
         self.n_frames = config.n_frames
 
-    @action
-    async def submit(self, chunk_spec: ChunkSpec, chunk_atoms: list[Atoms]):
-        await self.queue.put((chunk_spec, chunk_atoms))
-
-    @loop
     async def sample_frames(
         self,
-        shutdown: asyncio.Event
+        chunk: Chunk,
     ) -> None:
-        while not shutdown.is_set():
-            chunk_spec, chunk_atoms = await self.queue.get()
 
+        self.logger.info(
+            f'Sampling frames from traj {chunk.traj_id} '
+            f'chunk {chunk.chunk_id} '
+            f'attempt {chunk.attempt_ix}'
+        )
+        future = self.config.executor.submit(
+            self.config.sample_task,
+            chunk,
+            n_frames=self.config.n_frames,
+        )
+        wrapped_future = wrap_future(future)
+        await wrapped_future
+        training_frames = wrapped_future.result()
+
+        if len(training_frames) != self.config.n_frames:
+            self.logger.warning(
+                "Sampling returned %d frames for traj %s chunk %s (attempt %s), "
+                "expected n_frames=%d",
+                len(training_frames),
+                chunk.traj_id,
+                chunk.chunk_id,
+                chunk.attempt_ix,
+                self.n_frames,
+            )
+        for frame in training_frames:
             self.logger.info(
-                f'Sampling frames from chunk {chunk_spec.chunk_id} of '
-                f'traj {chunk_spec.traj_id}'
+                f'Submitting training frame from traj {chunk.traj_id} '
+                f'chunk {chunk.chunk_id} attempt {chunk.attempt_ix} to labeler'
             )
-
-            # Resolve model_version and attempt_index (auditor submits ChunkSpec
-            # without model_version; we store it in chunk metadata)
-            model_version = chunk_spec.model_version
-            attempt_index = chunk_spec.attempt_index
-            if model_version is None or attempt_index is None:
-                latest = self._traj_db.get_latest_chunk_attempt(
-                    self.config.run_id,
-                    chunk_spec.traj_id,
-                    chunk_spec.chunk_id,
-                )
-                if latest is not None:
-                    if model_version is None:
-                        model_version = latest.get('model_version')
-                    if attempt_index is None:
-                        attempt_index = latest['attempt_index']
-            if model_version is None:
-                self.logger.warning(
-                    "Cannot determine model_version for traj %s chunk %s "
-                    "(attempt %s), skipping",
-                    chunk_spec.traj_id,
-                    chunk_spec.chunk_id,
-                    attempt_index,
-                )
-                continue
-
-            # Ensure we have attempt_index for downstream use
-            resolved_spec = ChunkSpec(
-                traj_id=chunk_spec.traj_id,
-                chunk_id=chunk_spec.chunk_id,
-                attempt_index=attempt_index,
-                model_version=model_version,
-            )
-            # Get frame IDs for the sampled frames
-            frame_ids = self._traj_db.get_chunk_frame_ids(
-                run_id=self.config.run_id,
-                traj_id=chunk_spec.traj_id,
-                chunk_id=chunk_spec.chunk_id,
-                attempt_index=attempt_index,
-            )
-
-            future = self.config.executor.submit(
-                self.config.sample_task,
-                atoms_list=chunk_atoms,
-                frame_ids=frame_ids,
-                chunk_spec=resolved_spec,
-                model_version=model_version,
-                n_frames=self.config.n_frames,
-            )
-            wrapped_future = wrap_future(future)
-            await wrapped_future
-            specs = wrapped_future.result()
-
-            if len(specs) != self.config.n_frames:
-                self.logger.warning(
-                    "Sampling returned %d frames for traj %s chunk %s (attempt %s), "
-                    "expected n_frames=%d",
-                    len(specs),
-                    chunk_spec.traj_id,
-                    chunk_spec.chunk_id,
-                    chunk_spec.attempt_index,
-                    self.n_frames,
-                )
-            for spec in specs:
-                self.logger.info(
-                    f'Submitting training frame from traj {chunk_spec.traj_id} '
-                    f'chunk {chunk_spec.chunk_id} to labeler'
-                )
-                await self.labeler.submit(spec)
+            asyncio.create_task(self.labeler.label_data(frame))
 
 
 class Labeler(CascadeAgent):
@@ -387,122 +321,110 @@ class Labeler(CascadeAgent):
         self.config = config
         self.queue = Queue()
 
-    @action
-    async def submit(self, training_frame_spec: TrainingFrameSpec) -> None:
-        self.logger.info(f'Received training frame (trajectory_frame_id={training_frame_spec.trajectory_frame_id})')
-        await self.queue.put(training_frame_spec)
-
     @loop
-    async def label_data(self, shutdown: asyncio.Event) -> None:
+    async def label_data(self, frame: TrainingFrame) -> None:
 
-        # todo: is there any reason not to just do this in the submit?
-        while not shutdown.is_set():
-            training_frame_spec = await self.queue.get()
-
-
-            # Check if STARTED_LABELING exists for this chunk (idempotent)
-            if not self._traj_db.has_chunk_event(
+        # Check if STARTED_LABELING exists for this chunk (idempotent)
+        if not self._traj_db.has_chunk_event(
+            run_id=self.config.run_id,
+            traj_id=frame.traj_id,
+            chunk_id=frame.chunk_id,
+            attempt_index=frame.attempt_index,
+            event_type=ChunkEventType.STARTED_LABELING
+        ):
+            self._traj_db.record_chunk_event(
                 run_id=self.config.run_id,
-                traj_id=training_frame_spec.traj_id,
-                chunk_id=training_frame_spec.chunk_id,
-                attempt_index=training_frame_spec.attempt_index,
+                traj_id=frame.traj_id,
+                chunk_id=frame.chunk_id,
+                attempt_index=frame.attempt_index,
                 event_type=ChunkEventType.STARTED_LABELING
-            ):
-                self._traj_db.record_chunk_event(
-                    run_id=self.config.run_id,
-                    traj_id=training_frame_spec.traj_id,
-                    chunk_id=training_frame_spec.chunk_id,
-                    attempt_index=training_frame_spec.attempt_index,
-                    event_type=ChunkEventType.STARTED_LABELING
-                )
-
-            # Record STARTED_LABELING_FRAME
-            self._traj_db.record_chunk_event(
-                run_id=self.config.run_id,
-                traj_id=training_frame_spec.traj_id,
-                chunk_id=training_frame_spec.chunk_id,
-                attempt_index=training_frame_spec.attempt_index,
-                event_type=ChunkEventType.STARTED_LABELING_FRAME,
-                frame_id=training_frame_spec.trajectory_frame_id
             )
 
-            # Check if STARTED_LABELING exists for this chunk (idempotent)
-            if not self._traj_db.has_chunk_event(
+        # Record STARTED_LABELING_FRAME
+        self._traj_db.record_chunk_event(
+            run_id=self.config.run_id,
+            traj_id=frame.traj_id,
+            chunk_id=frame.chunk_id,
+            attempt_index=frame.attempt_index,
+            event_type=ChunkEventType.STARTED_LABELING_FRAME,
+            frame_id=frame.trajectory_frame_id
+        )
+
+        # Check if STARTED_LABELING exists for this chunk (idempotent)
+        if not self._traj_db.has_chunk_event(
+            run_id=self.config.run_id,
+            traj_id=frame.traj_id,
+            chunk_id=frame.chunk_id,
+            attempt_index=frame.attempt_index,
+            event_type=ChunkEventType.STARTED_LABELING
+        ):
+            self._traj_db.record_chunk_event(
                 run_id=self.config.run_id,
-                traj_id=training_frame_spec.traj_id,
-                chunk_id=training_frame_spec.chunk_id,
-                attempt_index=training_frame_spec.attempt_index,
+                traj_id=frame.traj_id,
+                chunk_id=frame.chunk_id,
+                attempt_index=frame.attempt_index,
                 event_type=ChunkEventType.STARTED_LABELING
-            ):
-                self._traj_db.record_chunk_event(
-                    run_id=self.config.run_id,
-                    traj_id=training_frame_spec.traj_id,
-                    chunk_id=training_frame_spec.chunk_id,
-                    attempt_index=training_frame_spec.attempt_index,
-                    event_type=ChunkEventType.STARTED_LABELING
-                )
+            )
 
-            # Record STARTED_LABELING_FRAME
+        # Record STARTED_LABELING_FRAME
+        self._traj_db.record_chunk_event(
+            run_id=self.config.run_id,
+            traj_id=frame.traj_id,
+            chunk_id=frame.chunk_id,
+            attempt_index=frame.attempt_index,
+            event_type=ChunkEventType.STARTED_LABELING_FRAME,
+            frame_id=frame.trajectory_frame_id
+        )
+
+        frame_future = self.config.executor.submit(
+            self.config.label_task,
+            frame
+        )
+        wrapped_future = wrap_future(frame_future)
+        await wrapped_future
+        frame = wrapped_future.result()
+        self._traj_db.add_training_frame(
+            run_id=self.config.run_id,
+            trajectory_frame_id=frame.trajectory_frame_id,
+            model_version_sampled_from=frame.training_frame.model_version,
+            traj_id=frame.traj_id,
+            chunk_id=frame.chunk_id,
+            attempt_index=frame.attempt_index
+        )
+
+        # Record FINISHED_LABELING_FRAME after successfully adding training frame
+        self._traj_db.record_chunk_event(
+            run_id=self.config.run_id,
+            traj_id=frame.traj_id,
+            chunk_id=frame.chunk_id,
+            attempt_index=frame.attempt_index,
+            event_type=ChunkEventType.FINISHED_LABELING_FRAME,
+            frame_id=frame.trajectory_frame_id
+        )
+
+        # Check if all frames for chunk are done
+        labeled_count = self._traj_db.count_labeled_frames_for_chunk(
+            run_id=self.config.run_id,
+            traj_id=frame.traj_id,
+            chunk_id=frame.chunk_id,
+            attempt_index=frame.attempt_index
+        )
+
+        if labeled_count >= frame.total_frames_in_chunk:
+            # All frames labeled, record FINISHED_LABELING
             self._traj_db.record_chunk_event(
                 run_id=self.config.run_id,
-                traj_id=training_frame_spec.traj_id,
-                chunk_id=training_frame_spec.chunk_id,
-                attempt_index=training_frame_spec.attempt_index,
-                event_type=ChunkEventType.STARTED_LABELING_FRAME,
-                frame_id=training_frame_spec.trajectory_frame_id
+                traj_id=frame.traj_id,
+                chunk_id=frame.chunk_id,
+                attempt_index=frame.attempt_index,
+                event_type=ChunkEventType.FINISHED_LABELING
             )
 
-            frame_future = self.config.executor.submit(
-                self.config.label_task,
-                training_frame_spec
-            )
-            wrapped_future = wrap_future(frame_future)
-            await wrapped_future
-            training_frame_spec = wrapped_future.result()
-            self._traj_db.add_training_frame(
-                run_id=self.config.run_id,
-                trajectory_frame_id=training_frame_spec.trajectory_frame_id,
-                model_version_sampled_from=training_frame_spec.training_frame.model_version,
-                traj_id=training_frame_spec.traj_id,
-                chunk_id=training_frame_spec.chunk_id,
-                attempt_index=training_frame_spec.attempt_index
-            )
-
-            # Record FINISHED_LABELING_FRAME after successfully adding training frame
-            self._traj_db.record_chunk_event(
-                run_id=self.config.run_id,
-                traj_id=training_frame_spec.traj_id,
-                chunk_id=training_frame_spec.chunk_id,
-                attempt_index=training_frame_spec.attempt_index,
-                event_type=ChunkEventType.FINISHED_LABELING_FRAME,
-                frame_id=training_frame_spec.trajectory_frame_id
-            )
-
-            # Check if all frames for chunk are done
-            labeled_count = self._traj_db.count_labeled_frames_for_chunk(
-                run_id=self.config.run_id,
-                traj_id=training_frame_spec.traj_id,
-                chunk_id=training_frame_spec.chunk_id,
-                attempt_index=training_frame_spec.attempt_index
-            )
-
-            if labeled_count >= training_frame_spec.total_frames_in_chunk:
-                # All frames labeled, record FINISHED_LABELING
-                self._traj_db.record_chunk_event(
-                    run_id=self.config.run_id,
-                    traj_id=training_frame_spec.traj_id,
-                    chunk_id=training_frame_spec.chunk_id,
-                    attempt_index=training_frame_spec.attempt_index,
-                    event_type=ChunkEventType.FINISHED_LABELING
-                )
-
-            self.logger.info(
-                f"Added training frame to database: traj={training_frame_spec.traj_id}, "
-                f"chunk={training_frame_spec.chunk_id}, attempt={training_frame_spec.attempt_index}, "
-                f"model_version={training_frame_spec.training_frame.model_version}"
-            )
-
-
+        self.logger.info(
+            f"Added training frame to database: traj={frame.traj_id}, "
+            f"chunk={frame.chunk_id}, attempt={frame.attempt_index}, "
+            f"model_version={frame.training_frame.model_version}"
+        )
 
 
 class Trainer(CascadeAgent):
