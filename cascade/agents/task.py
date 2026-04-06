@@ -33,7 +33,7 @@ def random_audit(
     passed = rng.random() < accept_prob
     score = rng.random() if passed else 0.0
     status = AuditStatus.PASSED if passed else AuditStatus.FAILED
-    return AuditResult(status=status, score=score, traj_id=chunk.traj_id, chunk_id=spec.chunk_id, attempt_index=attempt_index)
+    return AuditResult(status=status, score=score)
 
 
 def random_sample(

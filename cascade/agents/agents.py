@@ -31,7 +31,7 @@ from cascade.agents.config import (
     DynamicsRunnerConfig
 )
 from cascade.agents.db_orm import TrajectoryDB
-from cascade.model import ChunkSpec, TrainingFrameSpec, Chunk
+from cascade.model import ChunkSpec, TrainingFrameSpec, Chunk, TrainingFrame
 
 if TYPE_CHECKING:
     from typing import Callable
@@ -170,7 +170,7 @@ class DynamicsRunner(CascadeAgent):
                 atoms=chunk_atoms,
                 traj_id=self.config.traj_id,
                 chunk_id=self.chunk_ix,
-                attempt_ix=self.attempt_ix,
+                attempt_ix=self.attempt,
                 model_version=self.model_version
             )
             self.logger.info(f"Submitting audit for traj {self.config.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
@@ -220,7 +220,6 @@ class Auditor(CascadeAgent):
         super().__init__()
         self.config = config
         self.sampler = sampler
-        self.queue = Queue()
         self.chunk_size = config.chunk_size
 
     @action
@@ -240,23 +239,23 @@ class Auditor(CascadeAgent):
 
         self._traj_db.update_chunk_audit_done_status(
             run_id=self.config.run_id,
-            traj_id=result.traj_id,
-            chunk_id=result.chunk_id,
-            attempt_index=result.attempt_index,
+            traj_id=chunk.traj_id,
+            chunk_id=chunk.chunk_id,
+            attempt_index=chunk.attempt_ix,
             audit_status=status
         )
         if status == AuditStatus.PASSED:
             self.logger.info(
-                f'Audit passed for traj {result.traj_id} chunk {result.chunk_id} attempt {result.attempt_index}'
+                f'Audit passed for traj {chunk.traj_id} chunk {chunk.chunk_id} attempt {chunk.attempt_ix}'
             )
         else:
             # audit failed, submit to sampler
             self.logger.info(
-                f'Audit failed for traj {result.traj_id} chunk {result.chunk_id} attempt {result.attempt_index}'
+                f'Audit failed for traj {chunk.traj_id} chunk {chunk.chunk_id} attempt {chunk.attempt_ix}'
             )
-            self.logger.info(f'Submitting failed chunk {result.chunk_id} of traj {result.traj_id} to sampler')
+            self.logger.info(f'Submitting failed chunk {chunk.chunk_id} of traj {chunk.traj_id} to sampler')
             asyncio.create_task(self.sampler.submit(chunk))
-        return status
+        return result
 
 
 class Sampler(CascadeAgent):
@@ -269,7 +268,6 @@ class Sampler(CascadeAgent):
         self.db_url = config.db_url
         super().__init__()
         self.config = config
-        self.queue = Queue()
         self.labeler = labeler
         self.n_frames = config.n_frames
 
@@ -319,9 +317,7 @@ class Labeler(CascadeAgent):
         self.db_url = config.db_url
         super().__init__()
         self.config = config
-        self.queue = Queue()
 
-    @loop
     async def label_data(self, frame: TrainingFrame) -> None:
 
         # Check if STARTED_LABELING exists for this chunk (idempotent)
