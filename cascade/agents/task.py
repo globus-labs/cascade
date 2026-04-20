@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from cascade.model import ChunkSpec, AuditResult, Chunk
-    from cascade.model import AdvanceSpec, TrainingFrameSpec
+    from cascade.model import AdvanceSpec, TrainingFrame
     from cascade.learning.base import BaseLearnableForcefield
     from ase import Atoms
     from pathlib import Path
@@ -45,7 +45,7 @@ def random_sample(
 
     Intended to be used as a stub for a real sampling function.
     """
-    from cascade.model import TrainingFrame, TrainingFrameSpec
+    from cascade.model import TrainingFrame
     import time
     import numpy as np
 
@@ -60,7 +60,11 @@ def random_sample(
         result.append(
             TrainingFrame(
                 atoms=chunk.atoms[i],
+                chunk_id=chunk.chunk_id,
                 model_version=chunk.model_version,
+                traj_id=chunk.traj_id,
+                attempt_ix=chunk.attempt_ix,
+                frame_ix=i
             )
         )
     return result
@@ -132,7 +136,7 @@ def advance_dynamics(
     return frames
 
 
-def label_noop(spec: TrainingFrameSpec) -> TrainingFrameSpec:
+def label_noop(spec: TrainingFrame) -> TrainingFrame:
     """Returns forces from the training frame spec unmodified"""
     return spec
 

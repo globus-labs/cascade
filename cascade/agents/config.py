@@ -14,8 +14,8 @@ if TYPE_CHECKING:
     from cascade.model import (
         AdvanceSpec,
         AuditResult,
-        ChunkSpec,
-        TrainingFrameSpec
+        TrainingFrame,
+        Chunk
     )
 
 
@@ -62,7 +62,7 @@ class AuditorConfig(CascadeAgentConfig):
     """Configuration for DummyAuditor agent"""
     run_id: int
     db_url: str
-    audit_task: Callable[[ChunkSpec], AuditResult]
+    audit_task: Callable[[Chunk], AuditResult]
     audit_kwargs: dict
     executor: Executor
     chunk_size: int
@@ -75,7 +75,7 @@ class SamplerConfig(CascadeAgentConfig):
     db_url: str
     n_frames: int
     executor: Executor
-    sample_task: Callable[..., list[TrainingFrameSpec]]
+    sample_task: Callable[..., list[TrainingFrame]]
 
 
 @dataclass
@@ -84,7 +84,7 @@ class LabelerConfig(CascadeAgentConfig):
     run_id: str
     db_url: str
     executor: Executor
-    label_task: Callable[TrainingFrameSpec, TrainingFrameSpec]
+    label_task: Callable[TrainingFrame, TrainingFrame]
 
 
 @dataclass
