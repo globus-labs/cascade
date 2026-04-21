@@ -254,7 +254,7 @@ class Auditor(CascadeAgent):
                 f'Audit failed for traj {chunk.traj_id} chunk {chunk.chunk_id} attempt {chunk.attempt_ix}'
             )
             self.logger.info(f'Submitting failed chunk {chunk.chunk_id} of traj {chunk.traj_id} to sampler')
-            asyncio.create_task(self.sampler.submit(chunk))
+            asyncio.create_task(self.sampler.sample_frames(chunk))
         return result
 
 
@@ -271,6 +271,7 @@ class Sampler(CascadeAgent):
         self.labeler = labeler
         self.n_frames = config.n_frames
 
+    @action
     async def sample_frames(
         self,
         chunk: Chunk,
