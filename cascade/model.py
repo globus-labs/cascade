@@ -11,6 +11,8 @@ from ase import Atoms
 @dataclass
 class Chunk:
     atoms: list[Atoms]
+    frame_ids: list[int]
+    """this is a list of db keys. it might be good to get rid of this."""
     traj_id: int
     chunk_id: int
     attempt_ix: int
@@ -37,6 +39,7 @@ class ChunkSpec:
 class TrainingFrame:
     atoms: Atoms
     model_version: int
+    frame_id: int
     labeled: bool = False
 
 
@@ -67,10 +70,6 @@ class TrajectoryState:
     timestep: int
     chunk: int
     attempt: int
-
-
-
-
 
 class AuditStatus(Enum):
     """Whether a trajectory chunk is awaiting or has passed/failed an audit"""

@@ -153,9 +153,10 @@ class DynamicsRunner(CascadeAgent):
             chunk_atoms = wrapped_future.result()
 
             # write atoms # todo wrap this up
+            frame_ids = []
             for frame_index, _atoms in enumerate(chunk_atoms):
                 frame_index += self.timestep
-                self._traj_db.write_frame(
+                _id = self._traj_db.write_frame(
                     run_id=spec.run_id,
                     traj_id=spec.traj_id,
                     chunk_id=spec.chunk_id,
@@ -163,11 +164,13 @@ class DynamicsRunner(CascadeAgent):
                     frame_index=frame_index,
                     atoms=_atoms
                 )
+                frame_ids.append(_id)
             self.logger.info(f"Finished dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
 
             # submit to auditor
             chunk = Chunk(
                 atoms=chunk_atoms,
+                frame_ids=frame_ids,
                 traj_id=self.config.traj_id,
                 chunk_id=self.chunk_ix,
                 attempt_ix=self.attempt,

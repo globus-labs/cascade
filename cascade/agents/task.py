@@ -60,11 +60,8 @@ def random_sample(
         result.append(
             TrainingFrame(
                 atoms=chunk.atoms[i],
-                chunk_id=chunk.chunk_id,
+                frame_id=chunk.frame_ids[i],
                 model_version=chunk.model_version,
-                traj_id=chunk.traj_id,
-                attempt_ix=chunk.attempt_ix,
-                frame_ix=i
             )
         )
     return result
