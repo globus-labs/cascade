@@ -62,6 +62,10 @@ def random_sample(
                 atoms=chunk.atoms[i],
                 frame_id=chunk.frame_ids[i],
                 model_version=chunk.model_version,
+                traj_id=chunk.traj_id,
+                chunk_id=chunk.chunk_id,
+                attempt_index=chunk.attempt_ix,
+                total_frames_in_chunk=len(chunk.atoms)
             )
         )
     return result

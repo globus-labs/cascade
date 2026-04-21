@@ -322,6 +322,7 @@ class Labeler(CascadeAgent):
         super().__init__()
         self.config = config
 
+    @action
     async def label_data(self, frame: TrainingFrame) -> None:
 
         # Check if STARTED_LABELING exists for this chunk (idempotent)
@@ -347,7 +348,7 @@ class Labeler(CascadeAgent):
             chunk_id=frame.chunk_id,
             attempt_index=frame.attempt_index,
             event_type=ChunkEventType.STARTED_LABELING_FRAME,
-            frame_id=frame.trajectory_frame_id
+            frame_id=frame.frame_id
         )
 
         # Check if STARTED_LABELING exists for this chunk (idempotent)
@@ -373,7 +374,7 @@ class Labeler(CascadeAgent):
             chunk_id=frame.chunk_id,
             attempt_index=frame.attempt_index,
             event_type=ChunkEventType.STARTED_LABELING_FRAME,
-            frame_id=frame.trajectory_frame_id
+            frame_id=frame.frame_id
         )
 
         frame_future = self.config.executor.submit(
@@ -385,8 +386,8 @@ class Labeler(CascadeAgent):
         frame = wrapped_future.result()
         self._traj_db.add_training_frame(
             run_id=self.config.run_id,
-            trajectory_frame_id=frame.trajectory_frame_id,
-            model_version_sampled_from=frame.training_frame.model_version,
+            trajectory_frame_id=frame.frame_id,
+            model_version_sampled_from=frame.model_version,
             traj_id=frame.traj_id,
             chunk_id=frame.chunk_id,
             attempt_index=frame.attempt_index
@@ -399,7 +400,7 @@ class Labeler(CascadeAgent):
             chunk_id=frame.chunk_id,
             attempt_index=frame.attempt_index,
             event_type=ChunkEventType.FINISHED_LABELING_FRAME,
-            frame_id=frame.trajectory_frame_id
+            frame_id=frame.frame_id
         )
 
         # Check if all frames for chunk are done
@@ -423,7 +424,7 @@ class Labeler(CascadeAgent):
         self.logger.info(
             f"Added training frame to database: traj={frame.traj_id}, "
             f"chunk={frame.chunk_id}, attempt={frame.attempt_index}, "
-            f"model_version={frame.training_frame.model_version}"
+            f"model_version={frame.model_version}"
         )
 
 

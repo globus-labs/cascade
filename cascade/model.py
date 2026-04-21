@@ -39,7 +39,11 @@ class ChunkSpec:
 class TrainingFrame:
     atoms: Atoms
     model_version: int
+    traj_id: int
+    chunk_id: int
+    attempt_index: int
     frame_id: int
+    total_frames_in_chunk: int # todo: this is really TMI here.
     labeled: bool = False
 
 
