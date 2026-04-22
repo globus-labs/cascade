@@ -1,13 +1,12 @@
 import asyncio
 import argparse
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import warnings
 import datetime
 import hashlib
 import json
 import pathlib
-import sys
 
 import ase
 from ase.io import read
@@ -32,7 +31,6 @@ from cascade.agents.agents import (
     Trainer
 )
 from cascade.agents.config import (
-    DatabaseConfig,
     DatabaseMonitorConfig,
     DynamicsRunnerConfig,
     AuditorConfig,
