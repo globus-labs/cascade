@@ -1,27 +1,17 @@
-"""WIP agentic implementation of cascasde with academy
+"""Academy agents that implement Cascade
 
-Everything here is a stub
 
-In addition to de-stubbing, we have the following todos:
-* thread/process safety for queues, model updates
-* make configuration of agents flexible, updatable (i.e., control parameters)
-* logging
 """
 from __future__ import annotations
 
 import asyncio
-from asyncio import Queue, Event, Lock, wrap_future
-from typing import TYPE_CHECKING
+from asyncio import Event, Lock, wrap_future
 import logging
-from concurrent.futures import Executor
 
-from ase.optimize.optimize import Dynamics
-from mace.calculators import mace_mp
 from academy.handle import Handle
 from academy.agent import Agent, action, loop
 from academy.exception import AgentTerminatedError
 
-from cascade.learning.base import BaseLearnableForcefield
 from cascade.model import AuditStatus, AdvanceSpec, AuditResult, TrajectoryStatus, ChunkEventType
 from cascade.agents.config import (
     AuditorConfig,
@@ -31,11 +21,7 @@ from cascade.agents.config import (
     DynamicsRunnerConfig
 )
 from cascade.agents.db_orm import TrajectoryDB
-from cascade.model import ChunkSpec, TrainingFrameSpec, Chunk, TrainingFrame
-
-if TYPE_CHECKING:
-    from typing import Callable
-    from ase import Atoms
+from cascade.model import Chunk, TrainingFrame
 
 
 class CascadeAgent(Agent):
