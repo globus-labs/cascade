@@ -183,41 +183,40 @@ async def main():
     (run_dir / "params.json").write_text(json.dumps(params))
     logfile = run_dir / "runtime.log"
 
+    # set up logging
     logger = init_logging(level=args.log_level, logfile=logfile)
-
     logger.setLevel(logging.DEBUG)
-
     logger.info("Loaded run params")
     logger.info(f'Running job in {run_dir}')
+    # separate parsle logging
     parsl_logger = logging.getLogger('parsl')
-
     for handler in parsl_logger.handlers[:]:  # Iterate over a copy of the list
         parsl_logger.removeHandler(handler)
     parsl_logger.addHandler(logging.FileHandler(run_dir / 'parsl.log'))
 
-    init_strc = args.initial_structures
+    # read in initial model
     learner = get_learner(args.learner)
     init_weights = learner.serialize_model(learner.get_model(mace_mp('small').models[0]))
 
-    # Initialize trajectories in the database
+    # initialize database
     traj_db = TrajectoryDB(args.db_url)
     traj_db.create_tables()
+
+    # read initial structures
+    init_strc = args.initial_structures
+    initial_specs = []
     for i, s in enumerate(init_strc):
         a = read(s, index=-1)
         logger.info(f"Initializing traj {i} with {len(a)} atoms")
-        success = traj_db.initialize_trajectory(
+
+        # create trajectory entry in the database
+        traj_db.initialize_trajectory(
             run_id=run_id,
             traj_id=i,
             target_length=args.target_length,
             init_atoms=a
         )
-        if not success:
-            logger.error(f"Failed to initialize traj {i} in database")
-
-    # intial conditions, trajectories
-    initial_specs = []
-    for i, s in enumerate(init_strc):
-        a = read(s, index=-1)
+        # create advance specification for dynamics engine
         initial_specs.append(
             AdvanceSpec(
                 atoms=a,
@@ -229,14 +228,15 @@ async def main():
             )
         )
 
-    # set up parsl pool
+    # set up parsl
     # a chunk can only be in one worker at a time + training happens concurrently
-    n_workers = len(initial_specs) + 5 # this should be configurable
+    n_parsl_workers = len(initial_specs) + 1
+    n_agents = len(initial_specs) + 5 # one dynamics runner per traj and one of each other agent
     config = Config(
         executors=[
             HighThroughputExecutor(
                 label="htex_local",
-                max_workers_per_node=n_workers,
+                max_workers_per_node=n_parsl_workers,
                 provider=LocalProvider(
                     init_blocks=1,
                     max_blocks=1,
@@ -249,7 +249,7 @@ async def main():
     with ParslPoolExecutor(config=config) as pool:
         async with await Manager.from_exchange_factory(
             factory=LocalExchangeFactory(),
-            executors=ThreadPoolExecutor(max_workers=n_workers),
+            executors=ThreadPoolExecutor(max_workers=n_agents),
         ) as manager:
 
             # register all agents with manager
@@ -266,6 +266,7 @@ async def main():
             sampler_handle = manager.get_handle(sampler_reg)
             auditor_handle = manager.get_handle(auditor_reg)
 
+            # these are used for cleanup
             handles = [
                 db_handle,
                 trainer_handle,
@@ -274,6 +275,7 @@ async def main():
                 auditor_handle,
             ]
 
+            # set up agent configs
             db_monitor_config = DatabaseMonitorConfig(
                 run_id=run_id,
                 db_url=args.db_url,
@@ -341,11 +343,11 @@ async def main():
                 registration=trainer_reg
             )
 
+            # launch one DynamicsRunner per trajectory, accumulating the handles
             dyn_handles = []
             for spec in initial_specs:
                 reg = await manager.register_agent(DynamicsRunner)
                 handle = manager.get_handle(reg)
-
                 handles.append(handle)
                 dyn_handles.append(handle)
                 dyn_config = DynamicsRunnerConfig(
@@ -375,6 +377,7 @@ async def main():
                     registration=reg
                 )
 
+            # launch the DatabaseMonitor (needs dynamics runners)
             await manager.launch(
                 DatabaseMonitor,
                 kwargs=dict(
@@ -384,10 +387,11 @@ async def main():
                 ),
                 registration=db_reg,
             )
-            # wait for it to finish!
+            # wait for the run to finish!
             try:
                 await manager.wait([db_handle])
             except KeyboardInterrupt:
+                # attempt graceful shutdown on keyboard interrupt
                 for handle in handles:
                     await manager.shutdown(handle, blocking=False)
 
