@@ -8,7 +8,6 @@ if TYPE_CHECKING:
     from ase.optimize.optimize import Dynamics
     from cascade.model import Trajectory
     from cascade.learning.base import BaseLearnableForcefield
-    import numpy as np
     from concurrent.futures import Executor
     from typing import Callable
     from cascade.model import (
@@ -17,7 +16,6 @@ if TYPE_CHECKING:
         TrainingFrame,
         Chunk
     )
-
 
 @dataclass
 class CascadeAgentConfig:
@@ -40,71 +38,82 @@ class DatabaseConfig(CascadeAgentConfig):
 class DynamicsRunnerConfig(CascadeAgentConfig):
     """Configuration for DynamicsEngine agent"""
     atoms: Atoms
-    run_id: str
-    db_url: str
+    """Initial configuration for dynamics"""
     traj_id: int
+    """Trajectory ID"""
     chunk_size: int
+    """how many steps to run at a time before audit"""
     n_steps: int
+    """Total number of steps to run"""
     run_dir: str
+    """For MD logging"""
     executor: Executor
+    """Where tasks get run"""
     advance_dynamics_task: Callable[[AdvanceSpec], None]
+    """Task to run dynamics"""
     learner: BaseLearnableForcefield
+    """Learner to be used for dynamics"""
     weights: bytes
+    """Initial weights for dynamics"""
     dyn_cls: type[Dynamics]
+    """ASE dynamics integrator"""
     dyn_kws: dict[str, object] | None
+    """Passed to dynamics constructor"""
     run_kws: dict[str, object] | None
+    """Passed to dynamics.run"""
     device: str = 'cpu'
-    model_version: int = 0
+    """Device to run learner for dynamics"""
+    model_version: int = 0  # todo: I am not so sure this belongs here
 
 
 @dataclass
 class AuditorConfig(CascadeAgentConfig):
     """Configuration for DummyAuditor agent"""
-    run_id: int
-    db_url: str
     audit_task: Callable[[Chunk], AuditResult]
-    audit_kwargs: dict
+    """Function to audit a chunk"""
+    audit_kws: dict
+    """Keyword arguments to audit_task"""
     executor: Executor
-    chunk_size: int
+    """Where to run audit task"""
 
 
 @dataclass
 class SamplerConfig(CascadeAgentConfig):
     """Configuration for Sampler agent"""
-    run_id: str
-    db_url: str
     n_frames: int
+    """How many frames to sample given a trajectory chunk"""
     executor: Executor
+    """Where to run sample_task"""
     sample_task: Callable[..., list[TrainingFrame]]
+    """Method that returns unlabled training frames given a trajectory chunk"""
 
 
 @dataclass
 class LabelerConfig(CascadeAgentConfig):
-    """Configuration for DummyLabeler agent"""
-    run_id: str
-    db_url: str
+    """Configuration for Labeler agent"""
     executor: Executor
-    label_task: Callable[TrainingFrame, TrainingFrame]
-
+    """Where to run label_task"""
+    label_task: Callable[[TrainingFrame], TrainingFrame]
+    """Adds labels to training frames"""
 
 @dataclass
 class TrainerConfig(CascadeAgentConfig):
-    """Configuration for DummyTrainer agent"""
-    run_id: str
-    db_url: str
-    training_task: Callable[..., bytes]  # todo: come up with a signature
+    """Configuration for Trainer agent"""
+    training_task: Callable[..., bytes]
+    """Returns trained model weights"""
     training_args: list | tuple
-    training_kwargs: dict
+    """passed to training_task"""
+    training_kws: dict
+    """Passed to training_task"""
     learner: BaseLearnableForcefield
     executor: Executor
+    """Where to run training_task"""
 
 
 @dataclass
 class DatabaseMonitorConfig(CascadeAgentConfig):
     """Configuration for DatabaseMonitor agent"""
-    run_id: int
-    db_url: str
     retrain_len: int
-    chunk_size: int
+    """How many labeled frames to trigger retraining"""
     retrain_fraction: float = 0.5
-    retrain_min_frames: int = 10
+    """What fraction of trajectories with labeled frames to retrain"""

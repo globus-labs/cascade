@@ -280,17 +280,14 @@ async def main():
                 run_id=run_id,
                 db_url=args.db_url,
                 retrain_len=args.retrain_len,
-                chunk_size=args.chunk_size,
                 retrain_fraction=args.retrain_fraction,
-                retrain_min_frames=args.retrain_min_frames,
             )
             auditor_config = AuditorConfig(
                 audit_task=random_audit,
                 executor=pool,
                 run_id=run_id,
                 db_url=args.db_url,
-                audit_kwargs=dict(accept_prob=args.accept_rate,),
-                chunk_size=args.chunk_size,
+                audit_kws=dict(accept_prob=args.accept_rate, ),
             )
             sampler_config = SamplerConfig(
                 run_id=run_id,
@@ -311,7 +308,7 @@ async def main():
                 executor=pool,
                 training_task=training_noop,
                 training_args=(),
-                training_kwargs={},
+                training_kws={},
                 learner=learner
             )
 

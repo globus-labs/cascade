@@ -40,24 +40,7 @@ class DynamicsRunner(CascadeAgent):
         auditor: Handle[Auditor],
         config: DynamicsRunnerConfig
     ):
-        """Runs dynamics in a loop until done, or a shutdown message is received
-
-        Arguments:
-            atoms: initial conditions
-            run_id: which run this is (for logging) # todo surely we dont have to pass this to every agent like this
-            chunk_size: how many steps to advance at a time
-            n_steps: total number of timesteps to run
-            auditor: handle to auditor class
-            executor: where the dynamics is executed
-            advance_dynamics_task: task run on the executor
-            learner: cascade learner class
-            weights: weights for the learner
-            dyn_cls: ase dynamics class
-            dyn_kws: arguments to the dynamics constructor
-            run_kws: arguments to the dynamics run method
-            device: for torch execution
-            model_version: index of current model version
-        """
+        """Runs dynamics in a loop until done, or a shutdown message is received"""
         self.db_url = config.db_url
         super().__init__()
         self.config = config
@@ -209,7 +192,6 @@ class Auditor(CascadeAgent):
         super().__init__()
         self.config = config
         self.sampler = sampler
-        self.chunk_size = config.chunk_size
 
     @action
     async def audit(self, chunk: Chunk) -> AuditResult:
@@ -219,7 +201,7 @@ class Auditor(CascadeAgent):
         future = self.config.executor.submit(
             self.config.audit_task,
             chunk,
-            **self.config.audit_kwargs
+            **self.config.audit_kws
         )
         wrapped_future = wrap_future(future)
         await wrapped_future
@@ -431,7 +413,7 @@ class Trainer(CascadeAgent):
             self.config.training_task,
             self.config.learner,
             *self.config.training_args,
-            **self.config.training_kwargs
+            **self.config.training_kws
         )
         wrapped_future = wrap_future(training_future)
         await wrapped_future
@@ -457,11 +439,8 @@ class DatabaseMonitor(CascadeAgent):
         self.current_training_round = 0
         self.model_version = 0
 
-        # pull out config vars that might change
-        self.chunk_size = self.config.chunk_size
         self.retrain_len = self.config.retrain_len
         self.retrain_fraction = self.config.retrain_fraction
-        self.retrain_min_frames = self.config.retrain_min_frames
 
     @loop
     async def monitor_completion(self, shutdown: asyncio.Event) -> None:
