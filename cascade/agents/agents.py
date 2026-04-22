@@ -1,6 +1,8 @@
 """Academy agents that implement Cascade
 
-
+These implement the communication patterns that coordiante a cascade run.
+All agents have an Executor where work is done, no work is done in the agents themselves.
+All agents are passed a task in their configurations, which is run on the Executor.
 """
 from __future__ import annotations
 
@@ -34,13 +36,18 @@ class CascadeAgent(Agent):
 
 
 class DynamicsRunner(CascadeAgent):
+    """Runs a dynamics task in a loop until done, or a shutdown message is received
 
+    There is one DynamicsRunner per trajectory.
+    The trajectory is advanced in chunks of time, which have configurable length.
+    Chunks are passed to an Auditor agent. If the audit fails, the DynamicsRunner waits for new model weights
+    before trying to run the chunk again.
+    """
     def __init__(
         self,
         auditor: Handle[Auditor],
         config: DynamicsRunnerConfig
     ):
-        """Runs dynamics in a loop until done, or a shutdown message is received"""
         self.db_url = config.db_url
         super().__init__()
         self.config = config
@@ -182,6 +189,9 @@ class DynamicsRunner(CascadeAgent):
 
 
 class Auditor(CascadeAgent):
+    """Accepts or rejects a chunk based on an audit_task
+    If the chunk is rejected, it is passed to the sampler to generate training frames.
+    """
 
     def __init__(
             self,
@@ -230,7 +240,7 @@ class Auditor(CascadeAgent):
 
 
 class Sampler(CascadeAgent):
-
+    """Generates training frames based on a trajectory chunk"""
     def __init__(
         self,
         config: SamplerConfig,
@@ -281,6 +291,7 @@ class Sampler(CascadeAgent):
 
 
 class Labeler(CascadeAgent):
+    """Labels training frames"""
 
     def __init__(
         self,
@@ -397,6 +408,7 @@ class Labeler(CascadeAgent):
 
 
 class Trainer(CascadeAgent):
+    """Produces new model weights"""
 
     def __init__(self, config):
         self.db_url = config.db_url
