@@ -231,7 +231,7 @@ async def main():
 
     # set up parsl pool
     # a chunk can only be in one worker at a time + training happens concurrently
-    n_workers = len(initial_specs)+1
+    n_workers = len(initial_specs) + 5 # this should be configurable
     config = Config(
         executors=[
             HighThroughputExecutor(
@@ -249,7 +249,7 @@ async def main():
     with ParslPoolExecutor(config=config) as pool:
         async with await Manager.from_exchange_factory(
             factory=LocalExchangeFactory(),
-            executors=ThreadPoolExecutor(max_workers=5+len(initial_specs)),
+            executors=ThreadPoolExecutor(max_workers=n_workers),
         ) as manager:
 
             # register all agents with manager
