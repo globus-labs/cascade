@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from cascade.model import ChunkSpec, AuditResult, Chunk
+    from cascade.model import AuditResult, Chunk
     from cascade.model import AdvanceSpec, TrainingFrame
     from cascade.learning.base import BaseLearnableForcefield
     from ase import Atoms

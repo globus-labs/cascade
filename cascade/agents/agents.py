@@ -303,7 +303,8 @@ class Labeler(CascadeAgent):
 
     @action
     async def label_data(self, frame: TrainingFrame) -> None:
-
+        # todo: clean up this method. at the very least the arguments could be DRYed out, can also potentially reduce db interaction?
+        # todo: discuss with will. wouldnt a pub/sub be better than DB for communicating this information. this is essentially a pub/sub spoof
         # Check if STARTED_LABELING exists for this chunk (idempotent)
         if not self._traj_db.has_chunk_event(
             run_id=self.config.run_id,
@@ -503,6 +504,7 @@ class DatabaseMonitor(CascadeAgent):
             total_active, active_with_labeling = self._traj_db.count_active_trajs_with_labeling(
                 run_id=self.config.run_id
             )
+            # todo: clarify names here, sampling and labling are confused
             sampled_fraction = active_with_labeling / total_active if total_active > 0 else 0.
 
             # Determine which condition triggered retraining

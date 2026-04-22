@@ -1,22 +1,24 @@
+"""Classes mostly used to pass state about trajectories between agents over exchange or through database"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from collections import namedtuple
 
 from ase import Atoms
 
-
-
 @dataclass
 class Chunk:
+    """A time chunk fo a trajectory"""
     atoms: list[Atoms]
+    """The atoms in the chunk"""
     frame_ids: list[int]
-    """this is a list of db keys. it might be good to get rid of this."""
+    """List of database keys for every frame of """
     traj_id: int
     chunk_id: int
     attempt_ix: int
     model_version: int
+    """model version that generated this chunk"""
 
 
 @dataclass
@@ -25,16 +27,8 @@ class AuditResult:
     status: AuditStatus
     """Whether the chunk passed audit"""
     score: float
+    """How good or bad the chunk was in terms of uncertainty"""
 
-@dataclass
-class ChunkSpec:
-    traj_id: int
-    chunk_id: int
-    attempt_index: int | None = None
-    model_version: int | None = None
-
-
-# todo: rethink this frame/spec model. I am not sure this makes sense anymore
 @dataclass
 class TrainingFrame:
     atoms: Atoms
@@ -48,32 +42,25 @@ class TrainingFrame:
 
 
 @dataclass
-class TrainingFrameSpec:
-    """Training frame specification with all metadata needed for processing.
-    
-    This encapsulates both the training frame content and its trajectory metadata
-    to avoid database lookups when passing frames between agents.
+class AdvanceSpec:
+    """Trajectory advancement specification.
+
+    This is bare minimum information to pass for the dynamics engine
+    to create a trajectory chunk.
     """
-    training_frame: TrainingFrame
-    """The training frame with atoms and model version"""
-    trajectory_frame_id: int
-    """ID of the frame in the trajectory_frames table"""
+    atoms: Atoms
+    """Initial atoms for the trajectory chunk"""
+    run_id: str
+    """Run identifier"""
     traj_id: int
-    """Trajectory identifier"""
+    """Which trajectory"""
     chunk_id: int
-    """Chunk identifier"""
+    """Which chunk"""
     attempt_index: int
     """Attempt index for this chunk"""
-    total_frames_in_chunk: int
-    """Total number of frames that will be labeled for this chunk"""
+    steps: int
+    """How many steps to run dynamics for"""
 
-
-@dataclass
-class TrajectoryState:
-    atoms: Atoms
-    timestep: int
-    chunk: int
-    attempt: int
 
 class AuditStatus(Enum):
     """Whether a trajectory chunk is awaiting or has passed/failed an audit"""
@@ -106,36 +93,3 @@ class ChunkEventType(Enum):
     STARTED_TRAINING = auto()
     FINISHED_TRAINING = auto()
 
-
-@dataclass
-class TrajectorySpec:
-    """Enough information to initialize a trajectory"""
-    run_id: hash
-    """The run ID"""
-    traj_id: int
-    """The trajectory ID"""
-    target_length: int
-    """The target length of the trajectory"""
-    init_atoms: Atoms
-    """The initial atoms for the trajectory"""
-
-
-@dataclass
-class AdvanceSpec:
-    """Trajectory advancement specification.
-    
-    This is bare minimum information to pass for the dynamics engine
-    to create a trajectory chunk.
-    """
-    atoms: Atoms
-    """Initial atoms for the trajectory chunk"""
-    run_id: str
-    """Run identifier"""
-    traj_id: int
-    """Which trajectory"""
-    chunk_id: int
-    """Which chunk"""
-    attempt_index: int
-    """Attempt index for this chunk"""
-    steps: int
-    """How many steps to run dynamics for"""
