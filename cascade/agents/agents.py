@@ -113,6 +113,7 @@ class DynamicsRunner(CascadeAgent):
                     run_dir=str(self.config.run_dir)
                 )
 
+            #todo mt.2026.04.27 does this still need to be logged?
             self._traj_db.add_chunk_attempt(
                 run_id=self.config.run_id,
                 traj_id=spec.traj_id,
@@ -163,7 +164,7 @@ class DynamicsRunner(CascadeAgent):
                 self.logger.info(f"On timestep {self.timestep} of {self.config.n_steps}")
                 self.done = self.timestep >= self.config.n_steps
                 if self.done:
-                    self.logger.info(f"Finished dynamics for traj {self.config.traj_id} on {self.chunk_ix} attempt {self.attempt}, shutting down")
+                    self.logger.info(f"Finished dynamics for traj {self.config.traj_id} chunk {self.chunk_ix} attempt {self.attempt}, shutting down")
                     self._traj_db.mark_trajectory_completed(run_id=self.config.run_id, traj_id=self.config.traj_id)
                     self.agent_shutdown()
                 else:
@@ -331,32 +332,6 @@ class Labeler(CascadeAgent):
             frame_id=frame.frame_id
         )
 
-        # Check if STARTED_LABELING exists for this chunk (idempotent)
-        if not self._traj_db.has_chunk_event(
-            run_id=self.config.run_id,
-            traj_id=frame.traj_id,
-            chunk_id=frame.chunk_id,
-            attempt_index=frame.attempt_index,
-            event_type=ChunkEventType.STARTED_LABELING
-        ):
-            self._traj_db.record_chunk_event(
-                run_id=self.config.run_id,
-                traj_id=frame.traj_id,
-                chunk_id=frame.chunk_id,
-                attempt_index=frame.attempt_index,
-                event_type=ChunkEventType.STARTED_LABELING
-            )
-
-        # Record STARTED_LABELING_FRAME
-        self._traj_db.record_chunk_event(
-            run_id=self.config.run_id,
-            traj_id=frame.traj_id,
-            chunk_id=frame.chunk_id,
-            attempt_index=frame.attempt_index,
-            event_type=ChunkEventType.STARTED_LABELING_FRAME,
-            frame_id=frame.frame_id
-        )
-
         frame_future = self.config.executor.submit(
             self.config.label_task,
             frame
@@ -390,8 +365,12 @@ class Labeler(CascadeAgent):
             chunk_id=frame.chunk_id,
             attempt_index=frame.attempt_index
         )
-
-        if labeled_count >= frame.total_frames_in_chunk:
+        self.logger.info(
+            f"Finished labeleing traj={frame.traj_id}, "
+            f"chunk={frame.chunk_id}, attempt={frame.attempt_index};"
+            f"labled from chunk={labeled_count}, sampled from chunk:{frame.n_sampled_frames}"
+        )
+        if labeled_count == frame.n_sampled_frames-1: # recall the chunk stores an initial frame which wont get labeled
             # All frames labeled, record FINISHED_LABELING
             self._traj_db.record_chunk_event(
                 run_id=self.config.run_id,
@@ -526,6 +505,7 @@ class DatabaseMonitor(CascadeAgent):
 
                 # Get the training round for frames that will be used in this retraining
                 # (frames created before this retraining will have the current max training_round)
+                # todo: why do we ask the database for the training round when we have it on this class
                 training_round_for_retrain = self._traj_db.get_current_training_round(self.config.run_id)
 
                 # Increment training round - new frames created after this will use the new round

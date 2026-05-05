@@ -1497,7 +1497,25 @@ class TrajectoryDB:
                     'created_at': e.created_at
                 })
             return result
-    
+
+    def count_chunk_events_by_type(self, run_id: str) -> dict[str, int]:
+        """Count chunk events grouped by event type for a run.
+
+        Args:
+            run_id: Run identifier
+
+        Returns:
+            Dict mapping event type name to count, e.g. {'STARTED_LABELING': 10, ...}
+        """
+        with self.session() as sess:
+            rows = (
+                sess.query(DBChunkEvent.event_type, func.count().label("count"))
+                .filter_by(run_id=run_id)
+                .group_by(DBChunkEvent.event_type)
+                .all()
+            )
+            return {event_type.name: count for event_type, count in rows}
+
     def count_active_trajs_with_labeling(
         self,
         run_id: str

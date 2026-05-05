@@ -37,7 +37,7 @@ class TrainingFrame:
     chunk_id: int
     attempt_index: int
     frame_id: int
-    total_frames_in_chunk: int # todo: this is really TMI here.
+    n_sampled_frames: int # todo: is this really the way to pass this around
     labeled: bool = False
 
 

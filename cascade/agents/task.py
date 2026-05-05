@@ -65,7 +65,7 @@ def random_sample(
                 traj_id=chunk.traj_id,
                 chunk_id=chunk.chunk_id,
                 attempt_index=chunk.attempt_ix,
-                total_frames_in_chunk=len(chunk.atoms)
+                n_sampled_frames=n_sample
             )
         )
     return result
