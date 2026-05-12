@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ase import Atoms
     from pathlib import Path
     import numpy as np
+    import pandas as pd
 from ase.optimize.optimize import Dynamics
 
 
@@ -163,3 +164,12 @@ def training_noop(learner: BaseLearnableForcefield) -> bytes:
     model = calc.models[0]
     model_msg = learner.serialize_model(model)
     return model_msg
+
+def train(learner: BaseLearnableForcefield,
+          weights: bytes,
+          train_data: list[Atoms],
+          valid_data: list[Atoms],
+          train_kws: dict[str, object],
+          ) -> tuple[bytes, pd.DataFrame]:
+    weights, results = learner.train(weights, train_data, valid_data, **train_kws)
+    return weights, results

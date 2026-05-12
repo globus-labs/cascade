@@ -103,6 +103,8 @@ class LabelerConfig(CascadeAgentConfig):
 @dataclass
 class TrainerConfig(CascadeAgentConfig):
     """Configuration for Trainer agent"""
+    weights: bytes
+    """Initial weights for trainer"""
     training_task: Callable[..., bytes]
     """Returns trained model weights"""
     training_args: list | tuple

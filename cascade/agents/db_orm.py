@@ -1073,8 +1073,6 @@ class TrajectoryDB:
             if existing:
                 return existing
 
-            current_round = self.get_current_training_round(run_id)
-
             db_training_frame = DBTrainingFrame(
                 run_id=run_id,
                 trajectory_frame_id=trajectory_frame_id,
@@ -1082,7 +1080,7 @@ class TrajectoryDB:
                 traj_id=traj_id,
                 chunk_id=chunk_id,
                 attempt_index=attempt_index,
-                training_round=current_round,
+                training_round=None,
                 atoms_labeled_blob=self._serialize_atoms(atoms_labeled),
             )
             sess.add(db_training_frame)

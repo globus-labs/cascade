@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from asyncio import Event, Lock, wrap_future
 import logging
+from copy import deepcopy
 
 from academy.handle import Handle
 from academy.agent import Agent, action, loop
@@ -365,27 +366,40 @@ class Trainer(CascadeAgent):
         self.db_url = config.db_url
         super().__init__()
         self.config = config
+        self.weights = deepcopy(config.weights)
 
     @action
     async def train_model(
         self,
         training_round: int,
     ) -> bytes:
-
+        from sklearn.model_selection import train_test_split
+        self.logger.info(f'Fetching training data for training round {training_round}')
         train_data = self._traj_db.get_training_frames(
             self.config.run_id,
-            training_round=training_round - 1,
+            training_round=training_round,
         )
+        if not train_data:
+            self.logger.warning(f'No training frames found for round {training_round}, skipping training')
+            return self.weights
+        self.logger.info(f'Got {len(train_data)} training frames')
+        train_data, valid_data = train_test_split(train_data, test_size=0.2)
+        self.logger.info(f'Train size: {len(train_data)}, val size: {len(valid_data)}')
+        self.logger.info('Submitting training task')
         training_future = self.config.executor.submit(
             self.config.training_task,
-            self.config.learner,
-            *self.config.training_args,
-            **self.config.training_kws
+            learner=self.config.learner,
+            weights=self.weights,
+            train_data=train_data,
+            valid_data=valid_data,
+            train_kws=self.config.training_kws
         )
         wrapped_future = wrap_future(training_future)
         await wrapped_future
-        model_msg = wrapped_future.result()
-        return model_msg
+        self.logger.info('Retrieving new weights')
+        weights, results = wrapped_future.result()
+        self.weights = weights
+        return weights
 
 
 class DatabaseMonitor(CascadeAgent):
@@ -480,28 +494,27 @@ class DatabaseMonitor(CascadeAgent):
 
                 # Get the training round for frames that will be used in this retraining
                 # (frames created before this retraining will have the current max training_round)
-                # todo: why do we ask the database for the training round when we have it on this class
-                training_round_for_retrain = self._traj_db.get_current_training_round(self.config.run_id)
-
-                # Increment training round - new frames created after this will use the new round
-                self.current_training_round = training_round_for_retrain + 1
-
                 self.logger.info(
                     f"Starting retraining (round {self.current_training_round}) triggered by: {', '.join(trigger_reason)}\n"
                     f"Training frame count: current={current_count}, last_train={self.last_train_count}, "
                     f"new={new_frames}, active_trajs={total_active}, labeled_trajs={active_with_labeling}, "
                     f"fraction={sampled_fraction:.2%}"
                 )
-
+                # Stamp all unlabeled frames with the current round before training
+                self._traj_db.mark_training_frames_for_round(
+                    self.config.run_id,
+                    training_round=self.current_training_round,
+                )
                 # Train model and update weights in dynamics engine
                 weights = await self.trainer.train_model(self.current_training_round)
-
                 # Record FINISHED_TRAINING event after training completes
                 self._traj_db.record_training_event(
                     run_id=self.config.run_id,
                     event_type=ChunkEventType.FINISHED_TRAINING,
                     training_round=self.current_training_round
                 )
+                self.current_training_round += 1
+                self.last_train_count = current_count
 
                 self.model_version += 1
 

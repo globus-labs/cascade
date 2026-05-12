@@ -47,7 +47,7 @@ from cascade.agents.task import (
     advance_dynamics,
     random_sample,
     label_frame,
-    training_noop
+    train
 )
 
 
@@ -306,10 +306,15 @@ async def main():
             trainer_config = TrainerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
+                weights=init_weights,
                 executor=pool,
-                training_task=training_noop,
+                training_task=train,
                 training_args=(),
-                training_kws={},
+                training_kws=dict(
+                    num_epochs=2,
+                    device='cpu',
+                    batch_size=2,
+                ),
                 learner=learner
             )
 
