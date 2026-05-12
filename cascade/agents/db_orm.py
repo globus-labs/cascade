@@ -132,6 +132,7 @@ class DBTrainingFrame(Base):
     attempt_index = Column(Integer, nullable=False)
     # Training round tracking
     training_round = Column(Integer, nullable=True, index=True)
+    atoms_labeled_blob = Column(LargeBinary, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
@@ -227,7 +228,7 @@ class TrajectoryDB:
         """
         from cascade.utils import canonicalize, write_to_string
         canonical_atoms = canonicalize(atoms)
-        atoms_str = write_to_string(canonical_atoms, fmt='json')
+        atoms_str = write_to_string(canonical_atoms, fmt='extxyz')
         return atoms_str.encode('utf-8')
     
     @staticmethod
@@ -242,7 +243,7 @@ class TrajectoryDB:
         """
         from cascade.utils import read_from_string
         atoms_str = data.decode('utf-8')
-        return read_from_string(atoms_str, fmt='json')
+        return read_from_string(atoms_str, fmt='extxyz')
     
     def write_frame(
         self,
@@ -1046,12 +1047,11 @@ class TrajectoryDB:
         model_version_sampled_from: int,
         traj_id: int,
         chunk_id: int,
-        attempt_index: int
+        attempt_index: int,
+        atoms_labeled: Atoms,
     ) -> DBTrainingFrame:
         """Add a training frame to the database
-        
-        Training frames are immediately marked with the current training round.
-        
+
         Args:
             run_id: Run identifier
             trajectory_frame_id: ID of the frame in the trajectory_frames table
@@ -1059,24 +1059,22 @@ class TrajectoryDB:
             traj_id: Trajectory identifier (denormalized)
             chunk_id: Chunk identifier (denormalized)
             attempt_index: Attempt index (denormalized)
-            
+            atoms_labeled: Labeled atoms with energy/forces to store
+
         Returns:
             DBTrainingFrame instance
         """
         with self.session() as sess:
-            # Check if training frame already exists
             existing = sess.query(DBTrainingFrame).filter_by(
                 run_id=run_id,
                 trajectory_frame_id=trajectory_frame_id
             ).first()
-            
+
             if existing:
                 return existing
-            
-            # Get current training round
+
             current_round = self.get_current_training_round(run_id)
-            
-            # Create new training frame entry with current training round
+
             db_training_frame = DBTrainingFrame(
                 run_id=run_id,
                 trajectory_frame_id=trajectory_frame_id,
@@ -1084,7 +1082,8 @@ class TrajectoryDB:
                 traj_id=traj_id,
                 chunk_id=chunk_id,
                 attempt_index=attempt_index,
-                training_round=current_round  # Mark immediately with current round
+                training_round=current_round,
+                atoms_labeled_blob=self._serialize_atoms(atoms_labeled),
             )
             sess.add(db_training_frame)
             sess.flush()
@@ -1093,37 +1092,33 @@ class TrajectoryDB:
     
     def get_training_frames(
         self,
-        run_id: str
+        run_id: str,
+        training_round: int,
     ) -> list[Atoms]:
-        """Get all training frames for a run
-        
+        """Get labeled training frames for a specific training round.
+
         Args:
             run_id: Run identifier
-            
+            training_round: Round whose frames should be returned
+
         Returns:
-            List of Atoms objects from all training frames
+            List of labeled Atoms objects
         """
         with self.session() as sess:
             training_frames = sess.query(DBTrainingFrame).filter_by(
-                run_id=run_id
-            ).filter(
-                DBTrainingFrame.training_round.is_(None)
+                run_id=run_id,
+                training_round=training_round,
             ).all()
-            
+
             if not training_frames:
                 return []
-            
-            # Get trajectory frame IDs
-            frame_ids = [tf.trajectory_frame_id for tf in training_frames]
-            
-            # Deserialize directly from ORM objects
-            atoms_list = []
-            for frame_id in frame_ids:
-                frame = sess.query(DBTrajectoryFrame).filter_by(id=frame_id).first()
-                if frame:
-                    atoms_list.append(self._deserialize_atoms(frame.atoms_blob))
-        
-        # Force garbage collection after deserializing large binary data
+
+            atoms_list = [
+                self._deserialize_atoms(tf.atoms_labeled_blob)
+                for tf in training_frames
+                if tf.atoms_labeled_blob is not None
+            ]
+
         gc.collect()
         return atoms_list
     

@@ -324,6 +324,7 @@ class Labeler(CascadeAgent):
             **chunk_kws,
             trajectory_frame_id=frame.frame_id,
             model_version_sampled_from=frame.model_version,
+            atoms_labeled=frame.atoms_labeled,
         )
         self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.FINISHED_LABELING_FRAME, frame_id=frame.frame_id)
 
@@ -371,6 +372,10 @@ class Trainer(CascadeAgent):
         training_round: int,
     ) -> bytes:
 
+        train_data = self._traj_db.get_training_frames(
+            self.config.run_id,
+            training_round=training_round - 1,
+        )
         training_future = self.config.executor.submit(
             self.config.training_task,
             self.config.learner,
