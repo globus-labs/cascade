@@ -105,7 +105,6 @@ class DynamicsRunner(CascadeAgent):
                     spec=spec,
                     learner=self.config.learner,
                     weights=self.config.weights,
-                    db_url=self.config.db_url,
                     device=self.config.device,
                     dyn_cls=self.config.dyn_cls,
                     dyn_kws=self.config.dyn_kws,
@@ -302,89 +301,60 @@ class Labeler(CascadeAgent):
         super().__init__()
         self.config = config
 
-    @action
-    async def label_data(self, frame: TrainingFrame) -> None:
-        # todo: clean up this method. at the very least the arguments could be DRYed out, can also potentially reduce db interaction?
+    def _record_labeling_started(self, frame: TrainingFrame) -> None:
         # todo: discuss with will. wouldnt a pub/sub be better than DB for communicating this information. this is essentially a pub/sub spoof
-        # Check if STARTED_LABELING exists for this chunk (idempotent)
-        if not self._traj_db.has_chunk_event(
+        chunk_kws = dict(
             run_id=self.config.run_id,
             traj_id=frame.traj_id,
             chunk_id=frame.chunk_id,
             attempt_index=frame.attempt_index,
-            event_type=ChunkEventType.STARTED_LABELING
-        ):
-            self._traj_db.record_chunk_event(
-                run_id=self.config.run_id,
-                traj_id=frame.traj_id,
-                chunk_id=frame.chunk_id,
-                attempt_index=frame.attempt_index,
-                event_type=ChunkEventType.STARTED_LABELING
-            )
+        )
+        if not self._traj_db.has_chunk_event(**chunk_kws, event_type=ChunkEventType.STARTED_LABELING):
+            self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.STARTED_LABELING)
+        self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.STARTED_LABELING_FRAME, frame_id=frame.frame_id)
 
-        # Record STARTED_LABELING_FRAME
-        self._traj_db.record_chunk_event(
+    def _record_labeling_finished(self, frame: TrainingFrame) -> None:
+        chunk_kws = dict(
             run_id=self.config.run_id,
             traj_id=frame.traj_id,
             chunk_id=frame.chunk_id,
             attempt_index=frame.attempt_index,
-            event_type=ChunkEventType.STARTED_LABELING_FRAME,
-            frame_id=frame.frame_id
         )
-
-        frame_future = self.config.executor.submit(
-            self.config.label_task,
-            frame
-        )
-        wrapped_future = wrap_future(frame_future)
-        await wrapped_future
-        frame = wrapped_future.result()
         self._traj_db.add_training_frame(
-            run_id=self.config.run_id,
+            **chunk_kws,
             trajectory_frame_id=frame.frame_id,
             model_version_sampled_from=frame.model_version,
-            traj_id=frame.traj_id,
-            chunk_id=frame.chunk_id,
-            attempt_index=frame.attempt_index
         )
+        self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.FINISHED_LABELING_FRAME, frame_id=frame.frame_id)
 
-        # Record FINISHED_LABELING_FRAME after successfully adding training frame
-        self._traj_db.record_chunk_event(
-            run_id=self.config.run_id,
-            traj_id=frame.traj_id,
-            chunk_id=frame.chunk_id,
-            attempt_index=frame.attempt_index,
-            event_type=ChunkEventType.FINISHED_LABELING_FRAME,
-            frame_id=frame.frame_id
-        )
-
-        # Check if all frames for chunk are done
-        labeled_count = self._traj_db.count_labeled_frames_for_chunk(
-            run_id=self.config.run_id,
-            traj_id=frame.traj_id,
-            chunk_id=frame.chunk_id,
-            attempt_index=frame.attempt_index
-        )
+        labeled_count = self._traj_db.count_labeled_frames_for_chunk(**chunk_kws)
         self.logger.info(
             f"Finished labeleing traj={frame.traj_id}, "
             f"chunk={frame.chunk_id}, attempt={frame.attempt_index};"
             f"labled from chunk={labeled_count}, sampled from chunk:{frame.n_sampled_frames}"
         )
-        if labeled_count == frame.n_sampled_frames-1: # recall the chunk stores an initial frame which wont get labeled
-            # All frames labeled, record FINISHED_LABELING
-            self._traj_db.record_chunk_event(
-                run_id=self.config.run_id,
-                traj_id=frame.traj_id,
-                chunk_id=frame.chunk_id,
-                attempt_index=frame.attempt_index,
-                event_type=ChunkEventType.FINISHED_LABELING
-            )
-
+        if labeled_count == frame.n_sampled_frames-1:  # recall the chunk stores an initial frame which wont get labeled
+            self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.FINISHED_LABELING)
         self.logger.info(
             f"Added training frame to database: traj={frame.traj_id}, "
             f"chunk={frame.chunk_id}, attempt={frame.attempt_index}, "
             f"model_version={frame.model_version}"
         )
+
+    @action
+    async def label_data(self, frame: TrainingFrame) -> None:
+        self._record_labeling_started(frame)
+
+        frame_future = self.config.executor.submit(
+            self.config.label_task,
+            frame,
+            self.config.calc_factory
+        )
+        wrapped_future = wrap_future(frame_future)
+        await wrapped_future
+        frame = wrapped_future.result()
+
+        self._record_labeling_finished(frame)
 
 
 class Trainer(CascadeAgent):
