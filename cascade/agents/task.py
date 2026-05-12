@@ -150,22 +150,8 @@ def label_frame(frame: TrainingFrame, calc_factory: Callable[..., Calculator]) -
     calc = calc_factory()
     atoms_labeled = frame.atoms.copy()
     atoms_labeled.calc = calc
-
-    # compute energy, forces, stress
-    energy = atoms_labeled.get_potential_energy()
-    forces = atoms_labeled.get_forces()
-    try:
-        stress = atoms_labeled.get_stress(voigt=False)
-        atoms_labeled.info["stress"] = stress
-    except Exception:
-        pass
-
-    # Persist results onto atoms object
-    atoms_labeled.info["energy"] = energy
-    atoms_labeled.arrays["forces"] = forces
-    atoms_labeled.calc = None # todo: verify we should store all props on atoms and not calc
     calc.calculate(atoms_labeled)
-    frame.atoms_labeled = atoms_labeled
+    frame.atoms_labeled = canonicalize(atoms_labeled)
     return frame
 
 # todo: this should be configurable, or at least not hard code magic knowledge
