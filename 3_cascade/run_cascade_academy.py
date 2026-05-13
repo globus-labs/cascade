@@ -301,7 +301,7 @@ async def main():
                 db_url=args.db_url,
                 executor=pool,
                 label_task=label_frame,
-                calc_factory=partial(mace_mp, model='small', device='cpu', default_dtype="float32"),
+                calc_factory=partial(mace_mp, model='medium', device='cpu', default_dtype="float32"),
                 )
             trainer_config = TrainerConfig(
                 run_id=run_id,
