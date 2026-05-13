@@ -398,6 +398,7 @@ class Trainer(CascadeAgent):
         await wrapped_future
         self.logger.info('Retrieving new weights')
         weights, results = wrapped_future.result()
+        self._traj_db.write_training_log(self.config.run_id, training_round, results)
         self.weights = weights
         return weights
 

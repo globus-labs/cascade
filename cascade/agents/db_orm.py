@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
 import numpy as np
+import pandas as pd
 from ase import Atoms
 
 if TYPE_CHECKING:
@@ -177,6 +178,24 @@ class DBTrainingEvent(Base):
 
     def __repr__(self):
         return f"<DBTrainingEvent(run_id={self.run_id}, event_type={self.event_type.name}, training_round={self.training_round})>"
+
+
+class DBTrainingLog(Base):
+    """ORM model for per-round training loss history"""
+    __tablename__ = 'training_logs'
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String, nullable=False, index=True)
+    training_round = Column(Integer, nullable=False, index=True)
+    log_json = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'training_round', name='uq_training_log_run_round'),
+    )
+
+    def __repr__(self):
+        return f"<DBTrainingLog(run_id={self.run_id}, training_round={self.training_round})>"
 
 
 class TrajectoryDB:
@@ -1322,6 +1341,48 @@ class TrajectoryDB:
             )
             sess.add(db_event)
     
+    def write_training_log(self, run_id: str, training_round: int, log: pd.DataFrame) -> None:
+        """Persist per-epoch training metrics for a completed training round.
+
+        Args:
+            run_id: Run identifier
+            training_round: Training round number
+            log: DataFrame returned by MACEInterface.train, one row per epoch
+        """
+        with self.session() as sess:
+            sess.add(DBTrainingLog(
+                run_id=run_id,
+                training_round=training_round,
+                log_json=log.to_dict(orient='records'),
+            ))
+
+    def get_training_logs(self, run_id: str) -> pd.DataFrame:
+        """Return all training loss history for a run as a single DataFrame.
+
+        Each row is one epoch from one training round. A ``training_round``
+        column is prepended so callers can group or filter by round.
+
+        Args:
+            run_id: Run identifier
+
+        Returns:
+            DataFrame with columns [training_round, epoch, <metric columns>],
+            or an empty DataFrame if no logs exist yet.
+        """
+        with self.session() as sess:
+            rows = (
+                sess.query(DBTrainingLog)
+                .filter_by(run_id=run_id)
+                .order_by(DBTrainingLog.training_round)
+                .all()
+            )
+            frames = []
+            for row in rows:
+                df = pd.DataFrame(row.log_json)
+                df.insert(0, 'training_round', row.training_round)
+                frames.append(df)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
     def has_chunk_event(
         self,
         run_id: str,
