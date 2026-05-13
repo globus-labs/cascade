@@ -311,7 +311,7 @@ async def main():
                 training_task=train,
                 training_args=(),
                 training_kws=dict(
-                    num_epochs=2,
+                    num_epochs=10,
                     device='cpu',
                     batch_size=2,
                 ),
