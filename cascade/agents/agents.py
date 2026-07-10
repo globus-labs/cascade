@@ -80,9 +80,6 @@ class DynamicsRunner(CascadeAgent):
         """Run dynamics until done, or a shutdown message is received"""
         while not (shutdown.is_set() or self.done):
 
-            # there are two conditions to release this lock: we finish, or we are waiting for new weights
-            # await self.weights_lock.acquire()
-            # submit dynamics for evaluation
             spec = AdvanceSpec(
                 atoms=self.atoms,
                 steps=self.chunk_size,
@@ -94,6 +91,7 @@ class DynamicsRunner(CascadeAgent):
 
             self.logger.info(f"Running dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index} with {spec.steps} steps")
 
+            # there are two conditions to release this lock: 1. we finish this pass over the trajecotyr chunk
             async with self.new_model_lock:
 
                 if self.new_model:
@@ -101,6 +99,7 @@ class DynamicsRunner(CascadeAgent):
                     self.new_model = None
                 self.logger.debug(
                     f"Submitting dynamics to executor dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index} with {spec.steps} steps")
+                # submit dynamics for evaluation
                 chunk_future = self.config.executor.submit(
                     self.config.advance_dynamics_task,
                     spec=spec,
@@ -164,17 +163,18 @@ class DynamicsRunner(CascadeAgent):
                 self.logger.info(f"On timestep {self.timestep} of {self.config.n_steps}")
                 self.done = self.timestep >= self.config.n_steps
                 if self.done:
+                    # audit passed and trajectory is complete: shutdown
                     self.logger.info(f"Finished dynamics for traj {self.config.traj_id} chunk {self.chunk_ix} attempt {self.attempt}, shutting down")
                     self._traj_db.mark_trajectory_completed(run_id=self.config.run_id, traj_id=self.config.traj_id)
                     self.agent_shutdown()
                 else:
-                    # audit passed but not done, use the new atoms to run a new chunk
+                    # audit passed but not done: use the new atoms to run a new chunk in next pass of while loop
                     self.atoms = chunk_atoms[-1]
                     self.chunk_ix += 1
                     self.attempt = 0
                     self.logger.info(f"Updating traj {self.config.traj_id} to chunk {self.chunk_ix} attempt {self.attempt}")
             else:
-                # audit failed
+                # audit failed: wait for new weights
                 self.logger.info(f'Audit status failed for traj {self.config.traj_id} chunk {self.chunk_ix} attempt {self.attempt}, waiting for new weights...')
                 self.attempt += 1
                 self.received_weights.clear()
@@ -183,7 +183,7 @@ class DynamicsRunner(CascadeAgent):
 
     @action
     async def receive_weights(self, weights: bytes, model_version: int) -> None:
-        async with self.new_model_lock:
+        async with self.new_model_lock: # todo mt.2026.07.07: do we need this lock if we only call receive weights from a safe spot in the loop in this agent?
             self.new_model = (weights, model_version)
         self.logger.info(f"Received weights for model version {model_version}")
         self.received_weights.set()
