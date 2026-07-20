@@ -11,6 +11,8 @@ from ase import Atoms
 from ase.db import connect
 from ase.build import molecule
 
+from ase.calculators.singlepoint import SinglePointCalculator
+
 from cascade.agents.db_orm import TrajectoryDB, DBTrajectory, DBTrajectoryChunk, DBTrainingFrame
 from cascade.model import AuditStatus
 
@@ -43,6 +45,18 @@ def example_atoms() -> Atoms:
     water.cell = [4.] * 3
     water.pbc = True
     return water
+
+
+@pytest.fixture
+def labeled_atoms(example_atoms) -> Atoms:
+    """Atoms with energy and forces attached via SinglePointCalculator, as produced by label_frame."""
+    atoms = example_atoms.copy()
+    atoms.calc = SinglePointCalculator(
+        atoms,
+        energy=-10.5,
+        forces=np.ones((len(atoms), 3)) * 0.1,
+    )
+    return atoms
 
 
 class TestTrajectoryDB:
@@ -558,7 +572,7 @@ class TestTrajectoryDB:
 
         assert traj_db.is_trajectory_done("test_run", 0)
 
-    def test_add_training_frame(self, traj_db, example_atoms):
+    def test_add_training_frame(self, traj_db, example_atoms, labeled_atoms):
         """Test adding a training frame."""
         # First create a trajectory frame
         traj_db.initialize_trajectory(
@@ -575,21 +589,22 @@ class TestTrajectoryDB:
             frame_index=0,
             atoms=example_atoms
         )
-        
+
         traj_db.add_training_frame(
             run_id="test_run",
             trajectory_frame_id=frame_id,
             model_version_sampled_from=5,
             traj_id=0,
             chunk_id=0,
-            attempt_index=0
+            attempt_index=0,
+            atoms_labeled=labeled_atoms,
         )
 
         # Verify by counting
         count = traj_db.count_training_frames("test_run")
         assert count == 1
 
-    def test_add_training_frame_idempotent(self, traj_db, example_atoms):
+    def test_add_training_frame_idempotent(self, traj_db, example_atoms, labeled_atoms):
         """Test that adding the same training frame twice returns the same object."""
         # First create a trajectory frame
         traj_db.initialize_trajectory(
@@ -606,14 +621,15 @@ class TestTrajectoryDB:
             frame_index=0,
             atoms=example_atoms
         )
-        
+
         traj_db.add_training_frame(
             run_id="test_run",
             trajectory_frame_id=frame_id,
             model_version_sampled_from=5,
             traj_id=0,
             chunk_id=0,
-            attempt_index=0
+            attempt_index=0,
+            atoms_labeled=labeled_atoms,
         )
 
         traj_db.add_training_frame(
@@ -622,35 +638,36 @@ class TestTrajectoryDB:
             model_version_sampled_from=5,
             traj_id=0,
             chunk_id=0,
-            attempt_index=0
+            attempt_index=0,
+            atoms_labeled=labeled_atoms,
         )
 
         # Should still only have one frame
         count = traj_db.count_training_frames("test_run")
         assert count == 1
 
-    def test_count_training_frames(self, traj_db, example_atoms):
+    def test_count_training_frames(self, traj_db, example_atoms, labeled_atoms):
         """Test counting training frames."""
         # Initialize trajectories and create frames
         traj_db.initialize_trajectory("test_run", 0, 100, example_atoms)
         traj_db.initialize_trajectory("test_run", 1, 100, example_atoms)
-        
+
         frame_id1 = traj_db.write_frame("test_run", 0, 0, 0, 0, example_atoms)
         frame_id2 = traj_db.write_frame("test_run", 0, 0, 1, 0, example_atoms)
         frame_id3 = traj_db.write_frame("test_run", 1, 0, 2, 0, example_atoms)
-        
+
         count = traj_db.count_training_frames("test_run")
         assert count == 0
 
         # Add some training frames
-        traj_db.add_training_frame("test_run", frame_id1, 0, 0, 0, 0)
-        traj_db.add_training_frame("test_run", frame_id2, 0, 0, 1, 0)
-        traj_db.add_training_frame("test_run", frame_id3, 1, 0, 2, 0)
+        traj_db.add_training_frame("test_run", frame_id1, 0, 0, 0, 0, labeled_atoms)
+        traj_db.add_training_frame("test_run", frame_id2, 0, 0, 1, 0, labeled_atoms)
+        traj_db.add_training_frame("test_run", frame_id3, 1, 0, 2, 0, labeled_atoms)
 
         count = traj_db.count_training_frames("test_run")
         assert count == 3
 
-    def test_get_sampled_traj_ids(self, traj_db, example_atoms):
+    def test_get_sampled_traj_ids(self, traj_db, example_atoms, labeled_atoms):
         """Test getting sampled trajectory IDs from training frames."""
         traj_db.initialize_trajectory(
             run_id="test_run",
@@ -676,36 +693,36 @@ class TestTrajectoryDB:
         frame_id3 = traj_db.write_frame("test_run", 1, 0, 0, 0, atoms3)
 
         # Add training frames
-        traj_db.add_training_frame("test_run", frame_id1, 0, 0, 0, 0)  # traj_id=0, chunk_id=0, attempt_index=0
-        traj_db.add_training_frame("test_run", frame_id2, 0, 0, 0, 0)  # traj_id=0, chunk_id=0, attempt_index=0
-        traj_db.add_training_frame("test_run", frame_id3, 0, 1, 0, 0)  # traj_id=1, chunk_id=0, attempt_index=0
+        traj_db.add_training_frame("test_run", frame_id1, 0, 0, 0, 0, labeled_atoms)  # traj_id=0, chunk_id=0, attempt_index=0
+        traj_db.add_training_frame("test_run", frame_id2, 0, 0, 0, 0, labeled_atoms)  # traj_id=0, chunk_id=0, attempt_index=0
+        traj_db.add_training_frame("test_run", frame_id3, 0, 1, 0, 0, labeled_atoms)  # traj_id=1, chunk_id=0, attempt_index=0
 
         sampled_ids = traj_db.get_sampled_traj_ids("test_run")
 
         assert sampled_ids == {0, 1}
     
-    def test_count_active_trajs_with_samples(self, traj_db, example_atoms):
+    def test_count_active_trajs_with_samples(self, traj_db, example_atoms, labeled_atoms):
         """Test counting active trajectories with samples."""
         # Initialize 3 trajectories
         traj_db.initialize_trajectory("test_run", 0, 100, example_atoms)
         traj_db.initialize_trajectory("test_run", 1, 100, example_atoms)
         traj_db.initialize_trajectory("test_run", 2, 100, example_atoms)
-        
+
         # Add some atoms using write_frame
         atoms0 = Atoms(positions=[[0, 0, 0], [1, 1, 1]], numbers=[1, 1])
         atoms1 = Atoms(positions=[[2, 2, 2], [3, 3, 3]], numbers=[2, 2])
-        
+
         frame_id0 = traj_db.write_frame("test_run", 0, 0, 0, 0, atoms0)
         frame_id1 = traj_db.write_frame("test_run", 1, 0, 0, 0, atoms1)
-        
+
         # Initially, no samples
         total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run")
         assert total_active == 3
         assert with_samples == 0
-        
+
         # Add training frames from trajectories 0 and 1
-        traj_db.add_training_frame("test_run", frame_id0, 0, 0, 0, 0)  # traj_id=0, chunk_id=0, attempt_index=0
-        traj_db.add_training_frame("test_run", frame_id1, 0, 1, 0, 0)  # traj_id=1, chunk_id=0, attempt_index=0
+        traj_db.add_training_frame("test_run", frame_id0, 0, 0, 0, 0, labeled_atoms)  # traj_id=0, chunk_id=0, attempt_index=0
+        traj_db.add_training_frame("test_run", frame_id1, 0, 1, 0, 0, labeled_atoms)  # traj_id=1, chunk_id=0, attempt_index=0
         
         total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run")
         assert total_active == 3
@@ -722,8 +739,8 @@ class TestTrajectoryDB:
         # Add new training frames (round remains None) for trajectories 0 and 1
         frame_id0_round2 = traj_db.write_frame("test_run", 0, 0, 1, 0, atoms0.copy())
         frame_id1_round2 = traj_db.write_frame("test_run", 1, 0, 1, 0, atoms1.copy())
-        traj_db.add_training_frame("test_run", frame_id0_round2, 0, 0, 0, 0)
-        traj_db.add_training_frame("test_run", frame_id1_round2, 0, 1, 0, 0)
+        traj_db.add_training_frame("test_run", frame_id0_round2, 0, 0, 0, 0, labeled_atoms)
+        traj_db.add_training_frame("test_run", frame_id1_round2, 0, 1, 0, 0, labeled_atoms)
         
         total_active, with_samples = traj_db.count_active_trajs_with_samples("test_run")
         assert total_active == 3
@@ -776,7 +793,7 @@ class TestTrajectoryDB:
         runs = traj_db.list_runs()
         assert runs == []
     
-    def test_list_run_summary(self, traj_db, example_atoms):
+    def test_list_run_summary(self, traj_db, example_atoms, labeled_atoms):
         """Test getting run summary statistics."""
         run_id = "test_run"
         
@@ -795,8 +812,8 @@ class TestTrajectoryDB:
         frame_id2 = traj_db.write_frame(run_id, 0, 1, 0, 0, example_atoms)
         
         # Add training frames
-        traj_db.add_training_frame(run_id, frame_id1, 0, 0, 0, 0)  # traj_id=0, chunk_id=0, attempt_index=0
-        traj_db.add_training_frame(run_id, frame_id2, 0, 0, 1, 0)  # traj_id=0, chunk_id=1, attempt_index=0
+        traj_db.add_training_frame(run_id, frame_id1, 0, 0, 0, 0, labeled_atoms)  # traj_id=0, chunk_id=0, attempt_index=0
+        traj_db.add_training_frame(run_id, frame_id2, 0, 0, 1, 0, labeled_atoms)  # traj_id=0, chunk_id=1, attempt_index=0
         
         # Mark chunk 1 as passed for trajectory 0
         traj_db.update_chunk_audit_status(run_id, 0, 1, 0, AuditStatus.PASSED)
@@ -922,3 +939,61 @@ class TestTrajectoryDB:
         """Test listing trajectories in non-existent run."""
         trajectories = traj_db.list_trajectories_in_run("nonexistent")
         assert trajectories == []
+
+
+class TestLabeledTrainingFrames:
+    """Tests for writing and reading labeled training frames."""
+
+    def _write_frame(self, traj_db, example_atoms, labeled_atoms, *, run_id="run", traj_id=0, chunk_id=0, attempt_index=0, frame_index=0):
+        """Helper: initialize a trajectory, write a raw frame, add the labeled training frame."""
+        traj_db.initialize_trajectory(run_id, traj_id, 100, example_atoms)
+        frame_id = traj_db.write_frame(run_id, traj_id, chunk_id, attempt_index, frame_index, example_atoms)
+        traj_db.add_training_frame(
+            run_id=run_id,
+            trajectory_frame_id=frame_id,
+            model_version_sampled_from=0,
+            traj_id=traj_id,
+            chunk_id=chunk_id,
+            attempt_index=attempt_index,
+            atoms_labeled=labeled_atoms,
+        )
+        return frame_id
+
+    def test_energy_roundtrip(self, traj_db, example_atoms, labeled_atoms):
+        self._write_frame(traj_db, example_atoms, labeled_atoms)
+        result = traj_db.get_training_frames("run", training_round=0)
+        assert len(result) == 1
+        assert np.isclose(result[0].get_potential_energy(), labeled_atoms.get_potential_energy())
+
+    def test_forces_roundtrip(self, traj_db, example_atoms, labeled_atoms):
+        self._write_frame(traj_db, example_atoms, labeled_atoms)
+        result = traj_db.get_training_frames("run", training_round=0)
+        assert np.allclose(result[0].get_forces(), labeled_atoms.get_forces())
+
+    def test_filters_by_round(self, traj_db, example_atoms, labeled_atoms):
+        """Only frames from the requested round are returned."""
+        self._write_frame(traj_db, example_atoms, labeled_atoms)
+        assert len(traj_db.get_training_frames("run", training_round=0)) == 1
+        assert traj_db.get_training_frames("run", training_round=1) == []
+
+    def test_empty_when_no_frames(self, traj_db):
+        assert traj_db.get_training_frames("run", training_round=0) == []
+
+    def test_multiple_frames_same_round(self, traj_db, example_atoms, labeled_atoms):
+        """All frames for the same round come back."""
+        traj_db.initialize_trajectory("run", 0, 100, example_atoms)
+        for frame_index in range(3):
+            frame_id = traj_db.write_frame("run", 0, 0, 0, frame_index, example_atoms)
+            atoms = example_atoms.copy()
+            atoms.calc = SinglePointCalculator(atoms, energy=float(frame_index))
+            traj_db.add_training_frame(
+                run_id="run",
+                trajectory_frame_id=frame_id,
+                model_version_sampled_from=0,
+                traj_id=0, chunk_id=0, attempt_index=0,
+                atoms_labeled=atoms,
+            )
+        result = traj_db.get_training_frames("run", training_round=0)
+        assert len(result) == 3
+        energies = sorted(a.get_potential_energy() for a in result)
+        assert np.allclose(energies, [0.0, 1.0, 2.0])

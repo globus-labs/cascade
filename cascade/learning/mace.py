@@ -264,7 +264,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
 
         # Convert the training data from ASE -> MACE Configs
         train_loader = atoms_to_loader(train_data, batch_size, z_table, r_max, shuffle=True, drop_last=True)
-        valid_loader = atoms_to_loader(valid_data, batch_size, z_table, r_max, shuffle=False, drop_last=True)
+        valid_loader = atoms_to_loader(valid_data, batch_size, z_table, r_max, shuffle=False, drop_last=False)
 
         # Update the atomic energies for the current dataset
         _update_offset_factors(model, train_data, train_loader, device)
@@ -403,8 +403,11 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
 
         # Compile the loss
         train_losses = pd.DataFrame(train_losses).groupby('epoch').mean().reset_index()
-        valid_losses = pd.DataFrame(valid_losses).groupby('epoch').mean().reset_index()
-        log = train_losses.merge(valid_losses, on='epoch', suffixes=('_train', '_valid'))
+        if valid_losses:
+            valid_losses = pd.DataFrame(valid_losses).groupby('epoch').mean().reset_index()
+            log = train_losses.merge(valid_losses, on='epoch', suffixes=('_train', '_valid'))
+        else:
+            log = train_losses
         return self.serialize_model(model), log
 
     def make_calculator(self, model_msg: bytes | State, device: str) -> Calculator:

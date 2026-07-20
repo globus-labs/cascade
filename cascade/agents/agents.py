@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from asyncio import Event, Lock, wrap_future
 import logging
+from copy import deepcopy
 
 from academy.handle import Handle
 from academy.agent import Agent, action, loop
@@ -79,9 +80,6 @@ class DynamicsRunner(CascadeAgent):
         """Run dynamics until done, or a shutdown message is received"""
         while not (shutdown.is_set() or self.done):
 
-            # there are two conditions to release this lock: we finish, or we are waiting for new weights
-            # await self.weights_lock.acquire()
-            # submit dynamics for evaluation
             spec = AdvanceSpec(
                 atoms=self.atoms,
                 steps=self.chunk_size,
@@ -93,6 +91,7 @@ class DynamicsRunner(CascadeAgent):
 
             self.logger.info(f"Running dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index} with {spec.steps} steps")
 
+            # there are two conditions to release this lock: 1. we finish this pass over the trajecotyr chunk
             async with self.new_model_lock:
 
                 if self.new_model:
@@ -100,12 +99,12 @@ class DynamicsRunner(CascadeAgent):
                     self.new_model = None
                 self.logger.debug(
                     f"Submitting dynamics to executor dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index} with {spec.steps} steps")
+                # submit dynamics for evaluation
                 chunk_future = self.config.executor.submit(
                     self.config.advance_dynamics_task,
                     spec=spec,
                     learner=self.config.learner,
                     weights=self.config.weights,
-                    db_url=self.config.db_url,
                     device=self.config.device,
                     dyn_cls=self.config.dyn_cls,
                     dyn_kws=self.config.dyn_kws,
@@ -164,17 +163,18 @@ class DynamicsRunner(CascadeAgent):
                 self.logger.info(f"On timestep {self.timestep} of {self.config.n_steps}")
                 self.done = self.timestep >= self.config.n_steps
                 if self.done:
+                    # audit passed and trajectory is complete: shutdown
                     self.logger.info(f"Finished dynamics for traj {self.config.traj_id} chunk {self.chunk_ix} attempt {self.attempt}, shutting down")
                     self._traj_db.mark_trajectory_completed(run_id=self.config.run_id, traj_id=self.config.traj_id)
                     self.agent_shutdown()
                 else:
-                    # audit passed but not done, use the new atoms to run a new chunk
+                    # audit passed but not done: use the new atoms to run a new chunk in next pass of while loop
                     self.atoms = chunk_atoms[-1]
                     self.chunk_ix += 1
                     self.attempt = 0
                     self.logger.info(f"Updating traj {self.config.traj_id} to chunk {self.chunk_ix} attempt {self.attempt}")
             else:
-                # audit failed
+                # audit failed: wait for new weights
                 self.logger.info(f'Audit status failed for traj {self.config.traj_id} chunk {self.chunk_ix} attempt {self.attempt}, waiting for new weights...')
                 self.attempt += 1
                 self.received_weights.clear()
@@ -183,7 +183,7 @@ class DynamicsRunner(CascadeAgent):
 
     @action
     async def receive_weights(self, weights: bytes, model_version: int) -> None:
-        async with self.new_model_lock:
+        async with self.new_model_lock: # todo mt.2026.07.07: do we need this lock if we only call receive weights from a safe spot in the loop in this agent?
             self.new_model = (weights, model_version)
         self.logger.info(f"Received weights for model version {model_version}")
         self.received_weights.set()
@@ -302,89 +302,61 @@ class Labeler(CascadeAgent):
         super().__init__()
         self.config = config
 
-    @action
-    async def label_data(self, frame: TrainingFrame) -> None:
-        # todo: clean up this method. at the very least the arguments could be DRYed out, can also potentially reduce db interaction?
+    def _record_labeling_started(self, frame: TrainingFrame) -> None:
         # todo: discuss with will. wouldnt a pub/sub be better than DB for communicating this information. this is essentially a pub/sub spoof
-        # Check if STARTED_LABELING exists for this chunk (idempotent)
-        if not self._traj_db.has_chunk_event(
+        chunk_kws = dict(
             run_id=self.config.run_id,
             traj_id=frame.traj_id,
             chunk_id=frame.chunk_id,
             attempt_index=frame.attempt_index,
-            event_type=ChunkEventType.STARTED_LABELING
-        ):
-            self._traj_db.record_chunk_event(
-                run_id=self.config.run_id,
-                traj_id=frame.traj_id,
-                chunk_id=frame.chunk_id,
-                attempt_index=frame.attempt_index,
-                event_type=ChunkEventType.STARTED_LABELING
-            )
+        )
+        if not self._traj_db.has_chunk_event(**chunk_kws, event_type=ChunkEventType.STARTED_LABELING):
+            self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.STARTED_LABELING)
+        self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.STARTED_LABELING_FRAME, frame_id=frame.frame_id)
 
-        # Record STARTED_LABELING_FRAME
-        self._traj_db.record_chunk_event(
+    def _record_labeling_finished(self, frame: TrainingFrame) -> None:
+        chunk_kws = dict(
             run_id=self.config.run_id,
             traj_id=frame.traj_id,
             chunk_id=frame.chunk_id,
             attempt_index=frame.attempt_index,
-            event_type=ChunkEventType.STARTED_LABELING_FRAME,
-            frame_id=frame.frame_id
         )
-
-        frame_future = self.config.executor.submit(
-            self.config.label_task,
-            frame
-        )
-        wrapped_future = wrap_future(frame_future)
-        await wrapped_future
-        frame = wrapped_future.result()
         self._traj_db.add_training_frame(
-            run_id=self.config.run_id,
+            **chunk_kws,
             trajectory_frame_id=frame.frame_id,
             model_version_sampled_from=frame.model_version,
-            traj_id=frame.traj_id,
-            chunk_id=frame.chunk_id,
-            attempt_index=frame.attempt_index
+            atoms_labeled=frame.atoms_labeled,
         )
+        self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.FINISHED_LABELING_FRAME, frame_id=frame.frame_id)
 
-        # Record FINISHED_LABELING_FRAME after successfully adding training frame
-        self._traj_db.record_chunk_event(
-            run_id=self.config.run_id,
-            traj_id=frame.traj_id,
-            chunk_id=frame.chunk_id,
-            attempt_index=frame.attempt_index,
-            event_type=ChunkEventType.FINISHED_LABELING_FRAME,
-            frame_id=frame.frame_id
-        )
-
-        # Check if all frames for chunk are done
-        labeled_count = self._traj_db.count_labeled_frames_for_chunk(
-            run_id=self.config.run_id,
-            traj_id=frame.traj_id,
-            chunk_id=frame.chunk_id,
-            attempt_index=frame.attempt_index
-        )
+        labeled_count = self._traj_db.count_labeled_frames_for_chunk(**chunk_kws)
         self.logger.info(
             f"Finished labeleing traj={frame.traj_id}, "
             f"chunk={frame.chunk_id}, attempt={frame.attempt_index};"
             f"labled from chunk={labeled_count}, sampled from chunk:{frame.n_sampled_frames}"
         )
-        if labeled_count == frame.n_sampled_frames-1: # recall the chunk stores an initial frame which wont get labeled
-            # All frames labeled, record FINISHED_LABELING
-            self._traj_db.record_chunk_event(
-                run_id=self.config.run_id,
-                traj_id=frame.traj_id,
-                chunk_id=frame.chunk_id,
-                attempt_index=frame.attempt_index,
-                event_type=ChunkEventType.FINISHED_LABELING
-            )
-
+        if labeled_count == frame.n_sampled_frames-1:  # recall the chunk stores an initial frame which wont get labeled
+            self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.FINISHED_LABELING)
         self.logger.info(
             f"Added training frame to database: traj={frame.traj_id}, "
             f"chunk={frame.chunk_id}, attempt={frame.attempt_index}, "
             f"model_version={frame.model_version}"
         )
+
+    @action
+    async def label_data(self, frame: TrainingFrame) -> None:
+        self._record_labeling_started(frame)
+
+        frame_future = self.config.executor.submit(
+            self.config.label_task,
+            frame,
+            self.config.calc_factory
+        )
+        wrapped_future = wrap_future(frame_future)
+        await wrapped_future
+        frame = wrapped_future.result()
+
+        self._record_labeling_finished(frame)
 
 
 class Trainer(CascadeAgent):
@@ -394,23 +366,41 @@ class Trainer(CascadeAgent):
         self.db_url = config.db_url
         super().__init__()
         self.config = config
+        self.weights = deepcopy(config.weights)
 
     @action
     async def train_model(
         self,
         training_round: int,
     ) -> bytes:
-
+        from sklearn.model_selection import train_test_split
+        self.logger.info(f'Fetching training data for training round {training_round}')
+        train_data = self._traj_db.get_training_frames(
+            self.config.run_id,
+            training_round=training_round,
+        )
+        if not train_data:
+            self.logger.warning(f'No training frames found for round {training_round}, skipping training')
+            return self.weights
+        self.logger.info(f'Got {len(train_data)} training frames')
+        train_data, valid_data = train_test_split(train_data, test_size=0.2)
+        self.logger.info(f'Train size: {len(train_data)}, val size: {len(valid_data)}')
+        self.logger.info('Submitting training task')
         training_future = self.config.executor.submit(
             self.config.training_task,
-            self.config.learner,
-            *self.config.training_args,
-            **self.config.training_kws
+            learner=self.config.learner,
+            weights=self.weights,
+            train_data=train_data,
+            valid_data=valid_data,
+            train_kws=self.config.training_kws
         )
         wrapped_future = wrap_future(training_future)
         await wrapped_future
-        model_msg = wrapped_future.result()
-        return model_msg
+        self.logger.info('Retrieving new weights')
+        weights, results = wrapped_future.result()
+        self._traj_db.write_training_log(self.config.run_id, training_round, results)
+        self.weights = weights
+        return weights
 
 
 class DatabaseMonitor(CascadeAgent):
@@ -505,28 +495,27 @@ class DatabaseMonitor(CascadeAgent):
 
                 # Get the training round for frames that will be used in this retraining
                 # (frames created before this retraining will have the current max training_round)
-                # todo: why do we ask the database for the training round when we have it on this class
-                training_round_for_retrain = self._traj_db.get_current_training_round(self.config.run_id)
-
-                # Increment training round - new frames created after this will use the new round
-                self.current_training_round = training_round_for_retrain + 1
-
                 self.logger.info(
                     f"Starting retraining (round {self.current_training_round}) triggered by: {', '.join(trigger_reason)}\n"
                     f"Training frame count: current={current_count}, last_train={self.last_train_count}, "
                     f"new={new_frames}, active_trajs={total_active}, labeled_trajs={active_with_labeling}, "
                     f"fraction={sampled_fraction:.2%}"
                 )
-
+                # Stamp all unlabeled frames with the current round before training
+                self._traj_db.mark_training_frames_for_round(
+                    self.config.run_id,
+                    training_round=self.current_training_round,
+                )
                 # Train model and update weights in dynamics engine
                 weights = await self.trainer.train_model(self.current_training_round)
-
                 # Record FINISHED_TRAINING event after training completes
                 self._traj_db.record_training_event(
                     run_id=self.config.run_id,
                     event_type=ChunkEventType.FINISHED_TRAINING,
                     training_round=self.current_training_round
                 )
+                self.current_training_round += 1
+                self.last_train_count = current_count
 
                 self.model_version += 1
 

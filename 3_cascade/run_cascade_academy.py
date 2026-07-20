@@ -7,6 +7,7 @@ import datetime
 import hashlib
 import json
 import pathlib
+from functools import partial
 
 import ase
 from ase.io import read
@@ -45,9 +46,10 @@ from cascade.agents.task import (
     random_audit,
     advance_dynamics,
     random_sample,
-    label_noop,
-    training_noop
+    label_frame,
+    train
 )
+
 
 # Suppress FutureWarning about torch.load weights_only parameter from MACE
 warnings.filterwarnings("ignore", category=FutureWarning, module="mace.calculators")
@@ -298,15 +300,21 @@ async def main():
                 run_id=run_id,
                 db_url=args.db_url,
                 executor=pool,
-                label_task=label_noop
+                label_task=label_frame,
+                calc_factory=partial(mace_mp, model='medium', device='cpu', default_dtype="float32"),
                 )
             trainer_config = TrainerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
+                weights=init_weights,
                 executor=pool,
-                training_task=training_noop,
+                training_task=train,
                 training_args=(),
-                training_kws={},
+                training_kws=dict(
+                    num_epochs=10,
+                    device='cpu',
+                    batch_size=2,
+                ),
                 learner=learner
             )
 

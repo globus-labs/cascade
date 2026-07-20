@@ -39,7 +39,7 @@ class TrainingFrame:
     frame_id: int
     n_sampled_frames: int # todo: is this really the way to pass this around
     labeled: bool = False
-
+    atoms_labeled: Atoms = None
 
 @dataclass
 class AdvanceSpec:

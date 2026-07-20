@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+
+from matscipy.calculators.polydisperse import calculator
+
 if TYPE_CHECKING:
+    from typing import Callable
     from cascade.model import AuditResult, Chunk
     from cascade.model import AdvanceSpec, TrainingFrame
     from cascade.learning.base import BaseLearnableForcefield
+    from cascade.calculator import Calculator
     from ase import Atoms
     from pathlib import Path
     import numpy as np
+    import pandas as pd
 from ase.optimize.optimize import Dynamics
 
 
@@ -75,7 +81,6 @@ def advance_dynamics(
     spec: AdvanceSpec,
     learner: BaseLearnableForcefield,
     weights: bytes,
-    db_url: str,
     device: str,
     run_dir: str,
     dyn_cls: type[Dynamics],
@@ -136,11 +141,19 @@ def advance_dynamics(
 
     return frames
 
-
-def label_noop(spec: TrainingFrame) -> TrainingFrame:
+def label_noop(spec: TrainingFrame, calc_factory: Callable[..., Calculator]) -> TrainingFrame:
     """Returns forces from the training frame spec unmodified"""
     return spec
 
+def label_frame(frame: TrainingFrame, calc_factory: Callable[..., Calculator]) -> TrainingFrame:
+    """runs the specified calculator on the atoms"""
+    from cascade.utils import canonicalize
+    calc = calc_factory()
+    atoms_labeled = frame.atoms.copy()
+    atoms_labeled.calc = calc
+    calc.calculate(atoms_labeled)
+    frame.atoms_labeled = canonicalize(atoms_labeled)
+    return frame
 
 # todo: this should be configurable, or at least not hard code magic knowledge
 def training_noop(learner: BaseLearnableForcefield) -> bytes:
@@ -151,3 +164,12 @@ def training_noop(learner: BaseLearnableForcefield) -> bytes:
     model = calc.models[0]
     model_msg = learner.serialize_model(model)
     return model_msg
+
+def train(learner: BaseLearnableForcefield,
+          weights: bytes,
+          train_data: list[Atoms],
+          valid_data: list[Atoms],
+          train_kws: dict[str, object],
+          ) -> tuple[bytes, pd.DataFrame]:
+    weights, results = learner.train(weights, train_data, valid_data, **train_kws)
+    return weights, results

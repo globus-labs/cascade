@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from ase.calculators.calculator import Calculator
+
 if TYPE_CHECKING:
     from ase import Atoms
     from ase.optimize.optimize import Dynamics
@@ -93,12 +95,16 @@ class LabelerConfig(CascadeAgentConfig):
     """Configuration for Labeler agent"""
     executor: Executor
     """Where to run label_task"""
-    label_task: Callable[[TrainingFrame], TrainingFrame]
+    calc_factory: Callable[..., Calculator]
+    """Create the calculator to use for labeling"""
+    label_task: Callable[[TrainingFrame, Callable[..., Calculator]], TrainingFrame]
     """Adds labels to training frames"""
 
 @dataclass
 class TrainerConfig(CascadeAgentConfig):
     """Configuration for Trainer agent"""
+    weights: bytes
+    """Initial weights for trainer"""
     training_task: Callable[..., bytes]
     """Returns trained model weights"""
     training_args: list | tuple
