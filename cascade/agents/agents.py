@@ -104,7 +104,7 @@ class DynamicsRunner(CascadeAgent):
                     self.config.advance_dynamics_task,
                     spec=spec,
                     learner=self.config.learner,
-                    weights=self.config.weights,
+                    weights=self.weights,
                     device=self.config.device,
                     dyn_cls=self.config.dyn_cls,
                     dyn_kws=self.config.dyn_kws,
