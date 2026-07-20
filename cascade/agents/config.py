@@ -56,8 +56,8 @@ class DynamicsRunnerConfig(CascadeAgentConfig):
     """Task to run dynamics"""
     learner: BaseLearnableForcefield
     """Learner to be used for dynamics"""
-    weights: bytes
-    """Initial weights for dynamics"""
+    weights: list[bytes]
+    """Initial weights for dynamics, one entry per ensemble member"""
     dyn_cls: type[Dynamics]
     """ASE dynamics integrator"""
     dyn_kws: dict[str, object] | None

@@ -306,7 +306,7 @@ async def main():
             trainer_config = TrainerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
-                weights=init_weights,
+                weights=[init_weights],
                 executor=pool,
                 training_task=train,
                 training_args=(),
@@ -364,7 +364,7 @@ async def main():
                         advance_dynamics_task=advance_dynamics,
                         learner=learner,
                         run_dir=run_dir,
-                        weights=init_weights,
+                        weights=[init_weights],
                         dyn_cls=VelocityVerlet,
                         dyn_kws={'timestep': 1 * units.fs},
                         run_kws={},

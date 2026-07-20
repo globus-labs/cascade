@@ -70,7 +70,7 @@ class DynamicsRunner(CascadeAgent):
         # for handling weight updates
         self.received_weights = Event()
         self.new_model_lock = Lock()
-        self.new_model: tuple[bytes, int] | None = None  # weights, version
+        self.new_model: tuple[list[bytes], int] | None = None  # weights, version
 
     @loop
     async def run(
@@ -184,7 +184,7 @@ class DynamicsRunner(CascadeAgent):
                 self.logger.info('Received new weights')
 
     @action
-    async def receive_weights(self, weights: bytes, model_version: int) -> None:
+    async def receive_weights(self, weights: list[bytes], model_version: int) -> None:
         async with self.new_model_lock: # todo mt.2026.07.07: do we need this lock if we only call receive weights from a safe spot in the loop in this agent?
             self.new_model = (weights, model_version)
         self.logger.info(f"Received weights for model version {model_version}")

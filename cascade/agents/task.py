@@ -80,7 +80,7 @@ def random_sample(
 def advance_dynamics(
     spec: AdvanceSpec,
     learner: BaseLearnableForcefield,
-    weights: bytes,
+    weights: list[bytes],
     device: str,
     run_dir: str,
     dyn_cls: type[Dynamics],
@@ -94,7 +94,9 @@ def advance_dynamics(
     Arguments:
         spec: contains atoms and metadata about trajectory
         learner: used to make the calculator
-        weights: weights to add to the calculator
+        weights: weights for the calculator, one entry per ensemble member. A
+            single-element list uses a plain calculator; more than one builds an
+            ensemble calculator (see BaseLearnableForcefield.make_ensemble_calculator).
         db_url: url to write frames to
         device: for torch
         dyn_cls: ASE dynamics class
@@ -125,7 +127,10 @@ def advance_dynamics(
 
     atoms = spec.atoms
     logger.info('Creating calculator')
-    calc = learner.make_calculator(weights, device=device)
+    if len(weights) == 1:
+        calc = learner.make_calculator(weights[0], device=device)
+    else:
+        calc = learner.make_ensemble_calculator(weights, device=device)
     atoms.calc = calc
 
     logger.info('Creating dynamics class')
