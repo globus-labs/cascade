@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from ase.calculators.calculator import Calculator
@@ -66,6 +66,10 @@ class DynamicsRunnerConfig(CascadeAgentConfig):
     device: str = 'cpu'
     """Device to run learner for dynamics"""
     model_version: int = 0  # todo: I am not so sure this belongs here
+    uq_hook: Callable[[Atoms], tuple[dict, dict]] | None = None
+    """Optional hook called on each frame to compute UQ from an ensemble calculator's results"""
+    uq_kws: dict[str, object] = field(default_factory=dict)
+    """Keyword arguments passed to uq_hook"""
 
 
 @dataclass
