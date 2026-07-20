@@ -100,6 +100,8 @@ def advance_dynamics(
     dyn_cls: type[Dynamics],
     dyn_kws: dict[str, object],
     run_kws: dict[str, object],
+    uq_hook: Callable[[Atoms], tuple[dict, dict]] | None = None,
+    uq_kws: dict[str, object] | None = None,
 ) -> list[Atoms]:
     """Advance dynamics of a chunk of a trajectory
 
@@ -112,7 +114,14 @@ def advance_dynamics(
         dyn_cls: ASE dynamics class
         dyn_kws: kws to the dynamics constructor
         run_kws: kws to the dynamics run method
+        uq_hook: optional callable invoked on each frame's Atoms after force evaluation.
+            Returns (per_atom, per_frame) dicts of named UQ quantities, stored into
+            atoms.arrays / atoms.info respectively. Expects an ensemble-producing
+            calculator (e.g. one populating atoms.calc.results['forces_ens']).
+        uq_kws: keyword arguments passed to uq_hook
     """
+
+    uq_kws = uq_kws or {}
 
     # todo: stop this from writing to the screen
     logfile = str(Path(run_dir) / f'traj-{spec.traj_id}_chunk-{spec.chunk_id}_att-{spec.attempt_index}_md.log')
@@ -136,6 +145,15 @@ def advance_dynamics(
         logger.info('getting results from calc')
         f = atoms.calc.results['forces']
         atoms.calc.results['forces'] = f.astype(np.float64)
+
+        if uq_hook is not None:
+            logger.info('computing UQ')
+            per_atom, per_frame = uq_hook(atoms, **uq_kws)
+            for name, values in per_atom.items():
+                atoms.new_array(name, np.asarray(values))
+            for name, value in per_frame.items():
+                atoms.info[name] = value
+
         canonical_atoms = canonicalize(atoms)
 
         logger.info('writing frame to db')
@@ -148,6 +166,45 @@ def advance_dynamics(
     os.remove(logfile)
 
     return frames
+
+
+def ensemble_force_deviation_uq(atoms: Atoms) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    """UQ hook for use with an ensemble calculator (see EnsembleCalculator)
+
+    Reduces the ensemble-member axis of the per-atom force disagreement, leaving
+    per-atom and per-frame quantities for write_frame to attach to the Atoms.
+
+    Requires atoms.calc.results to contain 'forces_ens', i.e. an ensemble calculator
+    must have been used to produce this frame.
+    """
+    import numpy as np
+
+    ens = atoms.calc.results['forces_ens']       # (n_models, n_atoms, 3)
+    f = atoms.calc.results['forces']              # (n_atoms, 3)
+    dev = np.linalg.norm(ens - f[None], axis=-1).mean(axis=0)  # (n_atoms,)
+
+    per_atom = {'uq_force_std': dev}
+    per_frame = {'uq_force_std_max': float(dev.max())}
+    return per_atom, per_frame
+
+
+def uq_threshold_audit(
+    chunk: Chunk,
+    field: str = 'uq_force_std_max',
+    threshold: float = 0.1,
+) -> AuditResult:
+    """Audit a chunk by thresholding a per-frame UQ scalar stored in atoms.info
+
+    Requires the chunk's frames to have been produced with a uq_hook (e.g.
+    ensemble_force_deviation_uq) that populates `field`.
+    """
+    from cascade.model import AuditResult, AuditStatus
+    import numpy as np
+
+    values = np.array([a.info[field] for a in chunk.atoms])
+    score = float(values.max())
+    status = AuditStatus.PASSED if score < threshold else AuditStatus.FAILED
+    return AuditResult(status=status, score=score)
 
 def label_noop(spec: TrainingFrame, calc_factory: Callable[..., Calculator]) -> TrainingFrame:
     """Returns forces from the training frame spec unmodified"""

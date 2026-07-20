@@ -109,7 +109,9 @@ class DynamicsRunner(CascadeAgent):
                     dyn_cls=self.config.dyn_cls,
                     dyn_kws=self.config.dyn_kws,
                     run_kws=self.config.run_kws,
-                    run_dir=str(self.config.run_dir)
+                    run_dir=str(self.config.run_dir),
+                    uq_hook=self.config.uq_hook,
+                    uq_kws=self.config.uq_kws,
                 )
 
             #todo mt.2026.04.27 does this still need to be logged?
