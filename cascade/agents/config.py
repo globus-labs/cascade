@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         TrainingFrame,
         Chunk
     )
+    import pandas as pd
 
 @dataclass
 class CascadeAgentConfig:
@@ -107,9 +108,9 @@ class LabelerConfig(CascadeAgentConfig):
 @dataclass
 class TrainerConfig(CascadeAgentConfig):
     """Configuration for Trainer agent"""
-    weights: bytes
-    """Initial weights for trainer"""
-    training_task: Callable[..., bytes]
+    weights: list[bytes]
+    """Current weights for each ensemble member"""
+    training_task: Callable[..., tuple[bytes, pd.DataFrame]]
     """Returns trained model weights"""
     training_args: list | tuple
     """passed to training_task"""
@@ -118,6 +119,8 @@ class TrainerConfig(CascadeAgentConfig):
     learner: BaseLearnableForcefield
     executor: Executor
     """Where to run training_task"""
+    bootstrap_fraction: float = 1.0
+    """Fraction of available training frames to resample (with replacement) per ensemble member"""
 
 
 @dataclass
