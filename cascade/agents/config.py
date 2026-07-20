@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         Chunk
     )
     import pandas as pd
+    from cascade.learning.finetuning import MultiHeadConfig
 
 @dataclass
 class CascadeAgentConfig:
@@ -121,6 +122,10 @@ class TrainerConfig(CascadeAgentConfig):
     """Where to run training_task"""
     bootstrap_fraction: float = 1.0
     """Fraction of available training frames to resample (with replacement) per ensemble member"""
+    replay: MultiHeadConfig | None = None
+    """Multi-head replay config (see cascade.learning.finetuning.MultiHeadConfig), passed through
+    to learner.train to prevent catastrophic forgetting. Only meaningful for learners whose train()
+    accepts a `replay` kwarg (currently MACEInterface)."""
 
 
 @dataclass

@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from cascade.model import AdvanceSpec, TrainingFrame
     from cascade.learning.base import BaseLearnableForcefield
     from cascade.calculator import Calculator
+    from cascade.learning.finetuning import MultiHeadConfig
     from ase import Atoms
     from pathlib import Path
     import numpy as np
@@ -232,6 +233,7 @@ def train(learner: BaseLearnableForcefield,
           train_data: list[Atoms],
           valid_data: list[Atoms],
           train_kws: dict[str, object],
+          replay: MultiHeadConfig | None = None,
           ) -> tuple[bytes, pd.DataFrame]:
-    weights, results = learner.train(weights, train_data, valid_data, **train_kws)
+    weights, results = learner.train(weights, train_data, valid_data, replay=replay, **train_kws)
     return weights, results

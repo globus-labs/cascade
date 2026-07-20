@@ -405,6 +405,7 @@ class Trainer(CascadeAgent):
                 train_data=boot_data,
                 valid_data=valid_data,
                 train_kws=self.config.training_kws,
+                replay=self.config.replay,
             )
             futures.append(wrap_future(future))
 
