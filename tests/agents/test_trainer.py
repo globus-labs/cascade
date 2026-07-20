@@ -66,7 +66,7 @@ async def test_bootstrap_and_parallel_submit(temp_db_url, traj_db, populated_run
     under the correct member_index."""
     calls = []
 
-    def fake_training_task(learner, weights, train_data, valid_data, train_kws):
+    def fake_training_task(learner, weights, train_data, valid_data, train_kws, replay=None):
         calls.append({
             'weights': weights,
             'train_data': list(train_data),
