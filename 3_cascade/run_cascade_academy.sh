@@ -14,6 +14,7 @@ python run_cascade_academy.py \
     --accept-rate .5 \
     --learner mace \
     --calc mace \
+    --n-ensemble 2 \
     --dyn-cls velocity-verlet \
     --dt_fs 1.0 \
     --loginterval 1 \

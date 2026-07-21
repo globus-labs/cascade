@@ -98,6 +98,11 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help='Minimum number of frames before fraction-based retraining can trigger'
     ) # todo: can we clarify why this exsits along with retrain-len?
+    parser.add_argument('--n-ensemble',
+        type=int,
+        default=1,
+        help='Number of ensemble members for MLFF'
+    )
     parser.add_argument(
         '--n-sample-frames',
         type=int,
@@ -230,7 +235,11 @@ async def main():
 
     # set up parsl
     # a chunk can only be in one worker at a time + training happens concurrently
-    n_parsl_workers = len(initial_specs) + 1
+    # note that this is really too many workers since at least one agent is waiting for
+    # a new model while training is happening. can possibly do some math based on the retrain
+    # logic to figure out the real max number of used workers
+    # but this may not make as much sense once we distribute the workflow, so no worries for now
+    n_parsl_workers = len(initial_specs) + args.n_ensemble
     n_agents = len(initial_specs) + 5 # one dynamics runner per traj and one of each other agent
     config = Config(
         executors=[
@@ -306,7 +315,7 @@ async def main():
             trainer_config = TrainerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
-                weights=[init_weights],
+                weights=[init_weights]*args.n_ensemble,
                 executor=pool,
                 training_task=train,
                 training_args=(),
