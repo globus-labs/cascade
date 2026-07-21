@@ -1,5 +1,8 @@
 #strace -f -e trace=process,open,openat,close,socket,connect,accept \
 #    -o trace.log \
+#    --replay-dataset ./datasets/mace-mp/sampled_1000.traj \
+#    --replay-downselect 10 \
+#    --replay-batch-size 2 \
 python run_cascade_academy.py \
     --initial-structures \
         ../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp \
@@ -15,9 +18,6 @@ python run_cascade_academy.py \
     --learner mace \
     --calc mace \
     --n-ensemble 2 \
-    --replay-dataset ./datasets/mace-mp/sampled_1000.traj \
-    --replay-downselect 10 \
-    --replay-batch-size 2 \
     --dyn-cls velocity-verlet \
     --dt_fs 1.0 \
     --loginterval 1 \
