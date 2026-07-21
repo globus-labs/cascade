@@ -41,6 +41,7 @@ from cascade.agents.config import (
 )
 from cascade.model import AdvanceSpec
 from cascade.learning.mace import MACEInterface
+from cascade.learning.finetuning import MultiHeadConfig
 from cascade.agents.db_orm import TrajectoryDB
 from cascade.agents.task import (
     random_audit,
@@ -151,6 +152,11 @@ def parse_args() -> argparse.Namespace:
         default='postgresql://ase:pw@localhost:5432/cascade',
         help='Database URL'
     )
+    parser.add_argument('--replay-dataset', default=None, help='Path to an ASE database containing data to replay during finetuning')
+    parser.add_argument('--replay-downselect', default=None, type=int, help='Max number of entries to use from replay dataset')
+    parser.add_argument('--replay-frequency', default=1, type=int, help='How often to replay')
+    parser.add_argument('--replay-lr-reduction', default=1, type=float, help='Factor by which to reduce LR during replay')
+    parser.add_argument('--replay-batch-size', default=None, type=int, help='Batch size used during replay')
     args = parser.parse_args()
 
     return args
@@ -206,6 +212,18 @@ async def main():
     # initialize database
     traj_db = TrajectoryDB(args.db_url)
     traj_db.create_tables()
+
+    # set up multi-head replay, if requested
+    if args.replay_dataset is not None:
+        replay = MultiHeadConfig(
+            original_dataset=read(args.replay_dataset, slice(None)),
+            num_downselect=args.replay_downselect,
+            epoch_frequency=args.replay_frequency,
+            lr_reduction=args.replay_lr_reduction,
+            batch_size=args.replay_batch_size,
+        )
+    else:
+        replay = None
 
     # read initial structures
     init_strc = args.initial_structures
@@ -324,7 +342,8 @@ async def main():
                     device='cpu',
                     batch_size=2,
                 ),
-                learner=learner
+                learner=learner,
+                replay=replay,
             )
 
             # launch all agents

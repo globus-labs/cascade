@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import json
 import logging
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING
@@ -1356,7 +1357,11 @@ class TrajectoryDB:
                 run_id=run_id,
                 training_round=training_round,
                 member_index=member_index,
-                log_json=log.to_dict(orient='records'),
+                # NaN (e.g. from replay columns that only populate every few epochs) is not
+                # valid JSON and Postgres' json/jsonb columns reject it outright. `to_dict`
+                # leaves NaN as-is, but `to_json` correctly renders it as `null`, so round-trip
+                # through that instead.
+                log_json=json.loads(log.to_json(orient='records')),
             ))
 
     def get_training_logs(self, run_id: str) -> pd.DataFrame:
