@@ -51,6 +51,7 @@ from cascade.agents.config import (
 )
 from cascade.model import AdvanceSpec
 from cascade.learning.mace import MACEInterface
+from cascade.learning.finetuning import MultiHeadConfig
 from cascade.agents.db_orm import TrajectoryDB
 from cascade.agents.task import (
     random_audit,
@@ -108,6 +109,11 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help='Minimum number of frames before fraction-based retraining can trigger'
     ) # todo: can we clarify why this exsits along with retrain-len?
+    parser.add_argument('--n-ensemble',
+        type=int,
+        default=1,
+        help='Number of ensemble members for MLFF'
+    )
     parser.add_argument(
         '--n-sample-frames',
         type=int,
@@ -171,6 +177,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default='cpu',
     )
+    parser.add_argument('--replay-dataset', default=None, help='Path to an ASE database containing data to replay during finetuning')
+    parser.add_argument('--replay-downselect', default=None, type=int, help='Max number of entries to use from replay dataset')
+    parser.add_argument('--replay-frequency', default=1, type=int, help='How often to replay')
+    parser.add_argument('--replay-lr-reduction', default=1, type=float, help='Factor by which to reduce LR during replay')
+    parser.add_argument('--replay-batch-size', default=None, type=int, help='Batch size used during replay')
     args = parser.parse_args()
 
     return args
@@ -227,6 +238,18 @@ async def main():
     traj_db = TrajectoryDB(args.db_url)
     traj_db.create_tables()
 
+    # set up multi-head replay, if requested
+    if args.replay_dataset is not None:
+        replay = MultiHeadConfig(
+            original_dataset=read(args.replay_dataset, slice(None)),
+            num_downselect=args.replay_downselect,
+            epoch_frequency=args.replay_frequency,
+            lr_reduction=args.replay_lr_reduction,
+            batch_size=args.replay_batch_size,
+        )
+    else:
+        replay = None
+
     # read initial structures
     init_strc = args.initial_structures
     initial_specs = []
@@ -255,7 +278,11 @@ async def main():
 
     # set up parsl
     # a chunk can only be in one worker at a time + training happens concurrently
-    n_parsl_workers = len(initial_specs) + 1
+    # note that this is really too many workers since at least one agent is waiting for
+    # a new model while training is happening. can possibly do some math based on the retrain
+    # logic to figure out the real max number of used workers
+    # but this may not make as much sense once we distribute the workflow, so no worries for now
+    n_parsl_workers = len(initial_specs) + args.n_ensemble
     n_agents = len(initial_specs) + 5 # one dynamics runner per traj and one of each other agent
     config = Config(
         executors=[
@@ -331,7 +358,7 @@ async def main():
             trainer_config = TrainerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
-                weights=init_weights,
+                weights=[init_weights]*args.n_ensemble,
                 executor=pool,
                 training_task=train,
                 training_args=(),
@@ -340,7 +367,8 @@ async def main():
                     device=args.device_train,
                     batch_size=2,
                 ),
-                learner=learner
+                learner=learner,
+                replay=replay,
             )
 
             # launch all agents
@@ -389,7 +417,7 @@ async def main():
                         advance_dynamics_task=advance_dynamics,
                         learner=learner,
                         run_dir=run_dir,
-                        weights=init_weights,
+                        weights=[init_weights],
                         dyn_cls=VelocityVerlet,
                         dyn_kws={'timestep': 1 * units.fs},
                         run_kws={},

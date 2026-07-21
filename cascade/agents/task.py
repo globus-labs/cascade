@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from cascade.model import AdvanceSpec, TrainingFrame
     from cascade.learning.base import BaseLearnableForcefield
     from cascade.calculator import Calculator
+    from cascade.learning.finetuning import MultiHeadConfig
     from ase import Atoms
     from pathlib import Path
     import numpy as np
@@ -94,7 +95,7 @@ def random_sample(
 def advance_dynamics(
     spec: AdvanceSpec,
     learner: BaseLearnableForcefield,
-    weights: bytes,
+    weights: list[bytes],
     device: str,
     run_dir: str,
     dyn_cls: type[Dynamics],
@@ -108,7 +109,9 @@ def advance_dynamics(
     Arguments:
         spec: contains atoms and metadata about trajectory
         learner: used to make the calculator
-        weights: weights to add to the calculator
+        weights: weights for the calculator, one entry per ensemble member. A
+            single-element list uses a plain calculator; more than one builds an
+            ensemble calculator (see BaseLearnableForcefield.make_ensemble_calculator).
         db_url: url to write frames to
         device: for torch
         dyn_cls: ASE dynamics class
@@ -133,7 +136,10 @@ def advance_dynamics(
 
     atoms = spec.atoms
     logger.info('Creating calculator')
-    calc = learner.make_calculator(weights, device=device)
+    if len(weights) == 1:
+        calc = learner.make_calculator(weights[0], device=device)
+    else:
+        calc = learner.make_ensemble_calculator(weights, device=device)
     atoms.calc = calc
 
     logger.info('Creating dynamics class')
@@ -233,6 +239,7 @@ def train(learner: BaseLearnableForcefield,
           train_data: list[Atoms],
           valid_data: list[Atoms],
           train_kws: dict[str, object],
+          replay: MultiHeadConfig | None = None,
           ) -> tuple[bytes, pd.DataFrame]:
-    weights, results = learner.train(weights, train_data, valid_data, **train_kws)
+    weights, results = learner.train(weights, train_data, valid_data, replay=replay, **train_kws)
     return weights, results

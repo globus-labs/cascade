@@ -70,7 +70,7 @@ class DynamicsRunner(CascadeAgent):
         # for handling weight updates
         self.received_weights = Event()
         self.new_model_lock = Lock()
-        self.new_model: tuple[bytes, int] | None = None  # weights, version
+        self.new_model: tuple[list[bytes], int] | None = None  # weights, version
 
     @loop
     async def run(
@@ -104,7 +104,7 @@ class DynamicsRunner(CascadeAgent):
                     self.config.advance_dynamics_task,
                     spec=spec,
                     learner=self.config.learner,
-                    weights=self.config.weights,
+                    weights=self.weights,
                     device=self.config.device,
                     dyn_cls=self.config.dyn_cls,
                     dyn_kws=self.config.dyn_kws,
@@ -184,7 +184,7 @@ class DynamicsRunner(CascadeAgent):
                 self.logger.info('Received new weights')
 
     @action
-    async def receive_weights(self, weights: bytes, model_version: int) -> None:
+    async def receive_weights(self, weights: list[bytes], model_version: int) -> None:
         async with self.new_model_lock: # todo mt.2026.07.07: do we need this lock if we only call receive weights from a safe spot in the loop in this agent?
             self.new_model = (weights, model_version)
         self.logger.info(f"Received weights for model version {model_version}")
@@ -374,8 +374,10 @@ class Trainer(CascadeAgent):
     async def train_model(
         self,
         training_round: int,
-    ) -> bytes:
+    ) -> list[bytes]:
         from sklearn.model_selection import train_test_split
+        import numpy as np
+
         self.logger.info(f'Fetching training data for training round {training_round}')
         train_data = self._traj_db.get_training_frames(
             self.config.run_id,
@@ -387,22 +389,34 @@ class Trainer(CascadeAgent):
         self.logger.info(f'Got {len(train_data)} training frames')
         train_data, valid_data = train_test_split(train_data, test_size=0.2)
         self.logger.info(f'Train size: {len(train_data)}, val size: {len(valid_data)}')
-        self.logger.info('Submitting training task')
-        training_future = self.config.executor.submit(
-            self.config.training_task,
-            learner=self.config.learner,
-            weights=self.weights,
-            train_data=train_data,
-            valid_data=valid_data,
-            train_kws=self.config.training_kws
-        )
-        wrapped_future = wrap_future(training_future)
-        await wrapped_future
+
+        rng = np.random.default_rng()
+        n_sample = int(len(train_data) * self.config.bootstrap_fraction)
+
+        self.logger.info(f'Submitting {len(self.weights)} bootstrapped training tasks')
+        futures = []
+        for member_weights in self.weights:
+            boot_idx = rng.integers(0, len(train_data), size=n_sample)
+            boot_data = [train_data[i] for i in boot_idx]
+            future = self.config.executor.submit(
+                self.config.training_task,
+                learner=self.config.learner,
+                weights=member_weights,
+                train_data=boot_data,
+                valid_data=valid_data,
+                train_kws=self.config.training_kws,
+                replay=self.config.replay,
+            )
+            futures.append(wrap_future(future))
+
+        results = await asyncio.gather(*futures)
+
         self.logger.info('Retrieving new weights')
-        weights, results = wrapped_future.result()
-        self._traj_db.write_training_log(self.config.run_id, training_round, results)
-        self.weights = weights
-        return weights
+        new_weights = [w for w, _ in results]
+        for member_index, (_, log) in enumerate(results):
+            self._traj_db.write_training_log(self.config.run_id, training_round, log, member_index=member_index)
+        self.weights = new_weights
+        return new_weights
 
 
 class DatabaseMonitor(CascadeAgent):

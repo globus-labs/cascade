@@ -356,7 +356,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
         if replay is not None:
             # Downselect data, if desired
             #  TODO (wardlt): Use FPS to pick samples, as in https://arxiv.org/abs/2412.02877
-            if replay.num_downselect == 0:
+            if replay.num_downselect is not None:
                 replay_data = replay.original_dataset.copy()
                 random.shuffle(replay_data)
                 replay_data = replay_data[:replay.num_downselect]
@@ -371,7 +371,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
             _update_offset_factors(replay_model, replay_data, replay_loader, device)
 
             # Make the replay loss
-            replay_opt = torch.optim.Adam(replay_model.parameters(), lr=learning_rate // replay.lr_reduction)
+            replay_opt = torch.optim.Adam(replay_model.parameters(), lr=learning_rate / replay.lr_reduction)
 
             @trainer.on(Events.EPOCH_COMPLETED(every=replay.epoch_frequency))
             def replay_process(engine: Engine):

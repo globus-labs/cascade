@@ -18,6 +18,8 @@ if TYPE_CHECKING:
         TrainingFrame,
         Chunk
     )
+    import pandas as pd
+    from cascade.learning.finetuning import MultiHeadConfig
 
 @dataclass
 class CascadeAgentConfig:
@@ -55,8 +57,8 @@ class DynamicsRunnerConfig(CascadeAgentConfig):
     """Task to run dynamics"""
     learner: BaseLearnableForcefield
     """Learner to be used for dynamics"""
-    weights: bytes
-    """Initial weights for dynamics"""
+    weights: list[bytes]
+    """Initial weights for dynamics, one entry per ensemble member"""
     dyn_cls: type[Dynamics]
     """ASE dynamics integrator"""
     dyn_kws: dict[str, object] | None
@@ -107,9 +109,9 @@ class LabelerConfig(CascadeAgentConfig):
 @dataclass
 class TrainerConfig(CascadeAgentConfig):
     """Configuration for Trainer agent"""
-    weights: bytes
-    """Initial weights for trainer"""
-    training_task: Callable[..., bytes]
+    weights: list[bytes]
+    """Current weights for each ensemble member"""
+    training_task: Callable[..., tuple[bytes, pd.DataFrame]]
     """Returns trained model weights"""
     training_args: list | tuple
     """passed to training_task"""
@@ -118,6 +120,12 @@ class TrainerConfig(CascadeAgentConfig):
     learner: BaseLearnableForcefield
     executor: Executor
     """Where to run training_task"""
+    bootstrap_fraction: float = 1.0
+    """Fraction of available training frames to resample (with replacement) per ensemble member"""
+    replay: MultiHeadConfig | None = None
+    """Multi-head replay config (see cascade.learning.finetuning.MultiHeadConfig), passed through
+    to learner.train to prevent catastrophic forgetting. Only meaningful for learners whose train()
+    accepts a `replay` kwarg (currently MACEInterface)."""
 
 
 @dataclass

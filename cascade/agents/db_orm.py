@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import json
 import logging
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING
@@ -187,11 +188,12 @@ class DBTrainingLog(Base):
     id = Column(Integer, primary_key=True)
     run_id = Column(String, nullable=False, index=True)
     training_round = Column(Integer, nullable=False, index=True)
+    member_index = Column(Integer, nullable=False, default=0)
     log_json = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint('run_id', 'training_round', name='uq_training_log_run_round'),
+        UniqueConstraint('run_id', 'training_round', 'member_index', name='uq_training_log_run_round_member'),
     )
 
     def __repr__(self):
@@ -1341,32 +1343,38 @@ class TrajectoryDB:
             )
             sess.add(db_event)
     
-    def write_training_log(self, run_id: str, training_round: int, log: pd.DataFrame) -> None:
+    def write_training_log(self, run_id: str, training_round: int, log: pd.DataFrame, member_index: int = 0) -> None:
         """Persist per-epoch training metrics for a completed training round.
 
         Args:
             run_id: Run identifier
             training_round: Training round number
             log: DataFrame returned by MACEInterface.train, one row per epoch
+            member_index: Which ensemble member this log belongs to (0 if not ensembling)
         """
         with self.session() as sess:
             sess.add(DBTrainingLog(
                 run_id=run_id,
                 training_round=training_round,
-                log_json=log.to_dict(orient='records'),
+                member_index=member_index,
+                # NaN (e.g. from replay columns that only populate every few epochs) is not
+                # valid JSON and Postgres' json/jsonb columns reject it outright. `to_dict`
+                # leaves NaN as-is, but `to_json` correctly renders it as `null`, so round-trip
+                # through that instead.
+                log_json=json.loads(log.to_json(orient='records')),
             ))
 
     def get_training_logs(self, run_id: str) -> pd.DataFrame:
         """Return all training loss history for a run as a single DataFrame.
 
-        Each row is one epoch from one training round. A ``training_round``
-        column is prepended so callers can group or filter by round.
+        Each row is one epoch from one training round/member. ``training_round``
+        and ``member_index`` columns are prepended so callers can group or filter by them.
 
         Args:
             run_id: Run identifier
 
         Returns:
-            DataFrame with columns [training_round, epoch, <metric columns>],
+            DataFrame with columns [training_round, member_index, epoch, <metric columns>],
             or an empty DataFrame if no logs exist yet.
         """
         with self.session() as sess:
@@ -1380,6 +1388,7 @@ class TrajectoryDB:
             for row in rows:
                 df = pd.DataFrame(row.log_json)
                 df.insert(0, 'training_round', row.training_round)
+                df.insert(1, 'member_index', row.member_index)
                 frames.append(df)
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
