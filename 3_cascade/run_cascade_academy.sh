@@ -7,13 +7,17 @@ python run_cascade_academy.py \
         ../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp \
         ../0_setup/final-geometries/packmol-CH4-in-H2O=32-seed=1-mace-medium.vasp \
     --chunk-size 5 \
-    --target-length 20 \
+    --target-length 10 \
     --retrain-len 10 \
     --retrain-fraction 0.5 \
     --n-sample-frames 5 \
     --accept-rate .5 \
     --learner mace \
     --calc mace \
+    --n-ensemble 2 \
+    --replay-dataset ./datasets/mace-mp/sampled_1000.traj \
+    --replay-downselect 10 \
+    --replay-batch-size 2 \
     --dyn-cls velocity-verlet \
     --dt_fs 1.0 \
     --loginterval 1 \

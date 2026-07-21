@@ -167,4 +167,14 @@ class BaseLearnableForcefield(Generic[State]):
         raise NotImplementedError()
 
     def make_ensemble_calculator(self, model_msgs: list[bytes | State], device: str) -> EnsembleCalculator:
-        raise NotImplementedError()
+        """Make an EnsembleCalculator by wrapping one calculator per provided model
+
+        Args:
+            model_msgs: Serialized (or unserialized) form of each ensemble member
+            device: Device on which to run computations
+        Returns:
+            Calculator reporting the ensemble mean plus per-member spread (e.g. "forces_ens")
+        """
+        return EnsembleCalculator(
+            calculators=[self.make_calculator(m, device) for m in model_msgs]
+        )

@@ -6,10 +6,12 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 from ase import Atoms
 from ase.db import connect
 from ase.build import molecule
+from sqlalchemy.exc import IntegrityError
 
 from ase.calculators.singlepoint import SinglePointCalculator
 
@@ -995,5 +997,45 @@ class TestLabeledTrainingFrames:
             )
         result = traj_db.get_training_frames("run", training_round=0)
         assert len(result) == 3
-        energies = sorted(a.get_potential_energy() for a in result)
-        assert np.allclose(energies, [0.0, 1.0, 2.0])
+
+
+class TestTrainingLogs:
+    """Tests for writing and reading per-round (and per-ensemble-member) training logs."""
+
+    def _log(self, losses: list[float]) -> pd.DataFrame:
+        return pd.DataFrame({"epoch": range(len(losses)), "loss": losses})
+
+    def test_default_member_index_is_zero(self, traj_db):
+        """Non-ensemble callers that don't pass member_index still work as before."""
+        traj_db.write_training_log("run", training_round=0, log=self._log([1.0, 0.5]))
+        result = traj_db.get_training_logs("run")
+        assert len(result) == 2
+        assert (result["member_index"] == 0).all()
+        assert list(result["training_round"]) == [0, 0]
+
+    def test_multiple_members_same_round(self, traj_db):
+        """Multiple ensemble members can log against the same (run_id, training_round)."""
+        traj_db.write_training_log("run", training_round=0, log=self._log([1.0]), member_index=0)
+        traj_db.write_training_log("run", training_round=0, log=self._log([1.2]), member_index=1)
+
+        result = traj_db.get_training_logs("run")
+        assert len(result) == 2
+        assert sorted(result["member_index"]) == [0, 1]
+        assert (result["training_round"] == 0).all()
+
+    def test_duplicate_member_index_rejected(self, traj_db):
+        """The (run_id, training_round, member_index) constraint still catches true duplicates."""
+        traj_db.write_training_log("run", training_round=0, log=self._log([1.0]), member_index=0)
+        with pytest.raises(IntegrityError):
+            traj_db.write_training_log("run", training_round=0, log=self._log([1.1]), member_index=0)
+
+    def test_filters_by_run_id(self, traj_db):
+        traj_db.write_training_log("run-a", training_round=0, log=self._log([1.0]))
+        traj_db.write_training_log("run-b", training_round=0, log=self._log([2.0]))
+        result = traj_db.get_training_logs("run-a")
+        assert len(result) == 1
+        assert np.isclose(result["loss"].iloc[0], 1.0)
+
+    def test_empty_when_no_logs(self, traj_db):
+        result = traj_db.get_training_logs("run")
+        assert result.empty

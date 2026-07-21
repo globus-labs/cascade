@@ -80,38 +80,38 @@ async def test_dynamics_runner(atoms: Atoms):
         executors=ThreadPoolExecutor(max_workers=10),
     ) as manager:
 
-    dyn_reg = await manager.register_agent(DynamicsRunner)
-    aud_reg = await manager.register_agent(DeterministicAuditor)
-    dyn_handle = manager.get_handle(dyn_reg)
-    aud_handle = manager.get_handle(aud_reg)
+        dyn_reg = await manager.register_agent(DynamicsRunner)
+        aud_reg = await manager.register_agent(DeterministicAuditor)
+        dyn_handle = manager.get_handle(dyn_reg)
+        aud_handle = manager.get_handle(aud_reg)
 
-    await manager.launch(
-        DynamicsRunner,
-        kwargs=dict(
-            atoms=atoms,
-            run_id=run_id,
-            traj_id=0,
-            chunk_size=chunk_size,
-            n_steps=target_length,
-            auditor=aud_handle,
-            executor=ProcessPoolExecutor(1),
-            advance_dynamics_task=advance_dynamics,
-            learner=learner,
-            weights=init_weights,
-            dyn_cls=VelocityVerlet,
-            dyn_kws={'timestep': 1 * units.fs},
-            run_kws={},
-            device='cpu',
-            model_version=0
-        ),
-        registration=dyn_reg
-    )
+        await manager.launch(
+            DynamicsRunner,
+            kwargs=dict(
+                atoms=atoms,
+                run_id=run_id,
+                traj_id=0,
+                chunk_size=chunk_size,
+                n_steps=target_length,
+                auditor=aud_handle,
+                executor=ProcessPoolExecutor(1),
+                advance_dynamics_task=advance_dynamics,
+                learner=learner,
+                weights=[init_weights],
+                dyn_cls=VelocityVerlet,
+                dyn_kws={'timestep': 1 * units.fs},
+                run_kws={},
+                device='cpu',
+                model_version=0
+            ),
+            registration=dyn_reg
+        )
 
-    await manager.launch(
-        DeterministicAuditor,
-        sequence=[AuditStatus.PASSED, AuditStatus.FAILED, AuditStatus.PASSED],
-    )
+        await manager.launch(
+            DeterministicAuditor,
+            sequence=[AuditStatus.PASSED, AuditStatus.FAILED, AuditStatus.PASSED],
+        )
 
-    await manager.wait([dyn_handle]) # this should wait until it shuts itself down
+        await manager.wait([dyn_handle]) # this should wait until it shuts itself down
 
-    # todo: use caplog to assert things happen as expected
+        # todo: use caplog to assert things happen as expected
