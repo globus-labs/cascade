@@ -190,6 +190,7 @@ def uq_threshold_audit(
     chunk: Chunk,
     field: str = 'uq_force_std_max',
     threshold: float = 0.1,
+    burn_in_model_versions: int = 0,
 ) -> AuditResult:
     """Audit a chunk by thresholding a per-frame UQ scalar stored in atoms.info
 
@@ -198,6 +199,9 @@ def uq_threshold_audit(
     """
     from cascade.model import AuditResult, AuditStatus
     import numpy as np
+
+    if chunk.model_version < burn_in_model_versions:
+        return AuditResult(status=AuditStatus.FAILED, score=float('inf'))
 
     values = np.array([a.info[field] for a in chunk.atoms])
     score = float(values.max())
