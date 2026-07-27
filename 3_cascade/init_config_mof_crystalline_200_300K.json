@@ -1,0 +1,86 @@
+[
+  {
+    "path": "../MOFs/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_MOF5_crystalline",
+    "temperature_K": 200,
+    "dyn_cls": "npt",
+    "dt_fs": 1.0,
+    "dyn_kws": {
+      "temperature_K": 200,
+      "ttime_fs": 25,
+      "externalstress_GPa": -0.5,
+      "pfactor_time_fs": 125,
+      "pfactor_pressure_GPa": 100,
+      "mask": null
+    }
+  },
+  {
+    "path": "../MOFs/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_MOF5_crystalline",
+    "temperature_K": 300,
+    "dyn_cls": "npt",
+    "dt_fs": 1.0,
+    "dyn_kws": {
+      "temperature_K": 300,
+      "ttime_fs": 25,
+      "externalstress_GPa": -0.5,
+      "pfactor_time_fs": 125,
+      "pfactor_pressure_GPa": 100,
+      "mask": null
+    }
+  },
+  {
+    "path": "../MOFs/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_qmofb0f0d29_crystalline",
+    "temperature_K": 200,
+    "dyn_cls": "npt",
+    "dt_fs": 1.0,
+    "dyn_kws": {
+      "temperature_K": 200,
+      "ttime_fs": 25,
+      "externalstress_GPa": -0.5,
+      "pfactor_time_fs": 125,
+      "pfactor_pressure_GPa": 100,
+      "mask": null
+    }
+  },
+  {
+    "path": "../MOFs/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_qmofb0f0d29_crystalline",
+    "temperature_K": 300,
+    "dyn_cls": "npt",
+    "dt_fs": 1.0,
+    "dyn_kws": {
+      "temperature_K": 300,
+      "ttime_fs": 25,
+      "externalstress_GPa": -0.5,
+      "pfactor_time_fs": 125,
+      "pfactor_pressure_GPa": 100,
+      "mask": null
+    }
+  },
+  {
+    "path": "../MOFs/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_qmofb52c6c5_crystalline",
+    "temperature_K": 200,
+    "dyn_cls": "npt",
+    "dt_fs": 1.0,
+    "dyn_kws": {
+      "temperature_K": 200,
+      "ttime_fs": 25,
+      "externalstress_GPa": -0.5,
+      "pfactor_time_fs": 125,
+      "pfactor_pressure_GPa": 100,
+      "mask": null
+    }
+  },
+  {
+    "path": "../MOFs/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_qmofb52c6c5_crystalline",
+    "temperature_K": 300,
+    "dyn_cls": "npt",
+    "dt_fs": 1.0,
+    "dyn_kws": {
+      "temperature_K": 300,
+      "ttime_fs": 25,
+      "externalstress_GPa": -0.5,
+      "pfactor_time_fs": 125,
+      "pfactor_pressure_GPa": 100,
+      "mask": null
+    }
+  }
+]
