@@ -7,7 +7,6 @@ import datetime
 import hashlib
 import json
 import pathlib
-from dataclasses import dataclass, field
 from functools import partial
 from typing import Callable
 
@@ -65,6 +64,13 @@ from cascade.agents.task import (
     label_frame,
     train,
     ensemble_force_deviation_uq
+)
+from cascade.traj_config import (
+    InitialTrajConfig,
+    load_initial_configs,
+    get_dynamics_cls,
+    resolve_dyn_kws,
+    prepare_atoms_for_dynamics,
 )
 
 
@@ -211,13 +217,6 @@ def get_learner(learner_name: str) -> type[ase.calculators.calculator.Calculator
         raise ValueError(f'Unknown learner: {learner_name}')
 
 
-def get_dynamics_cls(cls_name: str) -> type[ase.md.md.MolecularDynamics]:
-    if cls_name == 'velocity-verlet':
-        return VelocityVerlet
-    else:
-        raise ValueError(f'Unknown dynamics class: {cls_name}')
-
-
 def get_audit_task(audit_task_name: str) -> Callable[..., AuditResult]:
     if audit_task_name == 'random':
         return random_audit
@@ -225,28 +224,6 @@ def get_audit_task(audit_task_name: str) -> Callable[..., AuditResult]:
         return uq_threshold_audit
     else:
         raise ValueError(f'Unknown audit task: {audit_task_name}')
-
-
-@dataclass
-class InitialTrajConfig:
-    """Initial configuration for a single trajectory"""
-    path: str
-    """Path to the initial structure, readable by ase.io.read"""
-    temperature_K: float | None = None
-    """If set, initialize velocities via a Maxwell-Boltzmann distribution at this temperature"""
-    dyn_cls: str = 'velocity-verlet'
-    """Dynamics integrator to use (see get_dynamics_cls)"""
-    dt_fs: float = 1.0
-    """Timestep in femtoseconds"""
-    dyn_kws: dict = field(default_factory=dict)
-    """Additional keyword arguments passed to the dynamics constructor (besides timestep)"""
-    run_kws: dict = field(default_factory=dict)
-    """Keyword arguments passed to the dynamics run method"""
-
-
-def load_initial_configs(path: str) -> list[InitialTrajConfig]:
-    data = json.loads(pathlib.Path(path).read_text())
-    return [InitialTrajConfig(**entry) for entry in data]
 
 
 async def main():
@@ -305,6 +282,8 @@ async def main():
     for i, cfg in enumerate(init_configs):
         a = read(cfg.path, index=-1)
         logger.info(f"Initializing traj {i} with {len(a)} atoms")
+
+        a = prepare_atoms_for_dynamics(a, cfg)
 
         if cfg.temperature_K is not None:
             MaxwellBoltzmannDistribution(a, temperature_K=cfg.temperature_K)
@@ -478,7 +457,7 @@ async def main():
                         weights=init_ensemble_weights,
                         device=args.device_dyn,
                         dyn_cls=get_dynamics_cls(cfg.dyn_cls),
-                        dyn_kws={'timestep': cfg.dt_fs * units.fs, **cfg.dyn_kws},
+                        dyn_kws=resolve_dyn_kws(cfg),
                         run_kws=cfg.run_kws,
                         model_version=0,
                         uq_hook=ensemble_force_deviation_uq,
