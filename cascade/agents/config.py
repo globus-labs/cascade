@@ -94,6 +94,10 @@ class SamplerConfig(CascadeAgentConfig):
     """Where to run sample_task"""
     sample_task: Callable[..., list[TrainingFrame]]
     """Method that returns unlabled training frames given a trajectory chunk"""
+    burn_in_model_versions: int = 0
+    """Chunks with model_version below this count use burn_in_n_frames instead of n_frames"""
+    burn_in_n_frames: int | None = None
+    """Frames to sample per chunk while model_version < burn_in_model_versions (falls back to n_frames if unset)"""
 
 
 @dataclass

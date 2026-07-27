@@ -8,6 +8,7 @@ import hashlib
 import json
 import pathlib
 from functools import partial
+from typing import Callable
 
 import ase
 from ase.io import read
@@ -49,12 +50,13 @@ from cascade.agents.config import (
     LabelerConfig,
     TrainerConfig
 )
-from cascade.model import AdvanceSpec
+from cascade.model import AdvanceSpec, AuditResult
 from cascade.learning.mace import MACEInterface
 from cascade.learning.finetuning import MultiHeadConfig
 from cascade.agents.db_orm import TrajectoryDB
 from cascade.agents.task import (
     random_audit,
+    uq_threshold_audit,
     advance_dynamics,
     random_sample,
     label_frame,
@@ -122,10 +124,37 @@ def parse_args() -> argparse.Namespace:
         help='Number of sample frames'
     )
     parser.add_argument(
+        '--burn-in-rounds',
+        type=int,
+        default=0,
+        help='Force-fail (and sample) chunks with model_version below this count, '
+             'so the ensemble gets some real disagreement before the audit is load-bearing'
+    )
+    parser.add_argument(
+        '--burn-in-n-frames',
+        type=int,
+        default=None,
+        help='Frames to sample per chunk while still in burn-in (defaults to --n-sample-frames if unset)'
+    )
+    parser.add_argument(
         '--accept-rate',
         type=float,
         default=1.0,
-        help='Accept rate'
+        help='Accept rate (only used by the "random" audit strategy)'
+    )
+    parser.add_argument(
+        '--audit-task',
+        type=str,
+        default='random',
+        choices=['random', 'uq_threshold'],
+        help='Audit strategy: "random" accepts/rejects chunks randomly (--accept-rate); '
+             '"uq_threshold" fails chunks whose ensemble force-disagreement exceeds --audit-threshold'
+    )
+    parser.add_argument(
+        '--audit-threshold',
+        type=float,
+        default=0.1,
+        help='UQ threshold for the "uq_threshold" audit strategy'
     )
     parser.add_argument(
         '--learner',
@@ -200,6 +229,15 @@ def get_dynamics_cls(cls_name: str) -> type[ase.md.md.MolecularDynamics]:
         return VelocityVerlet
     else:
         raise ValueError(f'Unknown dynamics class: {cls_name}')
+
+
+def get_audit_task(audit_task_name: str) -> Callable[..., AuditResult]:
+    if audit_task_name == 'random':
+        return random_audit
+    elif audit_task_name == 'uq_threshold':
+        return uq_threshold_audit
+    else:
+        raise ValueError(f'Unknown audit task: {audit_task_name}')
 
 
 async def main():
@@ -336,12 +374,16 @@ async def main():
                 retrain_len=args.retrain_len,
                 retrain_fraction=args.retrain_fraction,
             )
+            if args.audit_task == 'random':
+                audit_kws = dict(accept_prob=args.accept_rate)
+            else:
+                audit_kws = dict(threshold=args.audit_threshold, burn_in_model_versions=args.burn_in_rounds)
             auditor_config = AuditorConfig(
-                audit_task=random_audit,
+                audit_task=get_audit_task(args.audit_task),
                 executor=pool,
                 run_id=run_id,
                 db_url=args.db_url,
-                audit_kws=dict(accept_prob=args.accept_rate, ),
+                audit_kws=audit_kws,
             )
             sampler_config = SamplerConfig(
                 run_id=run_id,
@@ -349,6 +391,8 @@ async def main():
                 n_frames=args.n_sample_frames,
                 executor=pool,
                 sample_task=random_sample,
+                burn_in_model_versions=args.burn_in_rounds,
+                burn_in_n_frames=args.burn_in_n_frames,
             )
             labeler_config = LabelerConfig(
                 run_id=run_id,

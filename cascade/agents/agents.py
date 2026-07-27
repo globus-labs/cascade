@@ -266,16 +266,20 @@ class Sampler(CascadeAgent):
             f'chunk {chunk.chunk_id} '
             f'attempt {chunk.attempt_ix}'
         )
+        n_frames = self.config.n_frames
+        if chunk.model_version < self.config.burn_in_model_versions and self.config.burn_in_n_frames is not None:
+            n_frames = self.config.burn_in_n_frames
+
         future = self.config.executor.submit(
             self.config.sample_task,
             chunk,
-            n_frames=self.config.n_frames,
+            n_frames=n_frames,
         )
         wrapped_future = wrap_future(future)
         await wrapped_future
         training_frames = wrapped_future.result()
 
-        if len(training_frames) != self.config.n_frames:
+        if len(training_frames) != n_frames:
             self.logger.warning(
                 "Sampling returned %d frames for traj %s chunk %s (attempt %s), "
                 "expected n_frames=%d",
@@ -283,7 +287,7 @@ class Sampler(CascadeAgent):
                 chunk.traj_id,
                 chunk.chunk_id,
                 chunk.attempt_ix,
-                self.n_frames,
+                n_frames,
             )
         for frame in training_frames:
             self.logger.info(
