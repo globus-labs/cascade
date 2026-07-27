@@ -156,7 +156,7 @@ def advance_dynamics(
             logger.info('computing UQ')
             per_atom, per_frame = uq_hook(atoms, **uq_kws)
             for name, values in per_atom.items():
-                atoms.new_array(name, np.asarray(values))
+                atoms.set_array(name, np.asarray(values))
             for name, value in per_frame.items():
                 atoms.info[name] = value
 
