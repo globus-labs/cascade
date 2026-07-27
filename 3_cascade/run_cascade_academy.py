@@ -7,6 +7,7 @@ import datetime
 import hashlib
 import json
 import pathlib
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Callable
 
@@ -14,6 +15,7 @@ import ase
 from ase.io import read
 from ase import units
 from ase.md.verlet import VelocityVerlet
+from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from mace.calculators import mace_mp
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
@@ -68,9 +70,11 @@ def parse_args() -> argparse.Namespace:
         help='Logging levl'
     )
     parser.add_argument(
-        '--initial-structures',
-        nargs='+',
-        help='Initial structures to start dynamics'
+        '--init-config-json',
+        type=str,
+        required=True,
+        help='Path to a JSON file describing the initial configuration for each trajectory '
+             '(structure path, optional temperature, dynamics integrator + its kwargs)'
     )
     parser.add_argument(
         '--chunk-size',
@@ -159,24 +163,6 @@ def parse_args() -> argparse.Namespace:
         help='Calculator to use'
     )
     parser.add_argument(
-        '--dyn-cls',
-        type=str,
-        default='velocity-verlet',
-        help='Dynamics class to use'
-    )
-    parser.add_argument(
-        '--dt_fs',
-        type=float,
-        default=1.0,
-        help='Time step in fs'
-    )
-    parser.add_argument(
-        '--loginterval',
-        type=int,
-        default=1,
-        help='Log interval in steps'
-    )
-    parser.add_argument(
         '--db-url',
         type=str,
         default='postgresql://ase:pw@localhost:5432/cascade',
@@ -213,6 +199,28 @@ def get_audit_task(audit_task_name: str) -> Callable[..., AuditResult]:
         return uq_threshold_audit
     else:
         raise ValueError(f'Unknown audit task: {audit_task_name}')
+
+
+@dataclass
+class InitialTrajConfig:
+    """Initial configuration for a single trajectory"""
+    path: str
+    """Path to the initial structure, readable by ase.io.read"""
+    temperature_K: float | None = None
+    """If set, initialize velocities via a Maxwell-Boltzmann distribution at this temperature"""
+    dyn_cls: str = 'velocity-verlet'
+    """Dynamics integrator to use (see get_dynamics_cls)"""
+    dt_fs: float = 1.0
+    """Timestep in femtoseconds"""
+    dyn_kws: dict = field(default_factory=dict)
+    """Additional keyword arguments passed to the dynamics constructor (besides timestep)"""
+    run_kws: dict = field(default_factory=dict)
+    """Keyword arguments passed to the dynamics run method"""
+
+
+def load_initial_configs(path: str) -> list[InitialTrajConfig]:
+    data = json.loads(pathlib.Path(path).read_text())
+    return [InitialTrajConfig(**entry) for entry in data]
 
 
 async def main():
@@ -265,12 +273,15 @@ async def main():
     else:
         replay = None
 
-    # read initial structures
-    init_strc = args.initial_structures
+    # read initial configuration for each trajectory
+    init_configs = load_initial_configs(args.init_config_json)
     initial_specs = []
-    for i, s in enumerate(init_strc):
-        a = read(s, index=-1)
+    for i, cfg in enumerate(init_configs):
+        a = read(cfg.path, index=-1)
         logger.info(f"Initializing traj {i} with {len(a)} atoms")
+
+        if cfg.temperature_K is not None:
+            MaxwellBoltzmannDistribution(a, temperature_K=cfg.temperature_K)
 
         # create trajectory entry in the database
         traj_db.initialize_trajectory(
@@ -422,7 +433,7 @@ async def main():
 
             # launch one DynamicsRunner per trajectory, accumulating the handles
             dyn_handles = []
-            for spec in initial_specs:
+            for spec, cfg in zip(initial_specs, init_configs):
                 reg = await manager.register_agent(DynamicsRunner)
                 handle = manager.get_handle(reg)
                 handles.append(handle)
@@ -439,9 +450,9 @@ async def main():
                         learner=learner,
                         run_dir=run_dir,
                         weights=init_ensemble_weights,
-                        dyn_cls=VelocityVerlet,
-                        dyn_kws={'timestep': 1 * units.fs},
-                        run_kws={},
+                        dyn_cls=get_dynamics_cls(cfg.dyn_cls),
+                        dyn_kws={'timestep': cfg.dt_fs * units.fs, **cfg.dyn_kws},
+                        run_kws=cfg.run_kws,
                         device='cpu',
                         model_version=0,
                         uq_hook=ensemble_force_deviation_uq,
