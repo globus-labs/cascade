@@ -1,9 +1,27 @@
 from __future__ import annotations
 
+import time
+from pathlib import Path
+import logging
+import os
+
+import numpy as np
+import torch
+# crazy patch because of e3nn not importing safely
+# todo: make it a context manager and wrap every call with it?
+_orig_load = torch.load
+def _load_no_weights_only(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_load(*args, **kwargs)
+torch.load = _load_no_weights_only
+from ase.optimize.optimize import Dynamics
+from mace.calculators import mace_mp
+
+from cascade.model import AuditResult, AuditStatus
+from cascade.utils import canonicalize
+
+
 from typing import TYPE_CHECKING
-
-from matscipy.calculators.polydisperse import calculator
-
 if TYPE_CHECKING:
     from typing import Callable
     from cascade.model import AuditResult, Chunk
@@ -14,7 +32,6 @@ if TYPE_CHECKING:
     from pathlib import Path
     import numpy as np
     import pandas as pd
-from ase.optimize.optimize import Dynamics
 
 
 # can make this a classmethod on some audittask class
@@ -28,9 +45,6 @@ def random_audit(
 
     Intended to be used as a stub for a real audit function.
     """
-    from cascade.model import AuditResult, AuditStatus
-    import time
-    import numpy as np
 
     time.sleep(sleep_time)
     # Create a new random generator seeded with OS entropy to ensure
@@ -99,12 +113,6 @@ def advance_dynamics(
         dyn_kws: kws to the dynamics constructor
         run_kws: kws to the dynamics run method
     """
-    import numpy as np
-    from cascade.utils import canonicalize
-    from pathlib import Path
-
-    import logging
-    import os
 
     # todo: stop this from writing to the screen
     logfile = str(Path(run_dir) / f'traj-{spec.traj_id}_chunk-{spec.chunk_id}_att-{spec.attempt_index}_md.log')
@@ -158,8 +166,6 @@ def label_frame(frame: TrainingFrame, calc_factory: Callable[..., Calculator]) -
 # todo: this should be configurable, or at least not hard code magic knowledge
 def training_noop(learner: BaseLearnableForcefield) -> bytes:
     """just return a model"""
-    from mace.calculators import mace_mp
-
     calc = mace_mp('small', device='cpu', default_dtype="float32")
     model = calc.models[0]
     model_msg = learner.serialize_model(model)
