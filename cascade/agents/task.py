@@ -164,9 +164,9 @@ def label_frame(frame: TrainingFrame, calc_factory: Callable[..., Calculator]) -
     return frame
 
 # todo: this should be configurable, or at least not hard code magic knowledge
-def training_noop(learner: BaseLearnableForcefield) -> bytes:
+def training_noop(learner: BaseLearnableForcefield, device) -> bytes:
     """just return a model"""
-    calc = mace_mp('small', device='cpu', default_dtype="float32")
+    calc = mace_mp('small', device=device, default_dtype="float32")
     model = calc.models[0]
     model_msg = learner.serialize_model(model)
     return model_msg

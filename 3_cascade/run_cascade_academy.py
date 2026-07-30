@@ -156,6 +156,21 @@ def parse_args() -> argparse.Namespace:
         default='postgresql://ase:pw@localhost:5432/cascade',
         help='Database URL'
     )
+    parser.add_argument(
+        '--device-dyn',
+        type=str,
+        default='cpu',
+    )
+    parser.add_argument(
+        '--device-label',
+        type=str,
+        default='cpu',
+    )
+    parser.add_argument(
+        '--device-train',
+        type=str,
+        default='cpu',
+    )
     args = parser.parse_args()
 
     return args
@@ -311,7 +326,7 @@ async def main():
                 db_url=args.db_url,
                 executor=pool,
                 label_task=label_frame,
-                calc_factory=partial(mace_mp, model='medium', device='cpu', default_dtype="float32"),
+                calc_factory=partial(mace_mp, model='medium', device=args.device_label, default_dtype="float32"),
                 )
             trainer_config = TrainerConfig(
                 run_id=run_id,
@@ -322,7 +337,7 @@ async def main():
                 training_args=(),
                 training_kws=dict(
                     num_epochs=10,
-                    device='cpu',
+                    device=args.device_train,
                     batch_size=2,
                 ),
                 learner=learner
@@ -378,7 +393,7 @@ async def main():
                         dyn_cls=VelocityVerlet,
                         dyn_kws={'timestep': 1 * units.fs},
                         run_kws={},
-                        device='cpu',
+                        device=args.device_dyn,
                         model_version=0
                 )
                 await manager.launch(
