@@ -14,6 +14,14 @@ import warnings
 from concurrent.futures import as_completed
 from functools import partial
 
+import torch
+# crazy patch because of e3nn not importing safely
+# todo: make it a context manager and wrap every call with it?
+_orig_load = torch.load
+def _load_no_weights_only(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_load(*args, **kwargs)
+torch.load = _load_no_weights_only
 from mace.calculators import mace_mp
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
@@ -86,7 +94,8 @@ def run_reference_trajectory(
     run_id: str,
     db_url: str,
     target_length: int,
-    calc_factory,
+    calc_model: str,
+    device: str,
     log_level: str,
     log_interval: int,
 ) -> None:
@@ -98,6 +107,17 @@ def run_reference_trajectory(
     from cascade.utils import canonicalize
     from cascade.traj_config import get_dynamics_cls, resolve_dyn_kws, prepare_atoms_for_dynamics
     from cascade.model import AuditStatus
+    import torch
+    # crazy patch because of e3nn not importing safely
+    # todo: make it a context manager and wrap every call with it?
+    _orig_load = torch.load
+    def _load_no_weights_only(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return _orig_load(*args, **kwargs)
+    torch.load = _load_no_weights_only
+    from mace.calculators import mace_mp
+    from functools import partial
+    calc_factory = partial(mace_mp, model=calc_model, device=device, default_dtype="float32")
 
     logging.basicConfig(level=log_level)
     logger = logging.getLogger(f'reference.traj{traj_id}')
@@ -168,7 +188,6 @@ def main():
     run_id = f"reference-{start_time}-{params_hash}"
 
     init_configs = load_initial_configs(args.init_config_json)
-    calc_factory = partial(mace_mp, model=args.calc_model, device=args.device, default_dtype="float32")
 
     max_workers = args.max_workers or len(init_configs)
     config = Config(
@@ -190,7 +209,7 @@ def main():
         futures = [
             pool.submit(
                 run_reference_trajectory,
-                traj_id, cfg, run_id, args.db_url, args.target_length, calc_factory, args.log_level, args.log_interval,
+                traj_id, cfg, run_id, args.db_url, args.target_length, args.calc_model, args.device, args.log_level, args.log_interval,
             )
             for traj_id, cfg in enumerate(init_configs)
         ]
