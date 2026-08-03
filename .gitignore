@@ -180,3 +180,5 @@ cython_debug/
 #.idea/
 
 **/db/
+**/data/
+**/*.zip
