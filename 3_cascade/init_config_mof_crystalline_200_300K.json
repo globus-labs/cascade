@@ -1,6 +1,6 @@
 [
   {
-    "path": "../MOFs/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_MOF5_crystalline",
+    "path": "../MOFs/data/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_MOF5_crystalline",
     "temperature_K": 200,
     "dyn_cls": "mtknpt",
     "dt_fs": 1.0,
@@ -12,7 +12,7 @@
     }
   },
   {
-    "path": "../MOFs/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_MOF5_crystalline",
+    "path": "../MOFs/data/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_MOF5_crystalline",
     "temperature_K": 300,
     "dyn_cls": "mtknpt",
     "dt_fs": 1.0,
@@ -24,7 +24,7 @@
     }
   },
   {
-    "path": "../MOFs/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_qmofb0f0d29_crystalline",
+    "path": "../MOFs/data/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_qmofb0f0d29_crystalline",
     "temperature_K": 200,
     "dyn_cls": "mtknpt",
     "dt_fs": 1.0,
@@ -36,7 +36,7 @@
     }
   },
   {
-    "path": "../MOFs/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_qmofb0f0d29_crystalline",
+    "path": "../MOFs/data/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_qmofb0f0d29_crystalline",
     "temperature_K": 300,
     "dyn_cls": "mtknpt",
     "dt_fs": 1.0,
@@ -48,7 +48,7 @@
     }
   },
   {
-    "path": "../MOFs/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_qmofb52c6c5_crystalline",
+    "path": "../MOFs/data/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_qmofb52c6c5_crystalline",
     "temperature_K": 200,
     "dyn_cls": "mtknpt",
     "dt_fs": 1.0,
@@ -60,7 +60,7 @@
     }
   },
   {
-    "path": "../MOFs/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_qmofb52c6c5_crystalline",
+    "path": "../MOFs/data/CASCADE_Example_Files_05142026/MOF_Structures/POSCAR_qmofb52c6c5_crystalline",
     "temperature_K": 300,
     "dyn_cls": "mtknpt",
     "dt_fs": 1.0,
