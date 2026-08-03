@@ -16,6 +16,7 @@ from ase import Atoms, units
 import ase.md.md
 from ase.md.verlet import VelocityVerlet
 from ase.md.npt import NPT
+from ase.md.nose_hoover_chain import MTKNPT
 
 
 @dataclass
@@ -45,6 +46,8 @@ def get_dynamics_cls(cls_name: str) -> type[ase.md.md.MolecularDynamics]:
         return VelocityVerlet
     elif cls_name == 'npt':
         return NPT
+    elif cls_name == 'mtknpt':
+        return MTKNPT
     else:
         raise ValueError(f'Unknown dynamics class: {cls_name}')
 
@@ -69,10 +72,39 @@ class NPTConfig:
         )
 
 
+@dataclass
+class MTKNPTConfig:
+    """Friendly-unit settings for ase.md.nose_hoover_chain.MTKNPT, converted in to_ase_kwargs()"""
+    temperature_K: float
+    pressure_GPa: float
+    tdamp_fs: float
+    pdamp_fs: float
+    tchain: int = 3
+    pchain: int = 3
+    tloop: int = 1
+    ploop: int = 1
+    loginterval: int = 1
+
+    def to_ase_kwargs(self) -> dict:
+        return dict(
+            temperature_K=self.temperature_K,
+            pressure_au=self.pressure_GPa * units.GPa,
+            tdamp=self.tdamp_fs * units.fs,
+            pdamp=self.pdamp_fs * units.fs,
+            tchain=self.tchain,
+            pchain=self.pchain,
+            tloop=self.tloop,
+            ploop=self.ploop,
+            loginterval=self.loginterval,
+        )
+
+
 def resolve_dyn_kws(cfg: InitialTrajConfig) -> dict:
     """Build the real ASE dynamics-constructor kwargs for a trajectory config"""
     if cfg.dyn_cls == 'npt':
         return {'timestep': cfg.dt_fs * units.fs, **NPTConfig(**cfg.dyn_kws).to_ase_kwargs()}
+    elif cfg.dyn_cls == 'mtknpt':
+        return {'timestep': cfg.dt_fs * units.fs, **MTKNPTConfig(**cfg.dyn_kws).to_ase_kwargs()}
     return {'timestep': cfg.dt_fs * units.fs, **cfg.dyn_kws}
 
 
