@@ -56,7 +56,8 @@ from cascade.agents.task import (
     random_sample,
     label_frame,
     train,
-    ensemble_force_deviation_uq
+    ensemble_force_deviation_uq,
+    max_force_error
 )
 from cascade.traj_config import (
     InitialTrajConfig,
@@ -405,6 +406,7 @@ async def main():
                 executor=pool,
                 label_task=label_frame,
                 calc_factory=partial(mace_mp, model='medium', device=args.device_label, default_dtype="float32"),
+                error_fn=max_force_error,
                 )
             if use_controller:
                 controller_config = ControllerConfig(

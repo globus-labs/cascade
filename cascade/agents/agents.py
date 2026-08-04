@@ -213,7 +213,7 @@ class Auditor(CascadeAgent):
 
     @action
     async def receive_threshold(self, threshold: float) -> None:
-        """Pushed by Controller after each recalibration. Mirrors DynamicsRunner.receive_weights."""
+        """Pushed by Controller after each recalibration."""
         self.current_threshold = threshold
         self.logger.info(f"Received new audit threshold {threshold}")
 
@@ -223,8 +223,7 @@ class Auditor(CascadeAgent):
         self.logger.info(f'Submitting audit of traj {chunk.traj_id} chunk {chunk.chunk_id} attempt {chunk.attempt_ix} to executor')
 
         audit_kws = {**self.config.audit_kws}
-        if self.current_threshold is not None:
-            audit_kws['threshold'] = self.current_threshold
+        audit_kws['threshold'] = self.current_threshold
 
         future = self.config.executor.submit(
             self.config.audit_task,
@@ -258,14 +257,9 @@ class Auditor(CascadeAgent):
 
 
 class Controller(CascadeAgent):
-    """Calibrates the Auditor's UQ threshold against observed labeling error.
+    """Updates the Auditor's UQ threshold against observed labeling error.
 
-    Ports the alpha/threshold update from cascade.proxima.SerialLearningCalculator
-    (Eq. 1 and Eq. 3 of https://dl.acm.org/doi/abs/10.1145/3447818.3460370) to cascade's
-    async pipeline. Labeler calls calibrate_threshold() after every labeled frame; this
-    agent decides internally whether enough new data has accumulated to actually
-    recompute alpha/threshold, so callers never need to know whether a given call did
-    anything.
+    Based on the alpha and threshold updates from cascade.proxima.SerialLearningCalculator
     """
 
     def __init__(
@@ -285,13 +279,10 @@ class Controller(CascadeAgent):
     async def calibrate_threshold(self) -> None:
         """Recalibrate threshold/alpha from recently labeled frames, if warranted.
 
-        Throttled by config.recalibrate_every (new labeled frames between attempts)
-        and gated by config.burn_in_model_versions. The calibration window only ever
-        contains observations from a single model version -- see
-        TrajectoryDB.get_calibration_observations -- so a retrain resets the window
-        and threshold stays frozen at its last value until enough fresh, single-version
-        observations accumulate again.
+        Called by: Labeler
+        Invokes: Auditor (to update threshold)
         """
+
         self._since_last_calibration += 1
         if self._since_last_calibration < self.config.recalibrate_every:
             return
@@ -321,10 +312,9 @@ class Controller(CascadeAgent):
             assert self.alpha >= 0
 
             if self.threshold is None:
-                # Eq. 1: initial, conservative estimate
+                # initial, conservative estimate (make this tuneable?)
                 self.threshold = self.config.target_ferr / self.alpha / 2
             else:
-                # Eq. 3: incremental nudge toward target_ferr
                 current_err = float(np.mean(obs_errors))
                 self.threshold -= (current_err - self.config.target_ferr) / self.alpha
                 self.threshold = max(self.threshold, 0.)
@@ -413,13 +403,7 @@ class Labeler(CascadeAgent):
         # controller is only meaningful when paired with an adaptive audit strategy
         # (e.g. uq_threshold_audit); leave unset for audit strategies without a threshold
         self.controller = controller
-        if config.error_fn is not None:
-            self.error_fn = config.error_fn
-        else:
-            # lazy import: avoids pulling in task.py's torch/mace deps just to
-            # load cascade.agents.config or cascade.agents.agents
-            from cascade.agents.task import max_force_error
-            self.error_fn = max_force_error
+        self.error_fn = config.error_fn
 
     def _record_labeling_started(self, frame: TrainingFrame) -> None:
         # todo: discuss with will. wouldnt a pub/sub be better than DB for communicating this information. this is essentially a pub/sub spoof
