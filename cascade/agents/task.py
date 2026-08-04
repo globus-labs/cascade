@@ -220,6 +220,17 @@ def uq_threshold_audit(
     status = AuditStatus.PASSED if score < threshold else AuditStatus.FAILED
     return AuditResult(status=status, score=score)
 
+def max_force_error(atoms_predicted: Atoms, atoms_labeled: Atoms) -> float:
+    """Default error_fn for Controller calibration: max per-atom force-vector error
+    between the model's prediction and the DFT-labeled forces.
+
+    Mirrors the quantity target_ferr is calibrated against in proxima.
+    """
+    f_pred = atoms_predicted.calc.results['forces']
+    f_true = atoms_labeled.calc.results['forces']
+    return float(np.linalg.norm(f_pred - f_true, axis=-1).max())
+
+
 def label_noop(spec: TrainingFrame, calc_factory: Callable[..., Calculator]) -> TrainingFrame:
     """Returns forces from the training frame spec unmodified"""
     return spec

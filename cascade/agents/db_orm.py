@@ -29,6 +29,7 @@ from sqlalchemy import (
     Boolean,
     Enum as SQLEnum,
     DateTime,
+    Float,
     ForeignKey,
     func,
     JSON,
@@ -135,6 +136,11 @@ class DBTrainingFrame(Base):
     # Training round tracking
     training_round = Column(Integer, nullable=True, index=True)
     atoms_labeled_blob = Column(LargeBinary, nullable=True)
+    # Calibration inputs for adaptive audit thresholding (see Controller agent)
+    calibration_uq = Column(Float, nullable=True)
+    """UQ scalar recorded at sample time (e.g. atoms.info[uq_field])"""
+    calibration_error = Column(Float, nullable=True)
+    """Observed error vs. DFT label, computed by Labeler via error_fn"""
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
@@ -143,6 +149,22 @@ class DBTrainingFrame(Base):
 
     def __repr__(self):
         return f"<DBTrainingFrame(run_id={self.run_id}, trajectory_frame_id={self.trajectory_frame_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, training_round={self.training_round})>"
+
+
+class DBCalibrationLog(Base):
+    """ORM model for the Controller's threshold/alpha history"""
+    __tablename__ = 'calibration_log'
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String, nullable=False, index=True)
+    threshold = Column(Float, nullable=False)
+    alpha = Column(Float, nullable=False)
+    mean_error = Column(Float, nullable=False)
+    n_observations = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    def __repr__(self):
+        return f"<DBCalibrationLog(run_id={self.run_id}, threshold={self.threshold}, alpha={self.alpha}, n_observations={self.n_observations})>"
 
 
 class DBChunkEvent(Base):
@@ -1070,6 +1092,8 @@ class TrajectoryDB:
         chunk_id: int,
         attempt_index: int,
         atoms_labeled: Atoms,
+        calibration_uq: Optional[float] = None,
+        calibration_error: Optional[float] = None,
     ) -> DBTrainingFrame:
         """Add a training frame to the database
 
@@ -1081,6 +1105,8 @@ class TrajectoryDB:
             chunk_id: Chunk identifier (denormalized)
             attempt_index: Attempt index (denormalized)
             atoms_labeled: Labeled atoms with energy/forces to store
+            calibration_uq: UQ scalar recorded at sample time, for Controller calibration
+            calibration_error: Observed error vs. the DFT label, for Controller calibration
 
         Returns:
             DBTrainingFrame instance
@@ -1103,6 +1129,8 @@ class TrajectoryDB:
                 attempt_index=attempt_index,
                 training_round=None,
                 atoms_labeled_blob=self._serialize_atoms(atoms_labeled),
+                calibration_uq=calibration_uq,
+                calibration_error=calibration_error,
             )
             sess.add(db_training_frame)
             sess.flush()
@@ -1391,6 +1419,110 @@ class TrajectoryDB:
                 df.insert(1, 'member_index', row.member_index)
                 frames.append(df)
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    def get_calibration_observations(
+        self,
+        run_id: str,
+        burn_in_model_versions: int,
+        limit: int,
+    ) -> list[tuple[float, float]]:
+        """Return recent (uq, error) pairs for the Controller's threshold calibration.
+
+        Only frames from the newest model version present among qualifying, labeled
+        frames are returned, so a calibration window is never blended across model
+        versions (each model version has its own UQ/error relationship). "Newest" is
+        inferred from the data itself (MAX(model_version_sampled_from)) rather than
+        pushed in from another agent, since sampling/labeling happens concurrently
+        across trajectories and label completion order does not track generation order.
+
+        Args:
+            run_id: Run identifier
+            burn_in_model_versions: Ignore frames sampled below this model version
+            limit: Max number of most-recent observations to return
+
+        Returns:
+            List of (calibration_uq, calibration_error) pairs, newest first. Empty if
+            no qualifying frames exist yet.
+        """
+        with self.session() as sess:
+            latest_version = (
+                sess.query(func.max(DBTrainingFrame.model_version_sampled_from))
+                .filter(
+                    DBTrainingFrame.run_id == run_id,
+                    DBTrainingFrame.model_version_sampled_from >= burn_in_model_versions,
+                    DBTrainingFrame.calibration_error.isnot(None),
+                )
+                .scalar()
+            )
+            if latest_version is None:
+                return []
+
+            rows = (
+                sess.query(DBTrainingFrame.calibration_uq, DBTrainingFrame.calibration_error)
+                .filter(
+                    DBTrainingFrame.run_id == run_id,
+                    DBTrainingFrame.model_version_sampled_from == latest_version,
+                    DBTrainingFrame.calibration_error.isnot(None),
+                )
+                .order_by(DBTrainingFrame.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            return [(uq, err) for uq, err in rows]
+
+    def write_calibration_log(
+        self,
+        run_id: str,
+        threshold: float,
+        alpha: float,
+        mean_error: float,
+        n_observations: int,
+    ) -> None:
+        """Persist one Controller calibration event for later analysis.
+
+        Args:
+            run_id: Run identifier
+            threshold: Newly calibrated audit threshold
+            alpha: Newly fit alpha (error / UQ ratio)
+            mean_error: Mean observed error over the calibration window
+            n_observations: Number of observations the calibration window contained
+        """
+        with self.session() as sess:
+            sess.add(DBCalibrationLog(
+                run_id=run_id,
+                threshold=threshold,
+                alpha=alpha,
+                mean_error=mean_error,
+                n_observations=n_observations,
+            ))
+
+    def get_calibration_log(self, run_id: str) -> pd.DataFrame:
+        """Return the full calibration history for a run as a DataFrame.
+
+        Args:
+            run_id: Run identifier
+
+        Returns:
+            DataFrame with columns [threshold, alpha, mean_error, n_observations,
+            created_at], ordered by created_at, or an empty DataFrame if none exist.
+        """
+        with self.session() as sess:
+            rows = (
+                sess.query(DBCalibrationLog)
+                .filter_by(run_id=run_id)
+                .order_by(DBCalibrationLog.created_at)
+                .all()
+            )
+            return pd.DataFrame([
+                {
+                    'threshold': r.threshold,
+                    'alpha': r.alpha,
+                    'mean_error': r.mean_error,
+                    'n_observations': r.n_observations,
+                    'created_at': r.created_at,
+                }
+                for r in rows
+            ])
 
     def has_chunk_event(
         self,

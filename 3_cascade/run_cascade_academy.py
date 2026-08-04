@@ -33,7 +33,8 @@ from cascade.agents.agents import (
     Auditor,
     Sampler,
     Labeler,
-    Trainer
+    Trainer,
+    Controller,
 )
 from cascade.agents.config import (
     DatabaseMonitorConfig,
@@ -41,7 +42,8 @@ from cascade.agents.config import (
     AuditorConfig,
     SamplerConfig,
     LabelerConfig,
-    TrainerConfig
+    TrainerConfig,
+    ControllerConfig,
 )
 from cascade.model import AdvanceSpec, AuditResult
 from cascade.learning.mace import MACEInterface
@@ -158,7 +160,28 @@ def parse_args() -> argparse.Namespace:
         '--audit-threshold',
         type=float,
         default=0.1,
-        help='UQ threshold for the "uq_threshold" audit strategy'
+        help='Initial UQ threshold for the "uq_threshold" audit strategy, used as a seed '
+             'until --target-ferr calibration produces a real value (if enabled)'
+    )
+    parser.add_argument(
+        '--target-ferr',
+        type=float,
+        default=None,
+        help='Target observed force error for adaptive threshold calibration (Controller agent). '
+             'Only used with --audit-task uq_threshold; if unset, the threshold stays fixed '
+             'at --audit-threshold for the whole run.'
+    )
+    parser.add_argument(
+        '--calibration-history-length',
+        type=int,
+        default=8,
+        help='Number of same-model-version labeled frames required before (re)calibrating the threshold'
+    )
+    parser.add_argument(
+        '--recalibrate-every',
+        type=int,
+        default=5,
+        help='How many newly labeled frames between recalibration attempts'
     )
     parser.add_argument(
         '--learner',
@@ -297,7 +320,10 @@ async def main():
     # logic to figure out the real max number of used workers
     # but this may not make as much sense once we distribute the workflow, so no worries for now
     n_parsl_workers = len(initial_specs) + args.n_ensemble
-    n_agents = len(initial_specs) + 5 # one dynamics runner per traj and one of each other agent
+    # only meaningful alongside the uq_threshold audit strategy, which is the
+    # only audit_task that reads a 'threshold' kwarg
+    use_controller = args.audit_task == 'uq_threshold' and args.target_ferr is not None
+    n_agents = len(initial_specs) + 5 + (1 if use_controller else 0)  # one dynamics runner per traj and one of each other agent
     config = Config(
         executors=[
             HighThroughputExecutor(
@@ -325,6 +351,7 @@ async def main():
             labeler_reg = await manager.register_agent(Labeler)
             sampler_reg = await manager.register_agent(Sampler)
             auditor_reg = await manager.register_agent(Auditor)
+            controller_reg = await manager.register_agent(Controller) if use_controller else None
 
             # get handles to all agents
             db_handle = manager.get_handle(db_reg)
@@ -332,6 +359,7 @@ async def main():
             labeler_handle = manager.get_handle(labeler_reg)
             sampler_handle = manager.get_handle(sampler_reg)
             auditor_handle = manager.get_handle(auditor_reg)
+            controller_handle = manager.get_handle(controller_reg) if controller_reg is not None else None
 
             # these are used for cleanup
             handles = [
@@ -341,6 +369,8 @@ async def main():
                 sampler_handle,
                 auditor_handle,
             ]
+            if controller_handle is not None:
+                handles.append(controller_handle)
 
             # set up agent configs
             db_monitor_config = DatabaseMonitorConfig(
@@ -376,6 +406,15 @@ async def main():
                 label_task=label_frame,
                 calc_factory=partial(mace_mp, model='medium', device=args.device_label, default_dtype="float32"),
                 )
+            if use_controller:
+                controller_config = ControllerConfig(
+                    run_id=run_id,
+                    db_url=args.db_url,
+                    target_ferr=args.target_ferr,
+                    history_length=args.calibration_history_length,
+                    recalibrate_every=args.recalibrate_every,
+                    burn_in_model_versions=args.burn_in_rounds,
+                )
             trainer_config = TrainerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
@@ -409,9 +448,18 @@ async def main():
                 ),
                 registration=sampler_reg,
             )
+            if use_controller:
+                await manager.launch(
+                    Controller,
+                    kwargs=dict(
+                        config=controller_config,
+                        auditor=auditor_handle,
+                    ),
+                    registration=controller_reg,
+                )
             await manager.launch(
                 Labeler,
-                kwargs=dict(config=labeler_config),
+                kwargs=dict(config=labeler_config, controller=controller_handle),
                 registration=labeler_reg,
             )
             await manager.launch(

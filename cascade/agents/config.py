@@ -111,6 +111,25 @@ class LabelerConfig(CascadeAgentConfig):
     """Create the calculator to use for labeling"""
     label_task: Callable[[TrainingFrame, Callable[..., Calculator]], TrainingFrame]
     """Adds labels to training frames"""
+    uq_field: str = 'uq_force_std_max'
+    """atoms.info key holding the UQ scalar recorded at sample time"""
+    error_fn: Callable[[Atoms, Atoms], float] | None = None
+    """(predicted_atoms, labeled_atoms) -> observed error, recorded for Controller calibration.
+    Defaults to cascade.agents.task.max_force_error (resolved lazily by Labeler to avoid
+    importing task.py's heavy dependencies at config-module load time)."""
+
+
+@dataclass
+class ControllerConfig(CascadeAgentConfig):
+    """Configuration for Controller agent"""
+    target_ferr: float
+    """Target observed error (Eq. 1/3 of the proxima paper)"""
+    history_length: int = 8
+    """Max number of observations pulled per calibration window"""
+    recalibrate_every: int = 5
+    """New labeled frames required between recalibrations"""
+    burn_in_model_versions: int = 0
+    """Ignore calibration observations sampled below this model version"""
 
 @dataclass
 class TrainerConfig(CascadeAgentConfig):
