@@ -6,7 +6,7 @@
 source /home/michael/miniconda3/etc/profile.d/conda.sh
 conda activate cascade
 
-source "$(dirname "${BASH_SOURCE[0]}")/env_setup.sh"
+source "${SLURM_SUBMIT_DIR:-$(dirname "${BASH_SOURCE[0]}")}/env_setup.sh"
 
 JOB_TAG="${SLURM_JOB_ID:-$(date +%Y%m%d-%H%M%S)}"
 nvidia-smi --query-gpu=timestamp,utilization.gpu,temperature.gpu,power.draw \
