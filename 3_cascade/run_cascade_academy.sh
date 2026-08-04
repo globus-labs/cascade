@@ -3,6 +3,7 @@
 #    --replay-dataset ./datasets/mace-mp/sampled_1000.traj \
 #    --replay-downselect 10 \
 #    --replay-batch-size 2 \
+source "$(dirname "${BASH_SOURCE[0]}")/env_setup.sh"
 python run_cascade_academy.py \
     --init-config-json init_config_mof_crystalline_200_300K.json \
     --chunk-size 5 \

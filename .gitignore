@@ -1,4 +1,5 @@
-# 
+#
+**/env_setup.sh
 **/cp2k-run/*
 **/runinfo/*
 **/*.err

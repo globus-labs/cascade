@@ -10,6 +10,7 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import warnings
 from concurrent.futures import as_completed
 from functools import partial
@@ -76,8 +77,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--db-url',
         type=str,
-        default='postgresql://ase:pw@localhost:5432/cascade',
-        help='Database URL'
+        default=os.environ.get('CASCADE_DB_URL'),
+        help='Database URL, e.g. postgresql://ase:pw@<host>:5432/cascade '
+             '(defaults to the CASCADE_DB_URL env var)'
     )
     parser.add_argument(
         '--log-level',
