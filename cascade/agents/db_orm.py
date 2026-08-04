@@ -151,12 +151,14 @@ class DBTrainingFrame(Base):
         return f"<DBTrainingFrame(run_id={self.run_id}, trajectory_frame_id={self.trajectory_frame_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, training_round={self.training_round})>"
 
 
-class DBCalibrationLog(Base):
+class DBControllerLog(Base):
     """ORM model for the Controller's threshold/alpha history"""
-    __tablename__ = 'calibration_log'
+    __tablename__ = 'controller_log'
 
     id = Column(Integer, primary_key=True)
     run_id = Column(String, nullable=False, index=True)
+    model_version = Column(Integer, nullable=False)
+    """model_version_sampled_from of the calibration window this entry was fit from"""
     threshold = Column(Float, nullable=False)
     alpha = Column(Float, nullable=False)
     mean_error = Column(Float, nullable=False)
@@ -164,7 +166,7 @@ class DBCalibrationLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     def __repr__(self):
-        return f"<DBCalibrationLog(run_id={self.run_id}, threshold={self.threshold}, alpha={self.alpha}, n_observations={self.n_observations})>"
+        return f"<DBControllerLog(run_id={self.run_id}, model_version={self.model_version}, threshold={self.threshold}, alpha={self.alpha}, n_observations={self.n_observations})>"
 
 
 class DBChunkEvent(Base):
@@ -1420,12 +1422,12 @@ class TrajectoryDB:
                 frames.append(df)
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-    def get_calibration_observations(
+    def get_controller_observations(
         self,
         run_id: str,
         burn_in_model_versions: int,
         limit: int,
-    ) -> list[tuple[float, float]]:
+    ) -> tuple[int, list[tuple[float, float]]]:
         """Return recent (uq, error) pairs for the Controller's threshold calibration.
 
         Only frames from the newest model version present among qualifying, labeled
@@ -1441,8 +1443,9 @@ class TrajectoryDB:
             limit: Max number of most-recent observations to return
 
         Returns:
-            List of (calibration_uq, calibration_error) pairs, newest first. Empty if
-            no qualifying frames exist yet.
+            (model_version, observations): the model version the window was drawn
+            from, and (calibration_uq, calibration_error) pairs, newest first. Both
+            are empty/None if no qualifying frames exist yet.
         """
         with self.session() as sess:
             latest_version = (
@@ -1455,7 +1458,7 @@ class TrajectoryDB:
                 .scalar()
             )
             if latest_version is None:
-                return []
+                return None, []
 
             rows = (
                 sess.query(DBTrainingFrame.calibration_uq, DBTrainingFrame.calibration_error)
@@ -1468,11 +1471,12 @@ class TrajectoryDB:
                 .limit(limit)
                 .all()
             )
-            return [(uq, err) for uq, err in rows]
+            return latest_version, [(uq, err) for uq, err in rows]
 
-    def write_calibration_log(
+    def write_controller_log(
         self,
         run_id: str,
+        model_version: int,
         threshold: float,
         alpha: float,
         mean_error: float,
@@ -1482,39 +1486,43 @@ class TrajectoryDB:
 
         Args:
             run_id: Run identifier
+            model_version: model_version_sampled_from of the calibration window
             threshold: Newly calibrated audit threshold
             alpha: Newly fit alpha (error / UQ ratio)
             mean_error: Mean observed error over the calibration window
             n_observations: Number of observations the calibration window contained
         """
         with self.session() as sess:
-            sess.add(DBCalibrationLog(
+            sess.add(DBControllerLog(
                 run_id=run_id,
+                model_version=model_version,
                 threshold=threshold,
                 alpha=alpha,
                 mean_error=mean_error,
                 n_observations=n_observations,
             ))
 
-    def get_calibration_log(self, run_id: str) -> pd.DataFrame:
+    def get_controller_log(self, run_id: str) -> pd.DataFrame:
         """Return the full calibration history for a run as a DataFrame.
 
         Args:
             run_id: Run identifier
 
         Returns:
-            DataFrame with columns [threshold, alpha, mean_error, n_observations,
-            created_at], ordered by created_at, or an empty DataFrame if none exist.
+            DataFrame with columns [model_version, threshold, alpha, mean_error,
+            n_observations, created_at], ordered by created_at, or an empty DataFrame
+            if none exist.
         """
         with self.session() as sess:
             rows = (
-                sess.query(DBCalibrationLog)
+                sess.query(DBControllerLog)
                 .filter_by(run_id=run_id)
-                .order_by(DBCalibrationLog.created_at)
+                .order_by(DBControllerLog.created_at)
                 .all()
             )
             return pd.DataFrame([
                 {
+                    'model_version': r.model_version,
                     'threshold': r.threshold,
                     'alpha': r.alpha,
                     'mean_error': r.mean_error,

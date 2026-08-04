@@ -276,7 +276,7 @@ class Controller(CascadeAgent):
         self._since_last_calibration = 0
 
     @action
-    async def calibrate_threshold(self) -> None:
+    async def update_threshold(self) -> None:
         """Recalibrate threshold/alpha from recently labeled frames, if warranted.
 
         Called by: Labeler
@@ -288,7 +288,7 @@ class Controller(CascadeAgent):
             return
         self._since_last_calibration = 0
 
-        observations = self._traj_db.get_calibration_observations(
+        model_version, observations = self._traj_db.get_controller_observations(
             run_id=self.config.run_id,
             burn_in_model_versions=self.config.burn_in_model_versions,
             limit=self.config.history_length,
@@ -320,8 +320,9 @@ class Controller(CascadeAgent):
                 self.threshold = max(self.threshold, 0.)
 
         mean_error = float(np.mean(obs_errors))
-        self._traj_db.write_calibration_log(
+        self._traj_db.write_controller_log(
             run_id=self.config.run_id,
+            model_version=model_version,
             threshold=self.threshold,
             alpha=self.alpha if self.alpha is not None else 0.,
             mean_error=mean_error,
@@ -463,7 +464,7 @@ class Labeler(CascadeAgent):
 
         self._record_labeling_finished(frame)
         if self.controller is not None:
-            asyncio.create_task(self.controller.calibrate_threshold())
+            asyncio.create_task(self.controller.update_threshold())
 
 
 class Trainer(CascadeAgent):
