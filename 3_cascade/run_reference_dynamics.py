@@ -15,14 +15,6 @@ import warnings
 from concurrent.futures import as_completed
 from functools import partial
 
-import torch
-# crazy patch because of e3nn not importing safely
-# todo: make it a context manager and wrap every call with it?
-_orig_load = torch.load
-def _load_no_weights_only(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
-    return _orig_load(*args, **kwargs)
-torch.load = _load_no_weights_only
 from mace.calculators import mace_mp
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
@@ -109,14 +101,6 @@ def run_reference_trajectory(
     from cascade.utils import canonicalize
     from cascade.traj_config import get_dynamics_cls, resolve_dyn_kws, prepare_atoms_for_dynamics
     from cascade.model import AuditStatus
-    import torch
-    # crazy patch because of e3nn not importing safely
-    # todo: make it a context manager and wrap every call with it?
-    _orig_load = torch.load
-    def _load_no_weights_only(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
-        return _orig_load(*args, **kwargs)
-    torch.load = _load_no_weights_only
     from mace.calculators import mace_mp
     from functools import partial
     calc_factory = partial(mace_mp, model=calc_model, device=device, default_dtype="float32")

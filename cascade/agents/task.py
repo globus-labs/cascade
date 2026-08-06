@@ -6,14 +6,6 @@ import logging
 import os
 
 import numpy as np
-import torch
-# crazy patch because of e3nn not importing safely
-# todo: make it a context manager and wrap every call with it?
-_orig_load = torch.load
-def _load_no_weights_only(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
-    return _orig_load(*args, **kwargs)
-torch.load = _load_no_weights_only
 from ase.optimize.optimize import Dynamics
 from mace.calculators import mace_mp
 
