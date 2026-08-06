@@ -191,7 +191,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
         for batch in loader:
             batch = batch.to(device)
             y = model(
-                batch,
+                batch.to_dict(),
                 training=False,
                 compute_force=True,
                 compute_virials=False,
@@ -295,7 +295,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
             opt.zero_grad()
             batch = batch.to(device)
             y = model(
-                batch,
+                batch.to_dict(),
                 training=True,
                 compute_force=True,
                 compute_virials=False,
@@ -324,9 +324,9 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
             logger.info(f'Started validation for epoch {engine.state.epoch - 1}')
 
             for batch in valid_loader:
-                batch.to(device)
+                batch = batch.to(device)
                 y = model(
-                    batch,
+                    batch.to_dict(),
                     training=False,
                     compute_force=True,
                     compute_virials=False,
@@ -379,9 +379,9 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
                 logger.info(f'Started replay for epoch {engine.state.epoch - 1}')
 
                 for batch in replay_loader:
-                    batch.to(device)
+                    batch = batch.to(device)
                     y = replay_model(
-                        batch,
+                        batch.to_dict(),
                         training=True,
                         compute_force=True,
                         compute_virials=False,
