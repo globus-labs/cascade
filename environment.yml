@@ -21,7 +21,7 @@ dependencies:
       - parsl
       - pandas
       - sigfig
-      - academy-py==0.3.1
+      - academy-py
       - SQLAlchemy
       - psycopg2
       - -e .[mace]

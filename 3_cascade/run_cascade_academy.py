@@ -33,7 +33,7 @@ from parsl.executors import HighThroughputExecutor
 from parsl.providers import LocalProvider
 from parsl.usage_tracking.levels import LEVEL_1
 from parsl.concurrent import ParslPoolExecutor
-from academy.logging import init_logging
+from academy.logging.recommended import recommended_logging
 from academy.exchange import LocalExchangeFactory
 from academy.manager import Manager
 
@@ -246,17 +246,6 @@ async def main():
     (run_dir / "params.json").write_text(json.dumps(params))
     logfile = run_dir / "runtime.log"
 
-    # set up logging
-    logger = init_logging(level=args.log_level, logfile=logfile)
-    logger.setLevel(logging.DEBUG)
-    logger.info("Loaded run params")
-    logger.info(f'Running job in {run_dir}')
-    # separate parsle logging
-    parsl_logger = logging.getLogger('parsl')
-    for handler in parsl_logger.handlers[:]:  # Iterate over a copy of the list
-        parsl_logger.removeHandler(handler)
-    parsl_logger.addHandler(logging.FileHandler(run_dir / 'parsl.log'))
-
     # read in initial model
     learner = get_learner(args.learner)
     init_weights = learner.serialize_model(learner.get_model(mace_mp('small').models[0]))
@@ -283,7 +272,7 @@ async def main():
     initial_specs = []
     for i, cfg in enumerate(init_configs):
         a = read(cfg.path, index=-1)
-        logger.info(f"Initializing traj {i} with {len(a)} atoms")
+        #logger.info(f"Initializing traj {i} with {len(a)} atoms")
 
         a = prepare_atoms_for_dynamics(a, cfg)
 
@@ -335,6 +324,7 @@ async def main():
         async with await Manager.from_exchange_factory(
             factory=LocalExchangeFactory(),
             executors=ThreadPoolExecutor(max_workers=n_agents),
+            log_config=recommended_logging(level=args.log_level, logfile=logfile)
         ) as manager:
 
             # register all agents with manager
