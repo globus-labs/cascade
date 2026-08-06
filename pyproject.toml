@@ -49,7 +49,7 @@ chgnet = [
     'chgnet',
 ]
 mace = [
-    'mace-torch==0.3.7',
+    'mace-torch',
     'pytorch-ignite'
 ]
 docs = [
