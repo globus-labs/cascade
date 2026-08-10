@@ -234,6 +234,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default='cpu',
     )
+    parser.add_argument(
+        '--num-epochs',
+        type=int,
+        default=10,
+        help='Number of epochs per training round',
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=2,
+        help='Batch size for training',
+    )
     parser.add_argument('--replay-dataset', default=None, help='Path to an ASE database containing data to replay during finetuning')
     parser.add_argument('--replay-downselect', default=None, type=int, help='Max number of entries to use from replay dataset')
     parser.add_argument('--replay-frequency', default=1, type=int, help='How often to replay')
@@ -444,9 +456,9 @@ async def main():
                 training_task=train,
                 training_args=(),
                 training_kws=dict(
-                    num_epochs=10,
+                    num_epochs=args.num_epochs,
                     device=args.device_train,
-                    batch_size=2,
+                    batch_size=args.batch_size,
                 ),
                 learner=learner,
                 replay=replay,
