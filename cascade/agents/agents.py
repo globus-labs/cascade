@@ -182,12 +182,23 @@ class DynamicsRunner(CascadeAgent):
                     self.attempt = 0
                     self.logger.info(f"Updating traj {self.config.traj_id} to chunk {self.chunk_ix} attempt {self.attempt}")
             else:
-                # audit failed: wait for new weights
-                self.logger.info(f'Audit status failed for traj {self.config.traj_id} chunk {self.chunk_ix} attempt {self.attempt}, waiting for new weights...')
                 self.attempt += 1
-                self.received_weights.clear()
-                await self.received_weights.wait()
-                self.logger.info('Received new weights')
+                if self.config.max_audit_retries is not None and self.attempt > self.config.max_audit_retries:
+                    reason = (
+                        f"chunk {self.chunk_ix} failed audit {self.attempt} times "
+                        f"(max_audit_retries={self.config.max_audit_retries}); "
+                        f"last audit reason={audit_result.reason}"
+                    )
+                    self.logger.error(f"Traj {self.config.traj_id} exceeded max_audit_retries: {reason}")
+                    self._traj_db.mark_trajectory_failed(run_id=self.config.run_id, traj_id=self.config.traj_id, reason=reason)
+                    self.done = True
+                    self.agent_shutdown()
+                else:
+                    # audit failed: wait for new weights
+                    self.logger.info(f'Audit status failed for traj {self.config.traj_id} chunk {self.chunk_ix} attempt {self.attempt}, waiting for new weights...')
+                    self.received_weights.clear()
+                    await self.received_weights.wait()
+                    self.logger.info('Received new weights')
 
     @action
     async def receive_weights(self, weights: list[bytes], model_version: int) -> None:

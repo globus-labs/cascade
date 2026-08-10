@@ -53,6 +53,8 @@ class DBTrajectory(Base):
     target_length = Column(Integer, nullable=False)
     chunks_completed = Column(Integer, default=0, nullable=False)
     status = Column(SQLEnum(TrajectoryStatus), nullable=False, default=TrajectoryStatus.RUNNING)
+    failure_reason = Column(String, nullable=True)
+    """Why the trajectory was marked FAILED, e.g. exceeding max_audit_retries; null otherwise"""
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -354,11 +356,13 @@ class TrajectoryDB:
         sess,
         traj: DBTrajectory,
         status: TrajectoryStatus,
+        reason: str | None = None,
     ) -> None:
         """Internal helper to update trajectory status."""
         previous_status = traj.status
         if previous_status != status:
             traj.status = status
+            traj.failure_reason = reason
             sess.flush()
 
     def mark_trajectory_status(
@@ -366,6 +370,7 @@ class TrajectoryDB:
         run_id: str,
         traj_id: int,
         status: TrajectoryStatus,
+        reason: str | None = None,
     ) -> bool:
         """Set the lifecycle status for a trajectory."""
         with self.session() as sess:
@@ -380,16 +385,16 @@ class TrajectoryDB:
                     traj_id,
                 )
                 return False
-            self._set_trajectory_status(sess, traj, status)
+            self._set_trajectory_status(sess, traj, status, reason=reason)
             return True
 
     def mark_trajectory_running(self, run_id: str, traj_id: int) -> bool:
         """Mark a trajectory as actively running."""
         return self.mark_trajectory_status(run_id, traj_id, TrajectoryStatus.RUNNING)
 
-    def mark_trajectory_failed(self, run_id: str, traj_id: int) -> bool:
+    def mark_trajectory_failed(self, run_id: str, traj_id: int, reason: str | None = None) -> bool:
         """Mark a trajectory as failed."""
-        return self.mark_trajectory_status(run_id, traj_id, TrajectoryStatus.FAILED)
+        return self.mark_trajectory_status(run_id, traj_id, TrajectoryStatus.FAILED, reason=reason)
 
     def mark_trajectory_completed(self, run_id: str, traj_id: int) -> bool:
         """Mark a trajectory as completed."""

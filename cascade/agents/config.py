@@ -74,6 +74,9 @@ class DynamicsRunnerConfig(CascadeAgentConfig):
     """Keyword arguments passed to uq_hook"""
     gpu_flush_interval: int = 10
     """How often advance_dynamics releases PyTorch's CUDA caching allocator"""
+    max_audit_retries: int | None = None
+    """Max consecutive audit failures a single chunk may accumulate before the
+    trajectory is marked FAILED. None (default) means retry indefinitely"""
 
 
 @dataclass

@@ -144,6 +144,13 @@ def parse_args() -> argparse.Namespace:
         help='Frames to sample per chunk while still in burn-in (defaults to --n-sample-frames if unset)'
     )
     parser.add_argument(
+        '--max-audit-retries',
+        type=int,
+        default=None,
+        help='Max consecutive audit failures a single chunk may accumulate before its trajectory '
+             'is marked FAILED and given up on. Unset means retry indefinitely.'
+    )
+    parser.add_argument(
         '--accept-rate',
         type=float,
         default=1.0,
@@ -508,6 +515,7 @@ async def main():
                         model_version=0,
                         uq_hook=ensemble_force_deviation_uq,
                         gpu_flush_interval=args.gpu_flush_interval,
+                        max_audit_retries=args.max_audit_retries,
                 )
                 await manager.launch(
                     DynamicsRunner,
