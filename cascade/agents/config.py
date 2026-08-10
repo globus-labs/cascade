@@ -85,6 +85,9 @@ class AuditorConfig(CascadeAgentConfig):
     """Keyword arguments to audit_task"""
     executor: Executor
     """Where to run audit task"""
+    random_fail_rate: float = 0.0
+    """If > 0, the Auditor wraps audit_task so a PASSED result is randomly downgraded
+    to FAILED at this frequency, independent of audit_task's own pass/fail logic"""
 
 
 @dataclass
@@ -124,10 +127,11 @@ class ControllerConfig(CascadeAgentConfig):
     """Target observed error (Eq. 1/3 of the proxima paper)"""
     history_length: int = 8
     """Max number of observations pulled per calibration window"""
-    recalibrate_every: int = 5
-    """New labeled frames required between recalibrations"""
     burn_in_model_versions: int = 0
     """Ignore calibration observations sampled below this model version"""
+    per_trajectory_threshold: bool = False
+    """If set, calibrate each trajectory's alpha/threshold independently from only
+    its own observations, instead of pooling all trajectories into one shared threshold"""
 
 @dataclass
 class TrainerConfig(CascadeAgentConfig):

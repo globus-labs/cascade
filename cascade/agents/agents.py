@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from asyncio import Event, Lock, wrap_future
+from functools import partial
 import logging
 from copy import deepcopy
 
@@ -27,6 +28,7 @@ from cascade.agents.config import (
     ControllerConfig,
 )
 from cascade.agents.db_orm import TrajectoryDB
+from cascade.agents.task import audit_with_random_failure
 from cascade.model import Chunk, TrainingFrame
 
 
@@ -209,13 +211,25 @@ class Auditor(CascadeAgent):
         super().__init__()
         self.config = config
         self.sampler = sampler
-        self.current_threshold = config.audit_kws.get('threshold')
+        self.audit_task = config.audit_task
+        if config.random_fail_rate > 0:
+            self.audit_task = partial(audit_with_random_failure, audit_task=self.audit_task, fail_rate=config.random_fail_rate)
+        self.default_threshold = config.audit_kws.get('threshold')
+        self.thresholds: dict[int, float] = {}
 
     @action
-    async def receive_threshold(self, threshold: float) -> None:
-        """Pushed by Controller after each recalibration."""
-        self.current_threshold = threshold
-        self.logger.info(f"Received new audit threshold {threshold}")
+    async def receive_threshold(self, threshold: float, traj_id: int | None = None) -> None:
+        """Pushed by Controller after each recalibration.
+
+        traj_id=None updates the shared default used by any trajectory without its
+        own calibrated value; otherwise updates only that trajectory's threshold.
+        """
+        if traj_id is None:
+            self.default_threshold = threshold
+            self.logger.info(f"Received new default audit threshold {threshold}")
+        else:
+            self.thresholds[traj_id] = threshold
+            self.logger.info(f"Received new audit threshold {threshold} for traj {traj_id}")
 
     @action
     async def audit(self, chunk: Chunk) -> AuditResult:
@@ -223,10 +237,10 @@ class Auditor(CascadeAgent):
         self.logger.info(f'Submitting audit of traj {chunk.traj_id} chunk {chunk.chunk_id} attempt {chunk.attempt_ix} to executor')
 
         audit_kws = {**self.config.audit_kws}
-        audit_kws['threshold'] = self.current_threshold
+        audit_kws['threshold'] = self.thresholds.get(chunk.traj_id, self.default_threshold)
 
         future = self.config.executor.submit(
-            self.config.audit_task,
+            self.audit_task,
             chunk,
             **audit_kws
         )
@@ -240,7 +254,8 @@ class Auditor(CascadeAgent):
             traj_id=chunk.traj_id,
             chunk_id=chunk.chunk_id,
             attempt_index=chunk.attempt_ix,
-            audit_status=status
+            audit_status=status,
+            audit_reason=result.reason,
         )
         if status == AuditStatus.PASSED:
             self.logger.info(
@@ -259,7 +274,12 @@ class Auditor(CascadeAgent):
 class Controller(CascadeAgent):
     """Updates the Auditor's UQ threshold against observed labeling error.
 
-    Based on the alpha and threshold updates from cascade.proxima.SerialLearningCalculator
+    Based on the alpha and threshold updates from cascade.proxima.SerialLearningCalculator.
+
+    When config.per_trajectory_threshold is set, each trajectory gets its own
+    independently calibrated alpha/threshold, fit only from that trajectory's own
+    observations. Otherwise (the default) all trajectories share one calibration
+    pooled across the whole run, matching the original behavior.
     """
 
     def __init__(
@@ -271,32 +291,34 @@ class Controller(CascadeAgent):
         super().__init__()
         self.config = config
         self.auditor = auditor
-        self.threshold: float | None = None
-        self.alpha: float | None = None
-        self._since_last_calibration = 0
+        self.threshold: dict[int | None, float] = {}
+        self.alpha: dict[int | None, float] = {}
+
+    def _bucket(self, traj_id: int) -> int | None:
+        """Calibration key: per-trajectory when enabled, else one shared bucket for all trajectories."""
+        return traj_id if self.config.per_trajectory_threshold else None
 
     @action
-    async def update_threshold(self) -> None:
-        """Recalibrate threshold/alpha from recently labeled frames, if warranted.
+    async def update_threshold(self, traj_id: int) -> None:
+        """Recalibrate threshold/alpha from labeled frames, if enough observations exist.
 
-        Called by: Labeler
+        Called by: Labeler, on every newly labeled frame
         Invokes: Auditor (to update threshold)
         """
-
-        self._since_last_calibration += 1
-        if self._since_last_calibration < self.config.recalibrate_every:
-            return
-        self._since_last_calibration = 0
+        key = self._bucket(traj_id)
 
         model_version, observations = self._traj_db.get_controller_observations(
             run_id=self.config.run_id,
             burn_in_model_versions=self.config.burn_in_model_versions,
             limit=self.config.history_length,
+            traj_id=key,
         )
         if len(observations) < self.config.history_length:
             self.logger.info(
                 f"Too few calibration observations ({len(observations)} < "
-                f"{self.config.history_length}); threshold stays at {self.threshold}"
+                f"{self.config.history_length}) for "
+                f"{'traj ' + str(key) if key is not None else 'shared'} threshold; "
+                f"stays at {self.threshold.get(key)}"
             )
             return
 
@@ -305,34 +327,36 @@ class Controller(CascadeAgent):
         if np.allclose(uncert_metrics, 0.):
             # Happens e.g. when all ensemble members still share the same weights
             self.logger.info('All calibration UQ metrics are zero; setting threshold to zero')
-            self.threshold = 0.
+            self.threshold[key] = 0.
         else:
             many_alphas = np.true_divide(obs_errors, np.clip(uncert_metrics, 1e-6, a_max=np.inf))
-            self.alpha = float(np.mean(many_alphas))
-            assert self.alpha >= 0
+            alpha = float(np.mean(many_alphas))
+            assert alpha >= 0
+            self.alpha[key] = alpha
 
-            if self.threshold is None:
+            if key not in self.threshold:
                 # initial, conservative estimate (make this tuneable?)
-                self.threshold = self.config.target_ferr / self.alpha / 2
+                self.threshold[key] = self.config.target_ferr / alpha / 2
             else:
                 current_err = float(np.mean(obs_errors))
-                self.threshold -= (current_err - self.config.target_ferr) / self.alpha
-                self.threshold = max(self.threshold, 0.)
+                self.threshold[key] -= (current_err - self.config.target_ferr) / alpha
+                self.threshold[key] = max(self.threshold[key], 0.)
 
         mean_error = float(np.mean(obs_errors))
         self._traj_db.write_controller_log(
             run_id=self.config.run_id,
             model_version=model_version,
-            threshold=self.threshold,
-            alpha=self.alpha if self.alpha is not None else 0.,
+            threshold=self.threshold[key],
+            alpha=self.alpha.get(key, 0.),
             mean_error=mean_error,
             n_observations=len(observations),
+            traj_id=key,
         )
         self.logger.info(
-            f"Calibrated threshold={self.threshold:.4g}, alpha={self.alpha}, "
+            f"Calibrated threshold={self.threshold[key]:.4g}, alpha={self.alpha.get(key)}, "
             f"mean_error={mean_error:.4g}, n_observations={len(observations)}"
         )
-        await self.auditor.receive_threshold(self.threshold)
+        await self.auditor.receive_threshold(self.threshold[key], traj_id=key)
 
 
 class Sampler(CascadeAgent):
@@ -464,7 +488,7 @@ class Labeler(CascadeAgent):
 
         self._record_labeling_finished(frame)
         if self.controller is not None:
-            asyncio.create_task(self.controller.update_threshold())
+            asyncio.create_task(self.controller.update_threshold(traj_id=frame.traj_id))
 
 
 class Trainer(CascadeAgent):

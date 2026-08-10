@@ -85,6 +85,8 @@ class DBTrajectoryChunk(Base):
     attempt_index = Column(Integer, nullable=False, default=0)
     model_version = Column(Integer, nullable=False)
     audit_status = Column(SQLEnum(AuditStatus), nullable=False, default=AuditStatus.PENDING)
+    audit_reason = Column(String, nullable=True)
+    """Which mechanism produced audit_status, e.g. 'threshold', 'burn_in', 'random_fail'; null while PENDING"""
     n_frames = Column(Integer, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -157,6 +159,8 @@ class DBControllerLog(Base):
 
     id = Column(Integer, primary_key=True)
     run_id = Column(String, nullable=False, index=True)
+    traj_id = Column(Integer, nullable=True, index=True)
+    """Trajectory this calibration is specific to; null when the threshold is shared across all trajectories"""
     model_version = Column(Integer, nullable=False)
     """model_version_sampled_from of the calibration window this entry was fit from"""
     threshold = Column(Float, nullable=False)
@@ -531,16 +535,18 @@ class TrajectoryDB:
         traj_id: int,
         chunk_id: int,
         attempt_index: int,
-        audit_status: AuditStatus
+        audit_status: AuditStatus,
+        audit_reason: str | None = None,
     ):
         """Update the audit status of a chunk and mark trajectory as done if it is complete
-        
+
         Args:
             run_id: Run identifier
             traj_id: Trajectory identifier
             chunk_id: Chunk identifier
             attempt_index: Attempt index
             audit_status: New audit status
+            audit_reason: Which mechanism produced audit_status (see AuditResult.reason)
         """
         with self.session() as sess:
             chunk = sess.query(DBTrajectoryChunk).filter_by(
@@ -549,14 +555,15 @@ class TrajectoryDB:
                 chunk_id=chunk_id,
                 attempt_index=attempt_index
             ).first()
-            
+
             if not chunk:
                 raise ValueError(
                     f"Chunk not found: run_id={run_id}, traj_id={traj_id}, "
                     f"chunk_id={chunk_id}, attempt_index={attempt_index}"
                 )
-            
+
             chunk.audit_status = audit_status
+            chunk.audit_reason = audit_reason
             
             # If chunk passed, increment chunks_completed on trajectory
             if audit_status == AuditStatus.PASSED:
@@ -1427,6 +1434,7 @@ class TrajectoryDB:
         run_id: str,
         burn_in_model_versions: int,
         limit: int,
+        traj_id: int | None = None,
     ) -> tuple[int, list[tuple[float, float]]]:
         """Return recent (uq, error) pairs for the Controller's threshold calibration.
 
@@ -1441,6 +1449,8 @@ class TrajectoryDB:
             run_id: Run identifier
             burn_in_model_versions: Ignore frames sampled below this model version
             limit: Max number of most-recent observations to return
+            traj_id: If set, restrict to this trajectory's own observations only
+                (per-trajectory calibration); if None, pool across all trajectories.
 
         Returns:
             (model_version, observations): the model version the window was drawn
@@ -1448,12 +1458,18 @@ class TrajectoryDB:
             are empty/None if no qualifying frames exist yet.
         """
         with self.session() as sess:
+            base_filters = [
+                DBTrainingFrame.run_id == run_id,
+                DBTrainingFrame.calibration_error.isnot(None),
+            ]
+            if traj_id is not None:
+                base_filters.append(DBTrainingFrame.traj_id == traj_id)
+
             latest_version = (
                 sess.query(func.max(DBTrainingFrame.model_version_sampled_from))
                 .filter(
-                    DBTrainingFrame.run_id == run_id,
+                    *base_filters,
                     DBTrainingFrame.model_version_sampled_from >= burn_in_model_versions,
-                    DBTrainingFrame.calibration_error.isnot(None),
                 )
                 .scalar()
             )
@@ -1463,9 +1479,8 @@ class TrajectoryDB:
             rows = (
                 sess.query(DBTrainingFrame.calibration_uq, DBTrainingFrame.calibration_error)
                 .filter(
-                    DBTrainingFrame.run_id == run_id,
+                    *base_filters,
                     DBTrainingFrame.model_version_sampled_from == latest_version,
-                    DBTrainingFrame.calibration_error.isnot(None),
                 )
                 .order_by(DBTrainingFrame.created_at.desc())
                 .limit(limit)
@@ -1481,6 +1496,7 @@ class TrajectoryDB:
         alpha: float,
         mean_error: float,
         n_observations: int,
+        traj_id: int | None = None,
     ) -> None:
         """Persist one Controller calibration event for later analysis.
 
@@ -1491,10 +1507,13 @@ class TrajectoryDB:
             alpha: Newly fit alpha (error / UQ ratio)
             mean_error: Mean observed error over the calibration window
             n_observations: Number of observations the calibration window contained
+            traj_id: Trajectory this calibration is specific to, or None if shared
+                across all trajectories
         """
         with self.session() as sess:
             sess.add(DBControllerLog(
                 run_id=run_id,
+                traj_id=traj_id,
                 model_version=model_version,
                 threshold=threshold,
                 alpha=alpha,
@@ -1509,9 +1528,10 @@ class TrajectoryDB:
             run_id: Run identifier
 
         Returns:
-            DataFrame with columns [model_version, threshold, alpha, mean_error,
-            n_observations, created_at], ordered by created_at, or an empty DataFrame
-            if none exist.
+            DataFrame with columns [traj_id, model_version, threshold, alpha,
+            mean_error, n_observations, created_at], ordered by created_at, or an
+            empty DataFrame if none exist. traj_id is None for entries logged while
+            the threshold was shared across all trajectories.
         """
         with self.session() as sess:
             rows = (
@@ -1522,6 +1542,7 @@ class TrajectoryDB:
             )
             return pd.DataFrame([
                 {
+                    'traj_id': r.traj_id,
                     'model_version': r.model_version,
                     'threshold': r.threshold,
                     'alpha': r.alpha,

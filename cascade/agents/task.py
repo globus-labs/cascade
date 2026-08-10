@@ -46,7 +46,7 @@ def random_audit(
     passed = rng.random() < accept_prob
     score = rng.random() if passed else 0.0
     status = AuditStatus.PASSED if passed else AuditStatus.FAILED
-    return AuditResult(status=status, score=score)
+    return AuditResult(status=status, score=score, reason='random_accept')
 
 
 def random_sample(
@@ -213,12 +213,34 @@ def uq_threshold_audit(
     import numpy as np
 
     if chunk.model_version < burn_in_model_versions:
-        return AuditResult(status=AuditStatus.FAILED, score=float('inf'))
+        return AuditResult(status=AuditStatus.FAILED, score=float('inf'), reason='burn_in')
 
     values = np.array([a.info[field] for a in chunk.atoms])
     score = float(values.max())
     status = AuditStatus.PASSED if score < threshold else AuditStatus.FAILED
-    return AuditResult(status=status, score=score)
+    return AuditResult(status=status, score=score, reason='threshold')
+
+
+def audit_with_random_failure(
+    chunk: Chunk,
+    audit_task: Callable[..., AuditResult],
+    fail_rate: float = 0.0,
+    **audit_kws,
+) -> AuditResult:
+    """Wraps another audit_task so a PASSED result is randomly downgraded to FAILED
+    at the given frequency, independent of the wrapped strategy's own pass/fail logic.
+
+    Forces continued sampling/exploration even when the underlying strategy is confident.
+    """
+    from cascade.model import AuditResult, AuditStatus
+    import numpy as np
+
+    result = audit_task(chunk, **audit_kws)
+    if result.status == AuditStatus.PASSED and fail_rate > 0:
+        rng = np.random.default_rng(seed=None)
+        if rng.random() < fail_rate:
+            return AuditResult(status=AuditStatus.FAILED, score=result.score, reason='random_fail')
+    return result
 
 def max_force_error(atoms_predicted: Atoms, atoms_labeled: Atoms) -> float:
     """Default error_fn for Controller calibration: max per-atom force-vector error

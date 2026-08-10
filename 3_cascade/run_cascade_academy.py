@@ -179,10 +179,19 @@ def parse_args() -> argparse.Namespace:
         help='Number of same-model-version labeled frames required before (re)calibrating the threshold'
     )
     parser.add_argument(
-        '--recalibrate-every',
-        type=int,
-        default=5,
-        help='How many newly labeled frames between recalibration attempts'
+        '--per-trajectory-threshold',
+        type='int',
+        defualt=1,
+        help='Calibrate each trajectory\'s UQ threshold independently from only its own '
+             'labeled-frame history, instead of pooling all trajectories into one shared threshold. '
+             'Only used with --audit-task uq_threshold and --target-ferr set.'
+    )
+    parser.add_argument(
+        '--audit-random-fail-rate',
+        type=float,
+        default=0.0,
+        help='Frequency at which a chunk that would otherwise pass audit is randomly failed anyway, '
+             'independent of the active audit strategy (forces continued sampling/exploration)'
     )
     parser.add_argument(
         '--learner',
@@ -224,6 +233,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--replay-lr-reduction', default=1, type=float, help='Factor by which to reduce LR during replay')
     parser.add_argument('--replay-batch-size', default=None, type=int, help='Batch size used during replay')
     args = parser.parse_args()
+
+    args.per_trajectory_threshold = bool(args.per_trajectory_threshold)
 
     return args
 
@@ -390,6 +401,7 @@ async def main():
                 run_id=run_id,
                 db_url=args.db_url,
                 audit_kws=audit_kws,
+                random_fail_rate=args.audit_random_fail_rate,
             )
             sampler_config = SamplerConfig(
                 run_id=run_id,
@@ -414,7 +426,7 @@ async def main():
                     db_url=args.db_url,
                     target_ferr=args.target_ferr,
                     history_length=args.calibration_history_length,
-                    recalibrate_every=args.recalibrate_every,
+                    per_trajectory_threshold=args.per_trajectory_threshold,
                     burn_in_model_versions=args.burn_in_rounds,
                 )
             trainer_config = TrainerConfig(
