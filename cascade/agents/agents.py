@@ -112,6 +112,7 @@ class DynamicsRunner(CascadeAgent):
                     run_dir=str(self.config.run_dir),
                     uq_hook=self.config.uq_hook,
                     uq_kws=self.config.uq_kws,
+                    gpu_flush_interval=self.config.gpu_flush_interval,
                 )
 
             #todo mt.2026.04.27 does this still need to be logged?

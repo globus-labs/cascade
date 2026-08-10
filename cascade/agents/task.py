@@ -8,10 +8,10 @@ import os
 import numpy as np
 from ase.optimize.optimize import Dynamics
 from mace.calculators import mace_mp
+import torch
 
 from cascade.model import AuditResult, AuditStatus
 from cascade.utils import canonicalize
-
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -95,6 +95,7 @@ def advance_dynamics(
     run_kws: dict[str, object],
     uq_hook: Callable[[Atoms], tuple[dict, dict]] | None = None,
     uq_kws: dict[str, object] | None = None,
+    gpu_flush_interval: int = 10,
 ) -> list[Atoms]:
     """Advance dynamics of a chunk of a trajectory
 
@@ -114,9 +115,10 @@ def advance_dynamics(
             atoms.arrays / atoms.info respectively. Expects an ensemble-producing
             calculator (e.g. one populating atoms.calc.results['forces_ens']).
         uq_kws: keyword arguments passed to uq_hook
+        gpu_flush_interval: how often to release PyTorch's CUDA caching
+            allocator back to the driver. Without this NPT dynamics will cause
+            memory leaks through neighbor list size changes
     """
-
-    uq_kws = uq_kws or {}
 
     uq_kws = uq_kws or {}
 
@@ -127,6 +129,8 @@ def advance_dynamics(
     formatter = logging.Formatter('%(asctime)s : %(levelname)s : %(name)s : %(message)s')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
+
+    is_cuda = torch.cuda.is_available() and 'cuda' in device
 
     atoms = spec.atoms
     logger.info('Creating calculator')
@@ -140,6 +144,10 @@ def advance_dynamics(
     dyn = dyn_cls(atoms, **dyn_kws)
 
     frames = []
+
+    def flush_gpu_memory():
+        if is_cuda:
+            torch.cuda.empty_cache()
 
     def write_frame():
         logger.info('getting results from calc')
@@ -160,9 +168,11 @@ def advance_dynamics(
         frames.append(canonical_atoms)
 
     dyn.attach(write_frame)
+    dyn.attach(flush_gpu_memory, interval=gpu_flush_interval)
 
     logger.info('Starting dynamics')
     dyn.run(spec.steps, **run_kws)
+    flush_gpu_memory()
     os.remove(logfile)
 
     return frames

@@ -72,6 +72,8 @@ class DynamicsRunnerConfig(CascadeAgentConfig):
     """Optional hook called on each frame to compute UQ from an ensemble calculator's results"""
     uq_kws: dict[str, object] = field(default_factory=dict)
     """Keyword arguments passed to uq_hook"""
+    gpu_flush_interval: int = 10
+    """How often advance_dynamics releases PyTorch's CUDA caching allocator"""
 
 
 @dataclass

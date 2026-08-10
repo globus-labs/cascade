@@ -87,6 +87,12 @@ def parse_args() -> argparse.Namespace:
         help='Initial chunk size'
     )
     parser.add_argument(
+        '--gpu-flush-interval',
+        type=int,
+        default=10,
+        help='How often to release the CUDA caching allocator during dynamics'
+    )
+    parser.add_argument(
         '--target-length',
         type=int,
         default=10,
@@ -439,6 +445,7 @@ async def main():
                         run_kws=cfg.run_kws,
                         model_version=0,
                         uq_hook=ensemble_force_deviation_uq,
+                        gpu_flush_interval=args.gpu_flush_interval,
                 )
                 await manager.launch(
                     DynamicsRunner,
