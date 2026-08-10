@@ -94,7 +94,10 @@ def run_reference_trajectory(
     log_interval: int,
 ) -> None:
     """Run one trajectory to completion using a fixed reference calculator, writing frames directly to the DB"""
+    import csv
     import logging
+    import psutil
+    import torch
     from ase.io import read
     from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
     from cascade.agents.db_orm import TrajectoryDB
@@ -104,6 +107,7 @@ def run_reference_trajectory(
     from mace.calculators import mace_mp
     from functools import partial
     calc_factory = partial(mace_mp, model=calc_model, device=device, default_dtype="float32")
+    is_cuda = torch.cuda.is_available() and 'cuda' in device
 
     logging.basicConfig(level=log_level)
     logger = logging.getLogger(f'reference.traj{traj_id}')
@@ -152,13 +156,43 @@ def run_reference_trajectory(
             attempt_index=0,
         )
 
+    # Per-task loggers never surface anywhere without digging through Parsl's runinfo/
+    # (confirmed: reference_run.*.log has always been empty of this output), so this
+    # writes a plain CSV next to gpu_mon.*.csv/vmstat.*.log instead - visible with a
+    # normal `ls`/`cat` in the run directory, no runinfo spelunking required.
+    mem_csv = open(f'gpu_mem.{run_id}.traj{traj_id}.csv', 'w', newline='')
+    mem_writer = csv.writer(mem_csv)
+    mem_writer.writerow(['step', 'host_rss_mb', 'host_available_mb', 'gpu_allocated_mb', 'gpu_reserved_mb'])
+
+    def manage_and_log_gpu_memory():
+        # Periodically release PyTorch's CUDA caching allocator back to the driver. Without
+        # this, long NPT/MTKNPT runs (where the cell - and therefore the neighbor-list edge
+        # count fed to MACE - keeps changing shape) grow the allocator's reserved pool
+        # without bound, and on unified-memory hardware (e.g. GB10) that pool is host RAM,
+        # so it eventually starves the node.
+        if is_cuda:
+            torch.cuda.empty_cache()
+        gpu_alloc = torch.cuda.memory_allocated(device) / 1e6 if is_cuda else 0.0
+        gpu_reserved = torch.cuda.memory_reserved(device) / 1e6 if is_cuda else 0.0
+        mem_writer.writerow([
+            dyn.nsteps,
+            round(psutil.Process().memory_info().rss / 1e6, 1),
+            round(psutil.virtual_memory().available / 1e6, 1),
+            round(gpu_alloc, 1),
+            round(gpu_reserved, 1),
+        ])
+        mem_csv.flush()
+
     dyn.attach(write_frame)
     dyn.attach(mark_progress, interval=log_interval)
+    dyn.attach(manage_and_log_gpu_memory, interval=log_interval)
     logger.info(f'Starting reference dynamics for traj {traj_id}, {target_length} steps')
     dyn.run(target_length, **cfg.run_kws)
 
     mark_progress()  # make sure the final frame count is recorded even if target_length
                       # isn't a multiple of log_interval
+    manage_and_log_gpu_memory()
+    mem_csv.close()
     traj_db.mark_trajectory_completed(run_id=run_id, traj_id=traj_id)
     logger.info(f'Finished reference dynamics for traj {traj_id}')
 
