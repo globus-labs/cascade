@@ -1612,8 +1612,8 @@ class TrajectoryDB:
                 traj_id=traj_id,
                 chunk_id=chunk_id,
                 attempt_index=attempt_index
-            ).order_by(DBChunkEvent.created_at.desc()).first()
-            
+            ).order_by(DBChunkEvent.created_at.desc(), DBChunkEvent.id.desc()).first()
+
             if not event:
                 return None
             return event.event_type
@@ -1634,7 +1634,7 @@ class TrajectoryDB:
                     func.row_number()
                     .over(
                         partition_by=DBChunkEvent.traj_id,
-                        order_by=DBChunkEvent.created_at.desc(),
+                        order_by=(DBChunkEvent.created_at.desc(), DBChunkEvent.id.desc()),
                     )
                     .label("rn"),
                 )
@@ -1823,12 +1823,36 @@ class TrajectoryDB:
             event = sess.query(DBTrainingEvent).filter_by(
                 run_id=run_id,
                 event_type=ChunkEventType.FINISHED_TRAINING
-            ).order_by(DBTrainingEvent.created_at.desc()).first()
-            
+            ).order_by(DBTrainingEvent.created_at.desc(), DBTrainingEvent.id.desc()).first()
+
             if not event:
                 return None
             return event.created_at
-    
+
+    def get_latest_training_event(self, run_id: str) -> Optional[dict]:
+        """Get the most recent training-level event of any type (for monitoring).
+
+        Args:
+            run_id: Run identifier
+
+        Returns:
+            Dict with event_type, training_round, created_at, or None if no
+            training events exist yet. A latest event_type of STARTED_TRAINING
+            means training round `training_round` is currently in progress.
+        """
+        with self.session() as sess:
+            event = sess.query(DBTrainingEvent).filter_by(
+                run_id=run_id
+            ).order_by(DBTrainingEvent.created_at.desc(), DBTrainingEvent.id.desc()).first()
+
+            if not event:
+                return None
+            return {
+                'event_type': event.event_type,
+                'training_round': event.training_round,
+                'created_at': event.created_at,
+            }
+
     def count_labeled_frames_for_chunk(
         self,
         run_id: str,
@@ -2114,14 +2138,14 @@ class TrajectoryDB:
         Returns:
             List of dicts with trajectory metadata, sorted by traj_id.
             Each dict contains:
-                - traj_id, target_length, chunks_completed, status, done
+                - traj_id, target_length, chunks_completed, status, failure_reason
                 - created_at, updated_at
         """
         with self.session() as sess:
             trajectories = sess.query(DBTrajectory).filter_by(
                 run_id=run_id
             ).order_by(DBTrajectory.traj_id).all()
-            
+
             result = []
             for traj in trajectories:
                 result.append({
@@ -2129,9 +2153,10 @@ class TrajectoryDB:
                     'target_length': traj.target_length,
                     'chunks_completed': traj.chunks_completed,
                     'status': traj.status,
+                    'failure_reason': traj.failure_reason,
                     'created_at': traj.created_at,
                     'updated_at': traj.updated_at
                 })
-            
+
             return result
 

@@ -104,6 +104,13 @@ class DynamicsRunner(CascadeAgent):
                     self.new_model = None
                 self.logger.debug(
                     f"Submitting dynamics to executor dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index} with {spec.steps} steps")
+                self._traj_db.record_chunk_event(
+                    run_id=self.config.run_id,
+                    traj_id=spec.traj_id,
+                    chunk_id=spec.chunk_id,
+                    attempt_index=spec.attempt_index,
+                    event_type=ChunkEventType.STARTED_DYNAMICS,
+                )
                 # submit dynamics for evaluation
                 chunk_future = self.config.executor.submit(
                     self.config.advance_dynamics_task,
@@ -150,6 +157,13 @@ class DynamicsRunner(CascadeAgent):
                 )
                 frame_ids.append(_id)
             self.logger.info(f"Finished dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                attempt_index=spec.attempt_index,
+                event_type=ChunkEventType.FINISHED_DYNAMICS,
+            )
 
             # submit to auditor
             chunk = Chunk(
@@ -161,7 +175,21 @@ class DynamicsRunner(CascadeAgent):
                 model_version=self.model_version
             )
             self.logger.info(f"Submitting audit for traj {self.config.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                attempt_index=spec.attempt_index,
+                event_type=ChunkEventType.STARTED_AUDIT,
+            )
             audit_result = await self.auditor.audit(chunk)
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                attempt_index=spec.attempt_index,
+                event_type=ChunkEventType.AUDIT_PASSED if audit_result.status == AuditStatus.PASSED else ChunkEventType.AUDIT_FAILED,
+            )
 
             # handle audit result
             if audit_result.status == AuditStatus.PASSED:
@@ -398,6 +426,13 @@ class Sampler(CascadeAgent):
         if chunk.model_version < self.config.burn_in_model_versions and self.config.burn_in_n_frames is not None:
             n_frames = self.config.burn_in_n_frames
 
+        chunk_kws = dict(
+            run_id=self.config.run_id,
+            traj_id=chunk.traj_id,
+            chunk_id=chunk.chunk_id,
+            attempt_index=chunk.attempt_ix,
+        )
+        self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.STARTED_SAMPLING)
         future = self.config.executor.submit(
             self.config.sample_task,
             chunk,
@@ -406,6 +441,7 @@ class Sampler(CascadeAgent):
         wrapped_future = wrap_future(future)
         await wrapped_future
         training_frames = wrapped_future.result()
+        self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.FINISHED_SAMPLING)
 
         if len(training_frames) != n_frames:
             self.logger.warning(
@@ -664,6 +700,11 @@ class DatabaseMonitor(CascadeAgent):
                     training_round=self.current_training_round,
                 )
                 # Train model and update weights in dynamics engine
+                self._traj_db.record_training_event(
+                    run_id=self.config.run_id,
+                    event_type=ChunkEventType.STARTED_TRAINING,
+                    training_round=self.current_training_round
+                )
                 weights = await self.trainer.train_model(self.current_training_round)
                 # Record FINISHED_TRAINING event after training completes
                 self._traj_db.record_training_event(
