@@ -9,7 +9,7 @@ conda activate cascade
 source "${SLURM_SUBMIT_DIR:-$(dirname "${BASH_SOURCE[0]}")}/env_setup.sh"
 
 JOB_TAG="${SLURM_JOB_ID:-$(date +%Y%m%d-%H%M%S)}"
-nvidia-smi --query-gpu=timestamp,utilization.gpu,temperature.gpu,power.draw \
+nvidia-smi --query-gpu=timestamp,utilization.gpu,temperature.gpu,power.draw,memory.used \
     --format=csv -l 5 >> "gpu_mon.${JOB_TAG}.csv" &
 GPU_MON_PID=$!
 vmstat -SM -t 5 >> "vmstat.${JOB_TAG}.log" &
