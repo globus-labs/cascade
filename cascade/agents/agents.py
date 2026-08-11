@@ -306,7 +306,11 @@ class Auditor(CascadeAgent):
                 f'Audit failed for traj {chunk.traj_id} chunk {chunk.chunk_id} attempt {chunk.attempt_ix}'
             )
             self.logger.info(f'Submitting failed chunk {chunk.chunk_id} of traj {chunk.traj_id} to sampler')
-            asyncio.create_task(self.sampler.sample_frames(chunk))
+            asyncio.create_task(self.sampler.sample_frames(
+                chunk,
+                audit_reason=result.reason,
+                audit_threshold=audit_kws.get('threshold'),
+            ))
         return result
 
 
@@ -415,6 +419,8 @@ class Sampler(CascadeAgent):
     async def sample_frames(
         self,
         chunk: Chunk,
+        audit_reason: str | None = None,
+        audit_threshold: float | None = None,
     ) -> None:
 
         self.logger.info(
@@ -433,10 +439,13 @@ class Sampler(CascadeAgent):
             attempt_index=chunk.attempt_ix,
         )
         self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.STARTED_SAMPLING)
+        sample_kws = dict(n_frames=n_frames, reason=audit_reason)
+        if audit_threshold is not None:
+            # omit: some strategies have defaults we dont want to override with None
         future = self.config.executor.submit(
             self.config.sample_task,
             chunk,
-            n_frames=n_frames,
+            **sample_kws,
         )
         wrapped_future = wrap_future(future)
         await wrapped_future
