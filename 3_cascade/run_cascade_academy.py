@@ -45,7 +45,7 @@ from cascade.agents.config import (
     TrainerConfig,
     ControllerConfig,
 )
-from cascade.model import AdvanceSpec, AuditResult
+from cascade.model import AdvanceSpec, AuditResult, TrainingFrame
 from cascade.learning.mace import MACEInterface
 from cascade.learning.finetuning import MultiHeadConfig
 from cascade.agents.db_orm import TrajectoryDB
@@ -54,6 +54,9 @@ from cascade.agents.task import (
     uq_threshold_audit,
     advance_dynamics,
     random_sample,
+    max_uq_sample,
+    boundary_uq_sample,
+    audit_reason_sample,
     label_frame,
     train,
     ensemble_force_deviation_uq,
@@ -187,8 +190,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         '--per-trajectory-threshold',
-        type='int',
-        defualt=1,
+        type=int,
+        default=1,
         help='Calibrate each trajectory\'s UQ threshold independently from only its own '
              'labeled-frame history, instead of pooling all trajectories into one shared threshold. '
              'Only used with --audit-task uq_threshold and --target-ferr set.'
@@ -199,6 +202,40 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help='Frequency at which a chunk that would otherwise pass audit is randomly failed anyway, '
              'independent of the active audit strategy (forces continued sampling/exploration)'
+    )
+    parser.add_argument(
+        '--sample-task',
+        type=str,
+        default='random',
+        choices=['random', 'max_uq', 'boundary', 'audit_reason'],
+        help='Sampling strategy for picking training frames out of a failed chunk: "random" (current '
+             'default), "max_uq" (highest per-frame UQ), "boundary" (frames around the first frame '
+             'crossing threshold), or "audit_reason" (routes to one of the three per why the chunk '
+             'failed audit -- see --burn-in-sample-task/--threshold-sample-task/--random-fail-sample-task)'
+    )
+    parser.add_argument(
+        '--burn-in-sample-task',
+        type=str,
+        default='random',
+        choices=['random', 'max_uq', 'boundary'],
+        help='Only used with --sample-task audit_reason: strategy for chunks failed by the burn_in '
+             'model-version gate, where UQ may not be calibrated yet'
+    )
+    parser.add_argument(
+        '--threshold-sample-task',
+        type=str,
+        default='boundary',
+        choices=['random', 'max_uq', 'boundary'],
+        help='Only used with --sample-task audit_reason: strategy for chunks failed by a genuine '
+             'UQ threshold crossing'
+    )
+    parser.add_argument(
+        '--random-fail-sample-task',
+        type=str,
+        default='max_uq',
+        choices=['random', 'max_uq', 'boundary'],
+        help='Only used with --sample-task audit_reason: strategy for chunks failed by '
+             '--audit-random-fail-rate, which have no real crossing to anchor on'
     )
     parser.add_argument(
         '--learner',
@@ -272,6 +309,17 @@ def get_audit_task(audit_task_name: str) -> Callable[..., AuditResult]:
         return uq_threshold_audit
     else:
         raise ValueError(f'Unknown audit task: {audit_task_name}')
+
+
+def get_sample_task(sample_task_name: str) -> Callable[..., list[TrainingFrame]]:
+    if sample_task_name == 'random':
+        return random_sample
+    elif sample_task_name == 'max_uq':
+        return max_uq_sample
+    elif sample_task_name == 'boundary':
+        return boundary_uq_sample
+    else:
+        raise ValueError(f'Unknown sample task: {sample_task_name}')
 
 
 async def main():
@@ -422,12 +470,21 @@ async def main():
                 audit_kws=audit_kws,
                 random_fail_rate=args.audit_random_fail_rate,
             )
+            if args.sample_task == 'audit_reason':
+                sample_task = partial(
+                    audit_reason_sample,
+                    burn_in_sampler=get_sample_task(args.burn_in_sample_task),
+                    threshold_sampler=get_sample_task(args.threshold_sample_task),
+                    random_sampler=get_sample_task(args.random_fail_sample_task),
+                )
+            else:
+                sample_task = get_sample_task(args.sample_task)
             sampler_config = SamplerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
                 n_frames=args.n_sample_frames,
                 executor=pool,
-                sample_task=random_sample,
+                sample_task=sample_task,
                 burn_in_model_versions=args.burn_in_rounds,
                 burn_in_n_frames=args.burn_in_n_frames,
             )
