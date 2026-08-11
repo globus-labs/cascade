@@ -748,6 +748,7 @@ class TrajectoryDB:
                 'target_length': traj.target_length,
                 'chunks_completed': traj.chunks_completed,
                 'status': traj.status,
+                'failure_reason': traj.failure_reason,
                 'init_atoms_json': traj.init_atoms_json,
                 'created_at': traj.created_at,
                 'updated_at': traj.updated_at
