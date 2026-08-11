@@ -49,18 +49,42 @@ def random_audit(
     return AuditResult(status=status, score=score, reason='random_accept')
 
 
+def _frames_from_indices(chunk: Chunk, indices, n_sample: int) -> list[TrainingFrame]:
+    """Build one TrainingFrame per index into chunk.atoms/frame_ids.
+
+    Shared by every sample_task-shaped function so there's exactly one place
+    that builds a TrainingFrame from a (chunk, index) pair.
+    """
+    from cascade.model import TrainingFrame
+
+    return [
+        TrainingFrame(
+            atoms=chunk.atoms[i],
+            frame_id=chunk.frame_ids[i],
+            model_version=chunk.model_version,
+            traj_id=chunk.traj_id,
+            chunk_id=chunk.chunk_id,
+            attempt_index=chunk.attempt_ix,
+            n_sampled_frames=n_sample,
+        )
+        for i in indices
+    ]
+
+
 def random_sample(
     chunk: Chunk,
     n_frames: int,
     sleep_time: float = 0.,
+    *,
+    reason: str | None = None,       # unused -- signature parity with the other sample_task strategies
+    threshold: float | None = None,  # unused
+    field: str = 'uq_force_std_max',  # unused
 ) -> list[TrainingFrame]:
     """Random sample of frames from a chunk.
 
     Intended to be used as a stub for a real sampling function.
     """
-    from cascade.model import TrainingFrame
     import time
-    import numpy as np
 
     time.sleep(sleep_time)
     # Create a new random generator seeded with OS entropy to ensure
@@ -68,20 +92,92 @@ def random_sample(
     rng = np.random.default_rng(seed=None)
     n_sample = min(n_frames, len(chunk.atoms))
     indices = rng.choice(len(chunk.atoms), size=n_sample, replace=False)
-    result = []
-    for i in indices:
-        result.append(
-            TrainingFrame(
-                atoms=chunk.atoms[i],
-                frame_id=chunk.frame_ids[i],
-                model_version=chunk.model_version,
-                traj_id=chunk.traj_id,
-                chunk_id=chunk.chunk_id,
-                attempt_index=chunk.attempt_ix,
-                n_sampled_frames=n_sample
-            )
-        )
-    return result
+    return _frames_from_indices(chunk, indices, n_sample)
+
+
+def max_uq_sample(
+    chunk: Chunk,
+    n_frames: int,
+    *,
+    reason: str | None = None,       # unused -- signature parity with the other sample_task strategies
+    threshold: float | None = None,  # unused
+    field: str = 'uq_force_std_max',
+) -> list[TrainingFrame]:
+    """The n_frames frames with the highest per-frame UQ score.
+
+    Requires the chunk's frames to have been produced with a uq_hook (e.g.
+    ensemble_force_deviation_uq) that populates atoms.info[field].
+    """
+    values = np.array([a.info[field] for a in chunk.atoms])
+    n_sample = min(n_frames, len(chunk.atoms))
+    indices = np.argsort(-values)[:n_sample]
+    return _frames_from_indices(chunk, indices, n_sample)
+
+
+def boundary_uq_sample(
+    chunk: Chunk,
+    n_frames: int,
+    *,
+    reason: str | None = None,  # unused -- signature parity with the other sample_task strategies
+    threshold: float = 0.1,
+    field: str = 'uq_force_std_max',
+) -> list[TrainingFrame]:
+    """Frames clustered around the *first* frame that crossed threshold, rather
+    than the single most-uncertain one.
+
+    MD keeps running for the rest of the chunk even after a frame crosses
+    threshold (uq_threshold_audit only checks max() post-hoc), so the
+    highest-UQ frame is often deep into extrapolation the model made after it
+    was already out of its depth -- likely unphysical. The first-crossing
+    frame is the actual edge of what the model currently knows, and is more
+    likely to still be a physically continuous structure worth labeling.
+    """
+    values = np.array([a.info[field] for a in chunk.atoms])
+    crossings = np.flatnonzero(values >= threshold)
+    n_sample = min(n_frames, len(chunk.atoms))
+    if len(crossings) == 0:
+        # Defensive: reason/threshold are caller-supplied and could disagree
+        # with what's actually in this chunk. Fall back rather than error.
+        return max_uq_sample(chunk, n_frames, field=field)
+
+    crossing_idx = int(crossings[0])
+    indices = sorted(range(len(chunk.atoms)), key=lambda i: abs(i - crossing_idx))[:n_sample]
+    return _frames_from_indices(chunk, indices, n_sample)
+
+
+def audit_reason_sample(
+    chunk: Chunk,
+    n_frames: int,
+    *,
+    reason: str | None = None,
+    threshold: float = 0.1,
+    field: str = 'uq_force_std_max',
+    burn_in_sampler: Callable[..., list[TrainingFrame]] = random_sample,
+    threshold_sampler: Callable[..., list[TrainingFrame]] = boundary_uq_sample,
+    random_sampler: Callable[..., list[TrainingFrame]] = max_uq_sample,
+    default_sampler: Callable[..., list[TrainingFrame]] = random_sample,
+) -> list[TrainingFrame]:
+    """Route to a different, independently swappable sampling strategy per
+    AuditResult.reason -- no single strategy is hardcoded as "the" fallback.
+
+    Reasons produced by this module's audit functions today:
+    - 'burn_in'      -- uq_threshold_audit, chunk.model_version below the burn-in
+                         gate. UQ isn't necessarily trustworthy yet this early,
+                         so this defaults to plain random_sample rather than
+                         trusting a possibly-uncalibrated UQ signal.
+    - 'threshold'    -- uq_threshold_audit, a genuine UQ crossing. Defaults to
+                         boundary_uq_sample, which is only meaningful here.
+    - 'random_fail'  -- audit_with_random_failure, a forced failure with no real
+                         crossing to anchor on. Defaults to max_uq_sample.
+    default_sampler handles anything else (a future reason, or reason=None for
+    calls outside the Auditor/Sampler pipeline); defaults to random_sample.
+    """
+    strategy = {
+        'burn_in': burn_in_sampler,
+        'threshold': threshold_sampler,
+        'random_fail': random_sampler,
+    }.get(reason, default_sampler)
+    return strategy(chunk, n_frames, reason=reason, threshold=threshold, field=field)
 
 
 def advance_dynamics(
