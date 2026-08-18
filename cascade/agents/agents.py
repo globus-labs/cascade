@@ -337,10 +337,6 @@ class Controller(CascadeAgent):
         self.threshold: dict[int | None, float] = {}
         self.alpha: dict[int | None, float] = {}
 
-    def _bucket(self, traj_id: int) -> int | None:
-        """Calibration key: per-trajectory when enabled, else one shared bucket for all trajectories."""
-        return traj_id if self.config.per_trajectory_threshold else None
-
     @action
     async def update_threshold(self, traj_id: int) -> None:
         """Recalibrate threshold/alpha from labeled frames, if enough observations exist.
@@ -348,7 +344,7 @@ class Controller(CascadeAgent):
         Called by: Labeler, on every newly labeled frame
         Invokes: Auditor (to update threshold)
         """
-        key = self._bucket(traj_id)
+        key = traj_id if self.config.per_trajectory_threshold else None
 
         model_version, observations = self._traj_db.get_controller_observations(
             run_id=self.config.run_id,
