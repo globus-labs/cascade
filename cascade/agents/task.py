@@ -112,29 +112,14 @@ def max_uq_sample(
 def boundary_uq_sample(
     chunk: Chunk,
     n_frames: int,
-    *,
     threshold: float = 0.1,
     field: str = 'uq_force_std_max',
     **kwargs
 ) -> list[TrainingFrame]:
-    """Frames clustered around the *first* frame that crossed threshold, rather
-    than the single most-uncertain one.
-
-    MD keeps running for the rest of the chunk even after a frame crosses
-    threshold (uq_threshold_audit only checks max() post-hoc), so the
-    highest-UQ frame is often deep into extrapolation the model made after it
-    was already out of its depth -- likely unphysical. The first-crossing
-    frame is the actual edge of what the model currently knows, and is more
-    likely to still be a physically continuous structure worth labeling.
-    """
+    """Frames clustered around the first frame that crossed threshold"""
     values = np.array([a.info[field] for a in chunk.atoms])
     crossings = np.flatnonzero(values >= threshold)
     n_sample = min(n_frames, len(chunk.atoms))
-    if len(crossings) == 0:
-        # Defensive: reason/threshold are caller-supplied and could disagree
-        # with what's actually in this chunk. Fall back rather than error.
-        return max_uq_sample(chunk, n_frames, field=field)
-
     crossing_idx = int(crossings[0])
     indices = sorted(range(len(chunk.atoms)), key=lambda i: abs(i - crossing_idx))[:n_sample]
     return _frames_from_indices(chunk, indices, n_sample)
@@ -150,29 +135,19 @@ def audit_reason_sample(
     burn_in_sampler: Callable[..., list[TrainingFrame]] = random_sample,
     threshold_sampler: Callable[..., list[TrainingFrame]] = boundary_uq_sample,
     random_sampler: Callable[..., list[TrainingFrame]] = max_uq_sample,
-    default_sampler: Callable[..., list[TrainingFrame]] = random_sample,
 ) -> list[TrainingFrame]:
-    """Route to a different, independently swappable sampling strategy per
-    AuditResult.reason -- no single strategy is hardcoded as "the" fallback.
+    """Dispatches to different smapling methods based on audit failure reason
 
-    Reasons produced by this module's audit functions today:
-    - 'burn_in'      -- uq_threshold_audit, chunk.model_version below the burn-in
-                         gate. UQ isn't necessarily trustworthy yet this early,
-                         so this defaults to plain random_sample rather than
-                         trusting a possibly-uncalibrated UQ signal.
-    - 'threshold'    -- uq_threshold_audit, a genuine UQ crossing. Defaults to
-                         boundary_uq_sample, which is only meaningful here.
-    - 'random_fail'  -- audit_with_random_failure, a forced failure with no real
-                         crossing to anchor on. Defaults to max_uq_sample.
-    default_sampler handles anything else (a future reason, or reason=None for
-    calls outside the Auditor/Sampler pipeline); defaults to random_sample.
+    burn_in_sampler: when the audit failure reasion is "burn_in"
+    threshold_sampler: when the audit failure reason is "threshold"
+    random_sampler: when the audit failure reason is "random_fail"
     """
     strategy = {
         'burn_in': burn_in_sampler,
         'threshold': threshold_sampler,
         'random_fail': random_sampler,
-    }.get(reason, default_sampler)
-    return strategy(chunk, n_frames, reason=reason, threshold=threshold, field=field)
+    }.get(reason)
+    return strategy(chunk, n_frames, threshold=threshold, field=field)
 
 
 def advance_dynamics(
@@ -318,10 +293,7 @@ def audit_with_random_failure(
     fail_rate: float = 0.0,
     **audit_kws,
 ) -> AuditResult:
-    """Wraps another audit_task so a PASSED result is randomly downgraded to FAILED
-    at the given frequency, independent of the wrapped strategy's own pass/fail logic.
-
-    Forces continued sampling/exploration even when the underlying strategy is confident.
+    """Wraps another audit_task with random failures. Will only trip on a successful audit.
     """
     from cascade.model import AuditResult, AuditStatus
     import numpy as np
@@ -334,10 +306,7 @@ def audit_with_random_failure(
     return result
 
 def max_force_error(atoms_predicted: Atoms, atoms_labeled: Atoms) -> float:
-    """Default error_fn for Controller calibration: max per-atom force-vector error
-    between the model's prediction and the DFT-labeled forces.
-
-    Mirrors the quantity target_ferr is calibrated against in proxima.
+    """Get the maximum error in the forces between the predicted and labeled forces on the atoms
     """
     f_pred = atoms_predicted.calc.results['forces']
     f_true = atoms_labeled.calc.results['forces']

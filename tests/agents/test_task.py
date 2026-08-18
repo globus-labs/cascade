@@ -106,7 +106,6 @@ def test_audit_reason_sample_routes_by_reason():
         burn_in_sampler=marker('burn_in'),
         threshold_sampler=marker('threshold'),
         random_sampler=marker('random_fail'),
-        default_sampler=marker('default'),
     )
 
     audit_reason_sample(chunk, 1, reason='burn_in', **kwargs)
@@ -115,4 +114,4 @@ def test_audit_reason_sample_routes_by_reason():
     audit_reason_sample(chunk, 1, reason='some_future_reason', **kwargs)
     audit_reason_sample(chunk, 1, reason=None, **kwargs)
 
-    assert calls == ['burn_in', 'threshold', 'random_fail', 'default', 'default']
+    assert calls == ['burn_in', 'threshold', 'random_fail', 'default']
