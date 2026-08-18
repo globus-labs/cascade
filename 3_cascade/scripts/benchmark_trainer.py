@@ -2,16 +2,9 @@
 """Benchmark MACE Trainer batch_size / num_epochs against real labeled data.
 
 Sweeps every combination of candidate batch_size x replay_batch_size (a 1x1
-grid when replay is off or only one of each is given), training with a
-generous epoch ceiling and early stopping (--patience), and records wall-clock
-time, peak GPU memory, and per-epoch train/valid loss for each combination --
-so you can pick the largest batch_size that fits/runs well and read off how
-many epochs training actually needs before committing to values for a real run.
+grid when replay is off or only one of each is given).
 
-Writes live: per-epoch loss is flushed to disk as training proceeds, and the
-summary is appended to after each combination, so if the process dies (e.g. an
-out-of-memory kill) nothing already recorded is lost. Re-running with the same
---out-dir skips combinations already present in summary.csv.
+Records wall-clock time, peak GPU memory, and per-epoch train/valid loss ]
 
 Example:
     python scripts/benchmark_trainer.py --run-id my-reference-run \\
@@ -108,8 +101,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         type=str,
         help='Comma-separated batch sizes to sweep during replay (swept against every --batch-sizes '
-             'candidate, so the total run count is the product of the two lists). Defaults to a single '
-             "candidate that falls back to each run's main batch_size.",
+             "candidate, so the total run count is the product of the two lists). Defaults the run's main batch_size.",
     )
     return parser.parse_args()
 
@@ -117,9 +109,7 @@ def parse_args() -> argparse.Namespace:
 def _build_replay_variants(args: argparse.Namespace) -> list[tuple[MultiHeadConfig | None, str]]:
     """One (MultiHeadConfig, label) pair per --replay-batch-size candidate.
 
-    Returns [(None, 'none')] if replay isn't enabled at all -- distinct from a
-    MultiHeadConfig with batch_size=None, which means "replay enabled, fall
-    back to the main batch_size" (label 'default').
+    Returns [(None, 'none')] if replay isn't enabled
     """
     if args.replay_dataset is None:
         return [(None, 'none')]
@@ -216,8 +206,6 @@ def _run_candidate(learner: MACEInterface, weights: bytes, train_data: list, val
         valid_col = 'total_loss_valid' if 'total_loss_valid' in log.columns else None
         final_valid_loss = float(last_epoch[valid_col].mean()) if valid_col else ''
     else:
-        # OOM (or an otherwise-empty result): fall back to what the live epoch CSV
-        # already captured before the crash, rather than reporting nothing.
         epochs_run, final_valid_loss = 0, ''
         if epoch_rows:
             epochs_run = len(epoch_rows)
@@ -236,8 +224,6 @@ def _run_candidate(learner: MACEInterface, weights: bytes, train_data: list, val
         'final_valid_loss': final_valid_loss,
     }
 
-    # Roll up per-phase peak memory (only present when a CUDA run tracked it) so
-    # combos can be compared directly from summary.csv, without opening per-epoch CSVs.
     for col in PHASE_MEMORY_FIELDS:
         values = [float(r[col]) for r in epoch_rows if r.get(col)]
         if values:
