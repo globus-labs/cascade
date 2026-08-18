@@ -133,8 +133,8 @@ class ControllerConfig(CascadeAgentConfig):
     burn_in_model_versions: int = 0
     """Ignore calibration observations sampled below this model version"""
     per_trajectory_threshold: bool = False
-    """If set, calibrate each trajectory's alpha/threshold independently from only
-    its own observations, instead of pooling all trajectories into one shared threshold"""
+    """If set, calibrate each trajectory's alpha/threshold independently
+    instead of pooling all trajectories into one shared threshold"""
 
 @dataclass
 class TrainerConfig(CascadeAgentConfig):
