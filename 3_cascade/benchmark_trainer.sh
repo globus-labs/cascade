@@ -5,10 +5,6 @@
 source /home/michael/miniconda3/etc/profile.d/conda.sh
 conda activate cascade
 source "${SLURM_SUBMIT_DIR:-$(dirname "${BASH_SOURCE[0]}")}/env_setup.sh"
-# Train-phase and replay-phase peak memory are tracked (and reported) separately,
-# and are temporally disjoint, so each axis's ceiling is independent of the other --
-# two 1D sweeps instead of a full grid. Both keep replay enabled throughout so the
-# fixed baseline cost of the replay head being resident is present in both.
 python scripts/benchmark_trainer.py \
     --run-id reference-2026.08.07-17:51:00-bd260f \
     --max-frames 1000 \
