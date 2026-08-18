@@ -16,10 +16,6 @@ import numpy as np
 import pandas as pd
 from ase import Atoms
 
-if TYPE_CHECKING:
-    # Only import ORM classes for type checking, not at runtime
-    pass  # ORM classes are defined in this module
-
 logger = logging.getLogger(__name__)
 from sqlalchemy import (
     create_engine,
@@ -93,7 +89,6 @@ class DBTrajectoryChunk(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    # Relationship back to trajectory
     trajectory = relationship('DBTrajectory', back_populates='chunks')
 
     __table_args__ = (
@@ -1444,12 +1439,9 @@ class TrajectoryDB:
     ) -> tuple[int, list[tuple[float, float]]]:
         """Return recent (uq, error) pairs for the Controller's threshold calibration.
 
-        Only frames from the newest model version present among qualifying, labeled
+        Only frames from the newest model version present among labeled
         frames are returned, so a calibration window is never blended across model
-        versions (each model version has its own UQ/error relationship). "Newest" is
-        inferred from the data itself (MAX(model_version_sampled_from)) rather than
-        pushed in from another agent, since sampling/labeling happens concurrently
-        across trajectories and label completion order does not track generation order.
+        versions "Newest" is inferred from the data (MAX(model_version_sampled_from))
 
         Args:
             run_id: Run identifier
@@ -1471,6 +1463,7 @@ class TrajectoryDB:
             if traj_id is not None:
                 base_filters.append(DBTrainingFrame.traj_id == traj_id)
 
+            # sql MAX will occur before filter is applied
             latest_version = (
                 sess.query(func.max(DBTrainingFrame.model_version_sampled_from))
                 .filter(
@@ -1504,7 +1497,7 @@ class TrajectoryDB:
         n_observations: int,
         traj_id: int | None = None,
     ) -> None:
-        """Persist one Controller calibration event for later analysis.
+        """Persist ocontroller state for later analysis.
 
         Args:
             run_id: Run identifier
@@ -1528,7 +1521,7 @@ class TrajectoryDB:
             ))
 
     def get_controller_log(self, run_id: str) -> pd.DataFrame:
-        """Return the full calibration history for a run as a DataFrame.
+        """Return the full cpntroller state history for a run as a DataFrame.
 
         Args:
             run_id: Run identifier
