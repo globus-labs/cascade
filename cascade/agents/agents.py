@@ -477,8 +477,6 @@ class Labeler(CascadeAgent):
         self.db_url = config.db_url
         super().__init__()
         self.config = config
-        # controller is only meaningful when paired with an adaptive audit strategy
-        # (e.g. uq_threshold_audit); leave unset for audit strategies without a threshold
         self.controller = controller
         self.error_fn = config.error_fn
 
