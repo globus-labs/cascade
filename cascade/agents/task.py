@@ -52,8 +52,7 @@ def random_audit(
 def _frames_from_indices(chunk: Chunk, indices, n_sample: int) -> list[TrainingFrame]:
     """Build one TrainingFrame per index into chunk.atoms/frame_ids.
 
-    Shared by every sample_task-shaped function so there's exactly one place
-    that builds a TrainingFrame from a (chunk, index) pair.
+    Used by sampling tasks to create training frames for labeler
     """
     from cascade.model import TrainingFrame
 
@@ -75,10 +74,7 @@ def random_sample(
     chunk: Chunk,
     n_frames: int,
     sleep_time: float = 0.,
-    *,
-    reason: str | None = None,       # unused -- signature parity with the other sample_task strategies
-    threshold: float | None = None,  # unused
-    field: str = 'uq_force_std_max',  # unused
+    **kwargs
 ) -> list[TrainingFrame]:
     """Random sample of frames from a chunk.
 
@@ -99,9 +95,8 @@ def max_uq_sample(
     chunk: Chunk,
     n_frames: int,
     *,
-    reason: str | None = None,       # unused -- signature parity with the other sample_task strategies
-    threshold: float | None = None,  # unused
     field: str = 'uq_force_std_max',
+    **kwargs
 ) -> list[TrainingFrame]:
     """The n_frames frames with the highest per-frame UQ score.
 
@@ -118,9 +113,9 @@ def boundary_uq_sample(
     chunk: Chunk,
     n_frames: int,
     *,
-    reason: str | None = None,  # unused -- signature parity with the other sample_task strategies
     threshold: float = 0.1,
     field: str = 'uq_force_std_max',
+    **kwargs
 ) -> list[TrainingFrame]:
     """Frames clustered around the *first* frame that crossed threshold, rather
     than the single most-uncertain one.
