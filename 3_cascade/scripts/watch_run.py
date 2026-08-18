@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
 """Print a live per-trajectory pipeline status for a cascade run, for use with `watch`.
 
-Composes existing TrajectoryDB read methods (no new queries beyond what's
-already exposed) into one view: which chunk/attempt/model_version each
-trajectory is on, its lifecycle status, where it currently sits in the
-dynamics/audit/sampling pipeline, plus run-level training/threshold state.
-
 Example:
     watch -n 2 python scripts/watch_run.py
+
+Sample output:
+    run_id = abc123
+    training: idle (current round 3)
+    thresholds (per-traj): 0=0.0512, 1=0.0498, 2=0.0523
+
+     traj     status  chunk  attempt  model_v      audit                    stage     progress
+        0    RUNNING      4        1        3          -         STARTED_DYNAMICS         4/10
+        1    RUNNING      3        2        2     FAILED WAITING_FOR_MODEL_UPDATE         3/10
+        2  COMPLETED      9        1        3     PASSED                COMPLETED        10/10
+        3     FAILED      2        3        1     FAILED                   FAILED         2/10 (max_attempts_exceeded)
+
+The header block shows run-wide state: which training round is active (or idle)
+and the current UQ threshold(s). The table below shows, per trajectory, its
+current chunk/attempt/model version, last audit result, pipeline stage, and
+chunks-completed progress toward its target length.
 """
 from __future__ import annotations
 
