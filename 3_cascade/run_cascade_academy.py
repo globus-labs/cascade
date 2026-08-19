@@ -33,7 +33,8 @@ from cascade.agents.agents import (
     Auditor,
     Sampler,
     Labeler,
-    Trainer
+    Trainer,
+    Controller,
 )
 from cascade.agents.config import (
     DatabaseMonitorConfig,
@@ -41,9 +42,10 @@ from cascade.agents.config import (
     AuditorConfig,
     SamplerConfig,
     LabelerConfig,
-    TrainerConfig
+    TrainerConfig,
+    ControllerConfig,
 )
-from cascade.model import AdvanceSpec, AuditResult
+from cascade.model import AdvanceSpec, AuditResult, TrainingFrame
 from cascade.learning.mace import MACEInterface
 from cascade.learning.finetuning import MultiHeadConfig
 from cascade.agents.db_orm import TrajectoryDB
@@ -52,9 +54,13 @@ from cascade.agents.task import (
     uq_threshold_audit,
     advance_dynamics,
     random_sample,
+    max_uq_sample,
+    boundary_uq_sample,
+    audit_reason_sample,
     label_frame,
     train,
-    ensemble_force_deviation_uq
+    ensemble_force_deviation_uq,
+    max_force_error
 )
 from cascade.traj_config import (
     InitialTrajConfig,
@@ -141,6 +147,13 @@ def parse_args() -> argparse.Namespace:
         help='Frames to sample per chunk while still in burn-in (defaults to --n-sample-frames if unset)'
     )
     parser.add_argument(
+        '--max-audit-retries',
+        type=int,
+        default=None,
+        help='Max consecutive audit failures a single chunk may accumulate before its trajectory '
+             'is marked FAILED and given up on. Unset means retry indefinitely.'
+    )
+    parser.add_argument(
         '--accept-rate',
         type=float,
         default=1.0,
@@ -158,7 +171,71 @@ def parse_args() -> argparse.Namespace:
         '--audit-threshold',
         type=float,
         default=0.1,
-        help='UQ threshold for the "uq_threshold" audit strategy'
+        help='Initial UQ threshold for the "uq_threshold" audit strategy, used as a seed '
+             'until --target-ferr calibration produces a real value (if enabled)'
+    )
+    parser.add_argument(
+        '--target-ferr',
+        type=float,
+        default=None,
+        help='Target observed force error for adaptive threshold calibration (Controller agent). '
+             'Only used with --audit-task uq_threshold; if unset, the threshold stays fixed '
+             'at --audit-threshold for the whole run.'
+    )
+    parser.add_argument(
+        '--calibration-history-length',
+        type=int,
+        default=8,
+        help='Number of same-model-version labeled frames required before (re)calibrating the threshold'
+    )
+    parser.add_argument(
+        '--per-trajectory-threshold',
+        type=int,
+        default=1,
+        help='Calibrate each trajectory\'s UQ threshold independently from only its own '
+             'labeled-frame history, instead of pooling all trajectories into one shared threshold. '
+             'Only used with --audit-task uq_threshold and --target-ferr set.'
+    )
+    parser.add_argument(
+        '--audit-random-fail-rate',
+        type=float,
+        default=0.0,
+        help='Frequency at which a chunk that would otherwise pass audit is randomly failed anyway, '
+             'independent of the active audit strategy (forces continued sampling/exploration)'
+    )
+    parser.add_argument(
+        '--sample-task',
+        type=str,
+        default='random',
+        choices=['random', 'max_uq', 'boundary', 'audit_reason'],
+        help='Sampling strategy for picking training frames out of a failed chunk: "random" (current '
+             'default), "max_uq" (highest per-frame UQ), "boundary" (frames around the first frame '
+             'crossing threshold), or "audit_reason" (routes to one of the three per why the chunk '
+             'failed audit -- see --burn-in-sample-task/--threshold-sample-task/--random-fail-sample-task)'
+    )
+    parser.add_argument(
+        '--burn-in-sample-task',
+        type=str,
+        default='random',
+        choices=['random', 'max_uq', 'boundary'],
+        help='Only used with --sample-task audit_reason: strategy for chunks failed by the burn_in '
+             'model-version gate, where UQ may not be calibrated yet'
+    )
+    parser.add_argument(
+        '--threshold-sample-task',
+        type=str,
+        default='boundary',
+        choices=['random', 'max_uq', 'boundary'],
+        help='Only used with --sample-task audit_reason: strategy for chunks failed by a genuine '
+             'UQ threshold crossing'
+    )
+    parser.add_argument(
+        '--random-fail-sample-task',
+        type=str,
+        default='max_uq',
+        choices=['random', 'max_uq', 'boundary'],
+        help='Only used with --sample-task audit_reason: strategy for chunks failed by '
+             '--audit-random-fail-rate, which have no real crossing to anchor on'
     )
     parser.add_argument(
         '--learner',
@@ -194,12 +271,26 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default='cpu',
     )
+    parser.add_argument(
+        '--num-epochs',
+        type=int,
+        default=10,
+        help='Number of epochs per training round',
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=2,
+        help='Batch size for training',
+    )
     parser.add_argument('--replay-dataset', default=None, help='Path to an ASE database containing data to replay during finetuning')
     parser.add_argument('--replay-downselect', default=None, type=int, help='Max number of entries to use from replay dataset')
     parser.add_argument('--replay-frequency', default=1, type=int, help='How often to replay')
     parser.add_argument('--replay-lr-reduction', default=1, type=float, help='Factor by which to reduce LR during replay')
     parser.add_argument('--replay-batch-size', default=None, type=int, help='Batch size used during replay')
     args = parser.parse_args()
+
+    args.per_trajectory_threshold = bool(args.per_trajectory_threshold)
 
     return args
 
@@ -218,6 +309,17 @@ def get_audit_task(audit_task_name: str) -> Callable[..., AuditResult]:
         return uq_threshold_audit
     else:
         raise ValueError(f'Unknown audit task: {audit_task_name}')
+
+
+def get_sample_task(sample_task_name: str) -> Callable[..., list[TrainingFrame]]:
+    if sample_task_name == 'random':
+        return random_sample
+    elif sample_task_name == 'max_uq':
+        return max_uq_sample
+    elif sample_task_name == 'boundary':
+        return boundary_uq_sample
+    else:
+        raise ValueError(f'Unknown sample task: {sample_task_name}')
 
 
 async def main():
@@ -297,7 +399,10 @@ async def main():
     # logic to figure out the real max number of used workers
     # but this may not make as much sense once we distribute the workflow, so no worries for now
     n_parsl_workers = len(initial_specs) + args.n_ensemble
-    n_agents = len(initial_specs) + 5 # one dynamics runner per traj and one of each other agent
+    # only meaningful alongside the uq_threshold audit strategy, which is the
+    # only audit_task that reads a 'threshold' kwarg
+    use_controller = args.audit_task == 'uq_threshold' and args.target_ferr is not None
+    n_agents = len(initial_specs) + 5 + (1 if use_controller else 0)  # one dynamics runner per traj and one of each other agent
     config = Config(
         executors=[
             HighThroughputExecutor(
@@ -325,6 +430,7 @@ async def main():
             labeler_reg = await manager.register_agent(Labeler)
             sampler_reg = await manager.register_agent(Sampler)
             auditor_reg = await manager.register_agent(Auditor)
+            controller_reg = await manager.register_agent(Controller) if use_controller else None
 
             # get handles to all agents
             db_handle = manager.get_handle(db_reg)
@@ -332,6 +438,7 @@ async def main():
             labeler_handle = manager.get_handle(labeler_reg)
             sampler_handle = manager.get_handle(sampler_reg)
             auditor_handle = manager.get_handle(auditor_reg)
+            controller_handle = manager.get_handle(controller_reg) if controller_reg is not None else None
 
             # these are used for cleanup
             handles = [
@@ -341,6 +448,8 @@ async def main():
                 sampler_handle,
                 auditor_handle,
             ]
+            if controller_handle is not None:
+                handles.append(controller_handle)
 
             # set up agent configs
             db_monitor_config = DatabaseMonitorConfig(
@@ -359,13 +468,23 @@ async def main():
                 run_id=run_id,
                 db_url=args.db_url,
                 audit_kws=audit_kws,
+                random_fail_rate=args.audit_random_fail_rate,
             )
+            if args.sample_task == 'audit_reason':
+                sample_task = partial(
+                    audit_reason_sample,
+                    burn_in_sampler=get_sample_task(args.burn_in_sample_task),
+                    threshold_sampler=get_sample_task(args.threshold_sample_task),
+                    random_sampler=get_sample_task(args.random_fail_sample_task),
+                )
+            else:
+                sample_task = get_sample_task(args.sample_task)
             sampler_config = SamplerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
                 n_frames=args.n_sample_frames,
                 executor=pool,
-                sample_task=random_sample,
+                sample_task=sample_task,
                 burn_in_model_versions=args.burn_in_rounds,
                 burn_in_n_frames=args.burn_in_n_frames,
             )
@@ -375,6 +494,16 @@ async def main():
                 executor=pool,
                 label_task=label_frame,
                 calc_factory=partial(mace_mp, model='medium', device=args.device_label, default_dtype="float32"),
+                error_fn=max_force_error,
+                )
+            if use_controller:
+                controller_config = ControllerConfig(
+                    run_id=run_id,
+                    db_url=args.db_url,
+                    target_ferr=args.target_ferr,
+                    history_length=args.calibration_history_length,
+                    per_trajectory_threshold=args.per_trajectory_threshold,
+                    burn_in_model_versions=args.burn_in_rounds,
                 )
             trainer_config = TrainerConfig(
                 run_id=run_id,
@@ -384,9 +513,9 @@ async def main():
                 training_task=train,
                 training_args=(),
                 training_kws=dict(
-                    num_epochs=10,
+                    num_epochs=args.num_epochs,
                     device=args.device_train,
-                    batch_size=2,
+                    batch_size=args.batch_size,
                 ),
                 learner=learner,
                 replay=replay,
@@ -409,9 +538,18 @@ async def main():
                 ),
                 registration=sampler_reg,
             )
+            if use_controller:
+                await manager.launch(
+                    Controller,
+                    kwargs=dict(
+                        config=controller_config,
+                        auditor=auditor_handle,
+                    ),
+                    registration=controller_reg,
+                )
             await manager.launch(
                 Labeler,
-                kwargs=dict(config=labeler_config),
+                kwargs=dict(config=labeler_config, controller=controller_handle),
                 registration=labeler_reg,
             )
             await manager.launch(
@@ -446,6 +584,7 @@ async def main():
                         model_version=0,
                         uq_hook=ensemble_force_deviation_uq,
                         gpu_flush_interval=args.gpu_flush_interval,
+                        max_audit_retries=args.max_audit_retries,
                 )
                 await manager.launch(
                     DynamicsRunner,

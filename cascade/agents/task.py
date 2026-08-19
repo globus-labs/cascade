@@ -46,21 +46,41 @@ def random_audit(
     passed = rng.random() < accept_prob
     score = rng.random() if passed else 0.0
     status = AuditStatus.PASSED if passed else AuditStatus.FAILED
-    return AuditResult(status=status, score=score)
+    return AuditResult(status=status, score=score, reason='random_accept')
+
+
+def _frames_from_indices(chunk: Chunk, indices, n_sample: int) -> list[TrainingFrame]:
+    """Build one TrainingFrame per index into chunk.atoms/frame_ids.
+
+    Used by sampling tasks to create training frames for labeler
+    """
+    from cascade.model import TrainingFrame
+
+    return [
+        TrainingFrame(
+            atoms=chunk.atoms[i],
+            frame_id=chunk.frame_ids[i],
+            model_version=chunk.model_version,
+            traj_id=chunk.traj_id,
+            chunk_id=chunk.chunk_id,
+            attempt_index=chunk.attempt_ix,
+            n_sampled_frames=n_sample,
+        )
+        for i in indices
+    ]
 
 
 def random_sample(
     chunk: Chunk,
     n_frames: int,
     sleep_time: float = 0.,
+    **kwargs
 ) -> list[TrainingFrame]:
     """Random sample of frames from a chunk.
 
     Intended to be used as a stub for a real sampling function.
     """
-    from cascade.model import TrainingFrame
     import time
-    import numpy as np
 
     time.sleep(sleep_time)
     # Create a new random generator seeded with OS entropy to ensure
@@ -68,20 +88,66 @@ def random_sample(
     rng = np.random.default_rng(seed=None)
     n_sample = min(n_frames, len(chunk.atoms))
     indices = rng.choice(len(chunk.atoms), size=n_sample, replace=False)
-    result = []
-    for i in indices:
-        result.append(
-            TrainingFrame(
-                atoms=chunk.atoms[i],
-                frame_id=chunk.frame_ids[i],
-                model_version=chunk.model_version,
-                traj_id=chunk.traj_id,
-                chunk_id=chunk.chunk_id,
-                attempt_index=chunk.attempt_ix,
-                n_sampled_frames=n_sample
-            )
-        )
-    return result
+    return _frames_from_indices(chunk, indices, n_sample)
+
+
+def max_uq_sample(
+    chunk: Chunk,
+    n_frames: int,
+    *,
+    field: str = 'uq_force_std_max',
+    **kwargs
+) -> list[TrainingFrame]:
+    """The n_frames frames with the highest per-frame UQ score.
+
+    Requires the chunk's frames to have been produced with a uq_hook (e.g.
+    ensemble_force_deviation_uq) that populates atoms.info[field].
+    """
+    values = np.array([a.info[field] for a in chunk.atoms])
+    n_sample = min(n_frames, len(chunk.atoms))
+    indices = np.argsort(-values)[:n_sample]
+    return _frames_from_indices(chunk, indices, n_sample)
+
+
+def boundary_uq_sample(
+    chunk: Chunk,
+    n_frames: int,
+    threshold: float = 0.1,
+    field: str = 'uq_force_std_max',
+    **kwargs
+) -> list[TrainingFrame]:
+    """Frames clustered around the first frame that crossed threshold"""
+    values = np.array([a.info[field] for a in chunk.atoms])
+    crossings = np.flatnonzero(values >= threshold)
+    n_sample = min(n_frames, len(chunk.atoms))
+    crossing_idx = int(crossings[0])
+    indices = sorted(range(len(chunk.atoms)), key=lambda i: abs(i - crossing_idx))[:n_sample]
+    return _frames_from_indices(chunk, indices, n_sample)
+
+
+def audit_reason_sample(
+    chunk: Chunk,
+    n_frames: int,
+    *,
+    reason: str | None = None,
+    threshold: float = 0.1,
+    field: str = 'uq_force_std_max',
+    burn_in_sampler: Callable[..., list[TrainingFrame]] = random_sample,
+    threshold_sampler: Callable[..., list[TrainingFrame]] = boundary_uq_sample,
+    random_sampler: Callable[..., list[TrainingFrame]] = max_uq_sample,
+) -> list[TrainingFrame]:
+    """Dispatches to different smapling methods based on audit failure reason
+
+    burn_in_sampler: when the audit failure reasion is "burn_in"
+    threshold_sampler: when the audit failure reason is "threshold"
+    random_sampler: when the audit failure reason is "random_fail"
+    """
+    strategy = {
+        'burn_in': burn_in_sampler,
+        'threshold': threshold_sampler,
+        'random_fail': random_sampler,
+    }.get(reason)
+    return strategy(chunk, n_frames, threshold=threshold, field=field)
 
 
 def advance_dynamics(
@@ -213,12 +279,39 @@ def uq_threshold_audit(
     import numpy as np
 
     if chunk.model_version < burn_in_model_versions:
-        return AuditResult(status=AuditStatus.FAILED, score=float('inf'))
+        return AuditResult(status=AuditStatus.FAILED, score=float('inf'), reason='burn_in')
 
     values = np.array([a.info[field] for a in chunk.atoms])
     score = float(values.max())
     status = AuditStatus.PASSED if score < threshold else AuditStatus.FAILED
-    return AuditResult(status=status, score=score)
+    return AuditResult(status=status, score=score, reason='threshold')
+
+
+def audit_with_random_failure(
+    chunk: Chunk,
+    audit_task: Callable[..., AuditResult],
+    fail_rate: float = 0.0,
+    **audit_kws,
+) -> AuditResult:
+    """Wraps another audit_task with random failures. Will only trip on a successful audit.
+    """
+    from cascade.model import AuditResult, AuditStatus
+    import numpy as np
+
+    result = audit_task(chunk, **audit_kws)
+    if result.status == AuditStatus.PASSED and fail_rate > 0:
+        rng = np.random.default_rng(seed=None)
+        if rng.random() < fail_rate:
+            return AuditResult(status=AuditStatus.FAILED, score=result.score, reason='random_fail')
+    return result
+
+def max_force_error(atoms_predicted: Atoms, atoms_labeled: Atoms) -> float:
+    """Get the maximum error in the forces between the predicted and labeled forces on the atoms
+    """
+    f_pred = atoms_predicted.calc.results['forces']
+    f_true = atoms_labeled.calc.results['forces']
+    return float(np.linalg.norm(f_pred - f_true, axis=-1).max())
+
 
 def label_noop(spec: TrainingFrame, calc_factory: Callable[..., Calculator]) -> TrainingFrame:
     """Returns forces from the training frame spec unmodified"""

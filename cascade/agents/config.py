@@ -74,6 +74,9 @@ class DynamicsRunnerConfig(CascadeAgentConfig):
     """Keyword arguments passed to uq_hook"""
     gpu_flush_interval: int = 10
     """How often advance_dynamics releases PyTorch's CUDA caching allocator"""
+    max_audit_retries: int | None = None
+    """Max consecutive audit failures a single chunk may accumulate before the
+    trajectory is marked FAILED. None (default) means retry indefinitely"""
 
 
 @dataclass
@@ -85,6 +88,9 @@ class AuditorConfig(CascadeAgentConfig):
     """Keyword arguments to audit_task"""
     executor: Executor
     """Where to run audit task"""
+    random_fail_rate: float = 0.0
+    """If > 0, the Auditor wraps audit_task so a PASSED result is randomly downgraded
+    to FAILED at this frequency, independent of audit_task's own pass/fail logic"""
 
 
 @dataclass
@@ -111,6 +117,24 @@ class LabelerConfig(CascadeAgentConfig):
     """Create the calculator to use for labeling"""
     label_task: Callable[[TrainingFrame, Callable[..., Calculator]], TrainingFrame]
     """Adds labels to training frames"""
+    error_fn: Callable[[Atoms, Atoms], float]
+    """(predicted_atoms, labeled_atoms) -> observed error, recorded for Controller calibration"""
+    uq_field: str = 'uq_force_std_max'
+    """atoms.info key holding the UQ scalar recorded at sample time"""
+
+
+@dataclass
+class ControllerConfig(CascadeAgentConfig):
+    """Configuration for Controller agent"""
+    target_ferr: float
+    """Target observed error (Eq. 1/3 of the proxima paper)"""
+    history_length: int = 8
+    """Max number of observations pulled per calibration window"""
+    burn_in_model_versions: int = 0
+    """Ignore calibration observations sampled below this model version"""
+    per_trajectory_threshold: bool = False
+    """If set, calibrate each trajectory's alpha/threshold independently
+    instead of pooling all trajectories into one shared threshold"""
 
 @dataclass
 class TrainerConfig(CascadeAgentConfig):

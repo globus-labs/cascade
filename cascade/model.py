@@ -28,6 +28,8 @@ class AuditResult:
     """Whether the chunk passed audit"""
     score: float
     """How good or bad the chunk was in terms of uncertainty"""
+    reason: str | None = None
+    """Which mechanism produced this result, e.g. 'threshold', 'burn_in', 'random_fail', 'random_accept'"""
 
 @dataclass
 class TrainingFrame:
