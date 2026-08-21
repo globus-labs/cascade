@@ -49,6 +49,7 @@ from cascade.model import AdvanceSpec, AuditResult, TrainingFrame
 from cascade.learning.mace import MACEInterface
 from cascade.learning.finetuning import MultiHeadConfig
 from cascade.agents.db_orm import TrajectoryDB
+from cascade.calculator import get_calc_factory
 from cascade.agents.task import (
     random_audit,
     uq_threshold_audit,
@@ -243,10 +244,28 @@ def parse_args() -> argparse.Namespace:
         help='Learner to use'
     )
     parser.add_argument(
-        '--calc',
+        '--calc-type',
         type=str,
+        choices=['mace', 'fairchem'],
         default='mace',
-        help='Calculator to use'
+        help='Which reference calculator family the Labeler uses to compute ground-truth '
+             'energies/forces/stress for sampled frames'
+    )
+    parser.add_argument(
+        '--calc-model',
+        type=str,
+        default='medium',
+        help='For --calc-type=mace, a MACE-MP model size (e.g. "medium") or path to a MACE '
+             'checkpoint. For --calc-type=fairchem, the path to a FairChem .pt checkpoint.'
+    )
+    parser.add_argument(
+        '--calc-task',
+        type=str,
+        default=None,
+        help='FairChem task name selecting the model head (e.g. "omol", "omat", "oc20", '
+             '"odac", "omc"), ignored for --calc-type=mace. Only needed for --calc-type=fairchem '
+             'if the checkpoint supports more than one task; single-task checkpoints infer it '
+             'automatically.'
     )
     parser.add_argument(
         '--db-url',
@@ -492,7 +511,7 @@ async def main():
                 db_url=args.db_url,
                 executor=pool,
                 label_task=label_frame,
-                calc_factory=partial(mace_mp, model='medium', device=args.device_label, default_dtype="float32"),
+                calc_factory=get_calc_factory(args.calc_type, args.calc_model, args.device_label, args.calc_task),
                 error_fn=max_force_error,
                 )
             if use_controller:

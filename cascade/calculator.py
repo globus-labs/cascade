@@ -15,6 +15,29 @@ from ase import units, Atoms
 _file_dir = Path(__file__).parent / 'files'
 
 
+def _build_mace_calc(calc_model: str, device: str) -> Calculator:
+    # See https://github.com/ACEsuit/mace/issues/555.
+    os.environ.setdefault('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
+    from mace.calculators import mace_mp
+    return mace_mp(model=calc_model, device=device, default_dtype='float32')
+
+
+def _build_fairchem_calc(calc_model: str, calc_task: str | None, device: str) -> Calculator:
+    # See https://github.com/ACEsuit/mace/issues/555.
+    os.environ.setdefault('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
+    from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
+    # FAIRChemCalculator only accepts bare "cpu"/"cuda" (unlike mace_mp), and resolves
+    # "cuda" via torch.cuda.current_device()
+    if device.startswith('cuda:'):
+        import torch
+        torch.cuda.set_device(int(device.split(':', 1)[1]))
+    return FAIRChemCalculator.from_model_checkpoint(
+        name_or_path=calc_model,
+        task_name=calc_task,
+        device='cuda' if device.startswith('cuda') else device,
+    )
+
+
 def get_calc_factory(
         calc_type: str,
         calc_model: str,
@@ -25,7 +48,8 @@ def get_calc_factory(
 
     Imports for each ``calc_type`` are deferred until that branch runs, so
     selecting one calculator type does not require the packages for the others
-    to be installed.
+    to be installed. The returned factory is a ``functools.partial`` of a
+    top-level function (not a closure), can be pickled for parsl
 
     Args:
         calc_type: Which calculator family to use (``mace`` or ``fairchem``)
@@ -40,30 +64,10 @@ def get_calc_factory(
     Returns:
         A zero-argument callable that returns a new Calculator instance
     """
-    # torch>=2.6 defaults to weights_only=True, which rejects both MACE's and FairChem's
-    # checkpoints. See https://github.com/ACEsuit/mace/issues/555.
-    os.environ.setdefault('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
-
     if calc_type == 'mace':
-        from mace.calculators import mace_mp
-        return partial(mace_mp, model=calc_model, device=device, default_dtype='float32')
+        return partial(_build_mace_calc, calc_model, device)
     elif calc_type == 'fairchem':
-        from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
-
-        def build_fairchem_calc():
-            # FAIRChemCalculator only accepts bare "cpu"/"cuda" (unlike mace_mp), and
-            # resolves "cuda" via torch.cuda.current_device() - so an indexed device
-            # (e.g. "cuda:1") has to select the device explicitly first, or it'd silently
-            # fall back to whichever device is current (usually index 0).
-            if device.startswith('cuda:'):
-                import torch
-                torch.cuda.set_device(int(device.split(':', 1)[1]))
-            return FAIRChemCalculator.from_model_checkpoint(
-                name_or_path=calc_model,
-                task_name=calc_task,
-                device='cuda' if device.startswith('cuda') else device,
-            )
-        return build_fairchem_calc
+        return partial(_build_fairchem_calc, calc_model, calc_task, device)
     else:
         raise ValueError(f'Unknown calc_type: {calc_type!r}')
 
