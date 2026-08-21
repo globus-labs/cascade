@@ -1,8 +1,3 @@
-#strace -f -e trace=process,open,openat,close,socket,connect,accept \
-#    -o trace.log \
-#    --replay-dataset ./datasets/mace-mp/sampled_1000.traj \
-#    --replay-downselect 10 \
-#    --replay-batch-size 2 \
 source "${SLURM_SUBMIT_DIR:-$(dirname "${BASH_SOURCE[0]}")}/env_setup.sh"
 python run_cascade_academy.py \
     --init-config-json init_config_mof_crystalline_200_300K.json \
@@ -13,5 +8,10 @@ python run_cascade_academy.py \
     --n-sample-frames 5 \
     --accept-rate .5 \
     --learner mace \
-    --n-ensemble 2 \
-    --log-level DEBUG
+    --replay-dataset ./datasets/mace-mp/sampled_1000.traj \
+    --replay-batch-size 2 \
+    --n-ensemble 4 \
+    --log-level DEBUG \
+    --device-train cuda:0 \
+    --device-label cuda:0 \
+    --device-dyn cuda:0
