@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import asyncio
 from asyncio import Event, Lock, wrap_future
+from functools import partial
 import logging
 from copy import deepcopy
+
+import numpy as np
 
 from academy.handle import Handle
 from academy.agent import Agent, action, loop
@@ -21,9 +24,11 @@ from cascade.agents.config import (
     SamplerConfig,
     LabelerConfig,
     DatabaseMonitorConfig,
-    DynamicsRunnerConfig
+    DynamicsRunnerConfig,
+    ControllerConfig,
 )
 from cascade.agents.db_orm import TrajectoryDB
+from cascade.agents.task import audit_with_random_failure
 from cascade.model import Chunk, TrainingFrame
 
 
@@ -70,7 +75,7 @@ class DynamicsRunner(CascadeAgent):
         # for handling weight updates
         self.received_weights = Event()
         self.new_model_lock = Lock()
-        self.new_model: tuple[bytes, int] | None = None  # weights, version
+        self.new_model: tuple[list[bytes], int] | None = None  # weights, version
 
     @loop
     async def run(
@@ -99,17 +104,27 @@ class DynamicsRunner(CascadeAgent):
                     self.new_model = None
                 self.logger.debug(
                     f"Submitting dynamics to executor dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index} with {spec.steps} steps")
+                self._traj_db.record_chunk_event(
+                    run_id=self.config.run_id,
+                    traj_id=spec.traj_id,
+                    chunk_id=spec.chunk_id,
+                    attempt_index=spec.attempt_index,
+                    event_type=ChunkEventType.STARTED_DYNAMICS,
+                )
                 # submit dynamics for evaluation
                 chunk_future = self.config.executor.submit(
                     self.config.advance_dynamics_task,
                     spec=spec,
                     learner=self.config.learner,
-                    weights=self.config.weights,
+                    weights=self.weights,
                     device=self.config.device,
                     dyn_cls=self.config.dyn_cls,
                     dyn_kws=self.config.dyn_kws,
                     run_kws=self.config.run_kws,
-                    run_dir=str(self.config.run_dir)
+                    run_dir=str(self.config.run_dir),
+                    uq_hook=self.config.uq_hook,
+                    uq_kws=self.config.uq_kws,
+                    gpu_flush_interval=self.config.gpu_flush_interval,
                 )
 
             #todo mt.2026.04.27 does this still need to be logged?
@@ -142,6 +157,13 @@ class DynamicsRunner(CascadeAgent):
                 )
                 frame_ids.append(_id)
             self.logger.info(f"Finished dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                attempt_index=spec.attempt_index,
+                event_type=ChunkEventType.FINISHED_DYNAMICS,
+            )
 
             # submit to auditor
             chunk = Chunk(
@@ -153,7 +175,21 @@ class DynamicsRunner(CascadeAgent):
                 model_version=self.model_version
             )
             self.logger.info(f"Submitting audit for traj {self.config.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                attempt_index=spec.attempt_index,
+                event_type=ChunkEventType.STARTED_AUDIT,
+            )
             audit_result = await self.auditor.audit(chunk)
+            self._traj_db.record_chunk_event(
+                run_id=self.config.run_id,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                attempt_index=spec.attempt_index,
+                event_type=ChunkEventType.AUDIT_PASSED if audit_result.status == AuditStatus.PASSED else ChunkEventType.AUDIT_FAILED,
+            )
 
             # handle audit result
             if audit_result.status == AuditStatus.PASSED:
@@ -174,15 +210,26 @@ class DynamicsRunner(CascadeAgent):
                     self.attempt = 0
                     self.logger.info(f"Updating traj {self.config.traj_id} to chunk {self.chunk_ix} attempt {self.attempt}")
             else:
-                # audit failed: wait for new weights
-                self.logger.info(f'Audit status failed for traj {self.config.traj_id} chunk {self.chunk_ix} attempt {self.attempt}, waiting for new weights...')
                 self.attempt += 1
-                self.received_weights.clear()
-                await self.received_weights.wait()
-                self.logger.info('Received new weights')
+                if self.config.max_audit_retries is not None and self.attempt > self.config.max_audit_retries:
+                    reason = (
+                        f"chunk {self.chunk_ix} failed audit {self.attempt} times "
+                        f"(max_audit_retries={self.config.max_audit_retries}); "
+                        f"last audit reason={audit_result.reason}"
+                    )
+                    self.logger.error(f"Traj {self.config.traj_id} exceeded max_audit_retries: {reason}")
+                    self._traj_db.mark_trajectory_failed(run_id=self.config.run_id, traj_id=self.config.traj_id, reason=reason)
+                    self.done = True
+                    self.agent_shutdown()
+                else:
+                    # audit failed: wait for new weights
+                    self.logger.info(f'Audit status failed for traj {self.config.traj_id} chunk {self.chunk_ix} attempt {self.attempt}, waiting for new weights...')
+                    self.received_weights.clear()
+                    await self.received_weights.wait()
+                    self.logger.info('Received new weights')
 
     @action
-    async def receive_weights(self, weights: bytes, model_version: int) -> None:
+    async def receive_weights(self, weights: list[bytes], model_version: int) -> None:
         async with self.new_model_lock: # todo mt.2026.07.07: do we need this lock if we only call receive weights from a safe spot in the loop in this agent?
             self.new_model = (weights, model_version)
         self.logger.info(f"Received weights for model version {model_version}")
@@ -203,16 +250,38 @@ class Auditor(CascadeAgent):
         super().__init__()
         self.config = config
         self.sampler = sampler
+        self.audit_task = config.audit_task
+        if config.random_fail_rate > 0:
+            self.audit_task = partial(audit_with_random_failure, audit_task=self.audit_task, fail_rate=config.random_fail_rate)
+        self.default_threshold = config.audit_kws.get('threshold')
+        self.thresholds: dict[int, float] = {}
+
+    @action
+    async def receive_threshold(self, threshold: float, traj_id: int | None = None) -> None:
+        """Pushed by Controller after each recalibration.
+
+        traj_id=None updates the shared default used by any trajectory without its
+        own calibrated value; otherwise updates only that trajectory's threshold.
+        """
+        if traj_id is None:
+            self.default_threshold = threshold
+            self.logger.info(f"Received new default audit threshold {threshold}")
+        else:
+            self.thresholds[traj_id] = threshold
+            self.logger.info(f"Received new audit threshold {threshold} for traj {traj_id}")
 
     @action
     async def audit(self, chunk: Chunk) -> AuditResult:
         """Submit a chunk for audit"""
         self.logger.info(f'Submitting audit of traj {chunk.traj_id} chunk {chunk.chunk_id} attempt {chunk.attempt_ix} to executor')
 
+        audit_kws = {**self.config.audit_kws}
+        audit_kws['threshold'] = self.thresholds.get(chunk.traj_id, self.default_threshold)
+
         future = self.config.executor.submit(
-            self.config.audit_task,
+            self.audit_task,
             chunk,
-            **self.config.audit_kws
+            **audit_kws
         )
         wrapped_future = wrap_future(future)
         await wrapped_future
@@ -224,7 +293,8 @@ class Auditor(CascadeAgent):
             traj_id=chunk.traj_id,
             chunk_id=chunk.chunk_id,
             attempt_index=chunk.attempt_ix,
-            audit_status=status
+            audit_status=status,
+            audit_reason=result.reason,
         )
         if status == AuditStatus.PASSED:
             self.logger.info(
@@ -236,8 +306,94 @@ class Auditor(CascadeAgent):
                 f'Audit failed for traj {chunk.traj_id} chunk {chunk.chunk_id} attempt {chunk.attempt_ix}'
             )
             self.logger.info(f'Submitting failed chunk {chunk.chunk_id} of traj {chunk.traj_id} to sampler')
-            asyncio.create_task(self.sampler.sample_frames(chunk))
+            asyncio.create_task(self.sampler.sample_frames(
+                chunk,
+                audit_reason=result.reason,
+                audit_threshold=audit_kws.get('threshold'),
+            ))
         return result
+
+
+class Controller(CascadeAgent):
+    """Updates the Auditor's UQ threshold against observed labeling error.
+
+    Based on the alpha and threshold updates from cascade.proxima.SerialLearningCalculator.
+
+    When config.per_trajectory_threshold is set, each trajectory gets its own
+    independently calibrated alpha/threshold, otherwise they are shared.
+    """
+
+    def __init__(
+        self,
+        config: ControllerConfig,
+        auditor: Handle[Auditor],
+    ):
+        self.db_url = config.db_url
+        super().__init__()
+        self.config = config
+        self.auditor = auditor
+        self.threshold: dict[int | None, float] = {}
+        self.alpha: dict[int | None, float] = {}
+
+    @action
+    async def update_threshold(self, traj_id: int) -> None:
+        """Recalibrate threshold/alpha from labeled frames, if enough observations exist.
+
+        Called by: Labeler, on every newly labeled frame
+        Invokes: Auditor (to update threshold)
+        """
+        key = traj_id if self.config.per_trajectory_threshold else None
+
+        model_version, observations = self._traj_db.get_controller_observations(
+            run_id=self.config.run_id,
+            burn_in_model_versions=self.config.burn_in_model_versions,
+            limit=self.config.history_length,
+            traj_id=key,
+        )
+        if len(observations) < self.config.history_length:
+            self.logger.info(
+                f"Too few calibration observations ({len(observations)} < "
+                f"{self.config.history_length}) for "
+                f"{'traj ' + str(key) if key is not None else 'shared'} threshold; "
+                f"stays at {self.threshold.get(key)}"
+            )
+            return
+
+        uncert_metrics, obs_errors = zip(*observations)
+
+        if np.allclose(uncert_metrics, 0.):
+            # Happens e.g. when all ensemble members still share the same weights
+            self.logger.info('All calibration UQ metrics are zero; setting threshold to zero')
+            self.threshold[key] = 0.
+        else:
+            many_alphas = np.true_divide(obs_errors, np.clip(uncert_metrics, 1e-6, a_max=np.inf))
+            alpha = float(np.mean(many_alphas))
+            assert alpha >= 0
+            self.alpha[key] = alpha
+
+            if key not in self.threshold:
+                # initial, conservative estimate (todo: make this tuneable?)
+                self.threshold[key] = self.config.target_ferr / alpha / 2
+            else:
+                current_err = float(np.mean(obs_errors))
+                self.threshold[key] -= (current_err - self.config.target_ferr) / alpha
+                self.threshold[key] = max(self.threshold[key], 0.)
+
+        mean_error = float(np.mean(obs_errors))
+        self._traj_db.write_controller_log(
+            run_id=self.config.run_id,
+            model_version=model_version,
+            threshold=self.threshold[key],
+            alpha=self.alpha.get(key, 0.),
+            mean_error=mean_error,
+            n_observations=len(observations),
+            traj_id=key,
+        )
+        self.logger.info(
+            f"Calibrated threshold={self.threshold[key]:.4g}, alpha={self.alpha.get(key)}, "
+            f"mean_error={mean_error:.4g}, n_observations={len(observations)}"
+        )
+        await self.auditor.receive_threshold(self.threshold[key], traj_id=key)
 
 
 class Sampler(CascadeAgent):
@@ -257,6 +413,8 @@ class Sampler(CascadeAgent):
     async def sample_frames(
         self,
         chunk: Chunk,
+        audit_reason: str | None = None,
+        audit_threshold: float | None = None,
     ) -> None:
 
         self.logger.info(
@@ -264,16 +422,31 @@ class Sampler(CascadeAgent):
             f'chunk {chunk.chunk_id} '
             f'attempt {chunk.attempt_ix}'
         )
+        n_frames = self.config.n_frames
+        if chunk.model_version < self.config.burn_in_model_versions and self.config.burn_in_n_frames is not None:
+            n_frames = self.config.burn_in_n_frames
+
+        chunk_kws = dict(
+            run_id=self.config.run_id,
+            traj_id=chunk.traj_id,
+            chunk_id=chunk.chunk_id,
+            attempt_index=chunk.attempt_ix,
+        )
+        self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.STARTED_SAMPLING)
+        sample_kws = dict(n_frames=n_frames, reason=audit_reason)
+        if audit_threshold is not None:
+            # omit: some strategies have defaults we dont want to override with None
         future = self.config.executor.submit(
             self.config.sample_task,
             chunk,
-            n_frames=self.config.n_frames,
+            **sample_kws,
         )
         wrapped_future = wrap_future(future)
         await wrapped_future
         training_frames = wrapped_future.result()
+        self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.FINISHED_SAMPLING)
 
-        if len(training_frames) != self.config.n_frames:
+        if len(training_frames) != n_frames:
             self.logger.warning(
                 "Sampling returned %d frames for traj %s chunk %s (attempt %s), "
                 "expected n_frames=%d",
@@ -281,7 +454,7 @@ class Sampler(CascadeAgent):
                 chunk.traj_id,
                 chunk.chunk_id,
                 chunk.attempt_ix,
-                self.n_frames,
+                n_frames,
             )
         for frame in training_frames:
             self.logger.info(
@@ -296,11 +469,14 @@ class Labeler(CascadeAgent):
 
     def __init__(
         self,
-        config: LabelerConfig
+        config: LabelerConfig,
+        controller: Handle[Controller] | None = None,
     ):
         self.db_url = config.db_url
         super().__init__()
         self.config = config
+        self.controller = controller
+        self.error_fn = config.error_fn
 
     def _record_labeling_started(self, frame: TrainingFrame) -> None:
         # todo: discuss with will. wouldnt a pub/sub be better than DB for communicating this information. this is essentially a pub/sub spoof
@@ -326,6 +502,8 @@ class Labeler(CascadeAgent):
             trajectory_frame_id=frame.frame_id,
             model_version_sampled_from=frame.model_version,
             atoms_labeled=frame.atoms_labeled,
+            calibration_uq=frame.atoms.info.get(self.config.uq_field),
+            calibration_error=self.error_fn(frame.atoms, frame.atoms_labeled),
         )
         self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.FINISHED_LABELING_FRAME, frame_id=frame.frame_id)
 
@@ -357,6 +535,8 @@ class Labeler(CascadeAgent):
         frame = wrapped_future.result()
 
         self._record_labeling_finished(frame)
+        if self.controller is not None:
+            asyncio.create_task(self.controller.update_threshold(traj_id=frame.traj_id))
 
 
 class Trainer(CascadeAgent):
@@ -372,8 +552,10 @@ class Trainer(CascadeAgent):
     async def train_model(
         self,
         training_round: int,
-    ) -> bytes:
+    ) -> list[bytes]:
         from sklearn.model_selection import train_test_split
+        import numpy as np
+
         self.logger.info(f'Fetching training data for training round {training_round}')
         train_data = self._traj_db.get_training_frames(
             self.config.run_id,
@@ -385,22 +567,34 @@ class Trainer(CascadeAgent):
         self.logger.info(f'Got {len(train_data)} training frames')
         train_data, valid_data = train_test_split(train_data, test_size=0.2)
         self.logger.info(f'Train size: {len(train_data)}, val size: {len(valid_data)}')
-        self.logger.info('Submitting training task')
-        training_future = self.config.executor.submit(
-            self.config.training_task,
-            learner=self.config.learner,
-            weights=self.weights,
-            train_data=train_data,
-            valid_data=valid_data,
-            train_kws=self.config.training_kws
-        )
-        wrapped_future = wrap_future(training_future)
-        await wrapped_future
+
+        rng = np.random.default_rng()
+        n_sample = int(len(train_data) * self.config.bootstrap_fraction)
+
+        self.logger.info(f'Submitting {len(self.weights)} bootstrapped training tasks')
+        futures = []
+        for member_weights in self.weights:
+            boot_idx = rng.integers(0, len(train_data), size=n_sample)
+            boot_data = [train_data[i] for i in boot_idx]
+            future = self.config.executor.submit(
+                self.config.training_task,
+                learner=self.config.learner,
+                weights=member_weights,
+                train_data=boot_data,
+                valid_data=valid_data,
+                train_kws=self.config.training_kws,
+                replay=self.config.replay,
+            )
+            futures.append(wrap_future(future))
+
+        results = await asyncio.gather(*futures)
+
         self.logger.info('Retrieving new weights')
-        weights, results = wrapped_future.result()
-        self._traj_db.write_training_log(self.config.run_id, training_round, results)
-        self.weights = weights
-        return weights
+        new_weights = [w for w, _ in results]
+        for member_index, (_, log) in enumerate(results):
+            self._traj_db.write_training_log(self.config.run_id, training_round, log, member_index=member_index)
+        self.weights = new_weights
+        return new_weights
 
 
 class DatabaseMonitor(CascadeAgent):
@@ -507,6 +701,11 @@ class DatabaseMonitor(CascadeAgent):
                     training_round=self.current_training_round,
                 )
                 # Train model and update weights in dynamics engine
+                self._traj_db.record_training_event(
+                    run_id=self.config.run_id,
+                    event_type=ChunkEventType.STARTED_TRAINING,
+                    training_round=self.current_training_round
+                )
                 weights = await self.trainer.train_model(self.current_training_round)
                 # Record FINISHED_TRAINING event after training completes
                 self._traj_db.record_training_event(

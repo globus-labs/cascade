@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import json
 import logging
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING
@@ -14,10 +15,6 @@ from typing import Optional, TYPE_CHECKING
 import numpy as np
 import pandas as pd
 from ase import Atoms
-
-if TYPE_CHECKING:
-    # Only import ORM classes for type checking, not at runtime
-    pass  # ORM classes are defined in this module
 
 logger = logging.getLogger(__name__)
 from sqlalchemy import (
@@ -28,6 +25,7 @@ from sqlalchemy import (
     Boolean,
     Enum as SQLEnum,
     DateTime,
+    Float,
     ForeignKey,
     func,
     JSON,
@@ -51,6 +49,8 @@ class DBTrajectory(Base):
     target_length = Column(Integer, nullable=False)
     chunks_completed = Column(Integer, default=0, nullable=False)
     status = Column(SQLEnum(TrajectoryStatus), nullable=False, default=TrajectoryStatus.RUNNING)
+    failure_reason = Column(String, nullable=True)
+    """Why the trajectory was marked FAILED, e.g. exceeding max_audit_retries; null otherwise"""
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -83,11 +83,12 @@ class DBTrajectoryChunk(Base):
     attempt_index = Column(Integer, nullable=False, default=0)
     model_version = Column(Integer, nullable=False)
     audit_status = Column(SQLEnum(AuditStatus), nullable=False, default=AuditStatus.PENDING)
+    audit_reason = Column(String, nullable=True)
+    """Which mechanism produced audit_status, e.g. 'threshold', 'burn_in', 'random_fail'; null while PENDING"""
     n_frames = Column(Integer, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    # Relationship back to trajectory
     trajectory = relationship('DBTrajectory', back_populates='chunks')
 
     __table_args__ = (
@@ -134,6 +135,11 @@ class DBTrainingFrame(Base):
     # Training round tracking
     training_round = Column(Integer, nullable=True, index=True)
     atoms_labeled_blob = Column(LargeBinary, nullable=True)
+    # Calibration inputs for adaptive audit thresholding (see Controller agent)
+    calibration_uq = Column(Float, nullable=True)
+    """UQ scalar recorded at sample time (e.g. atoms.info[uq_field])"""
+    calibration_error = Column(Float, nullable=True)
+    """Observed error vs. DFT label, computed by Labeler via error_fn"""
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
@@ -142,6 +148,26 @@ class DBTrainingFrame(Base):
 
     def __repr__(self):
         return f"<DBTrainingFrame(run_id={self.run_id}, trajectory_frame_id={self.trajectory_frame_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, training_round={self.training_round})>"
+
+
+class DBControllerLog(Base):
+    """ORM model for the Controller's threshold/alpha history"""
+    __tablename__ = 'controller_log'
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String, nullable=False, index=True)
+    traj_id = Column(Integer, nullable=True, index=True)
+    """Trajectory this calibration is specific to; null when the threshold is shared across all trajectories"""
+    model_version = Column(Integer, nullable=False)
+    """model_version_sampled_from of the calibration window this entry was fit from"""
+    threshold = Column(Float, nullable=False)
+    alpha = Column(Float, nullable=False)
+    mean_error = Column(Float, nullable=False)
+    n_observations = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    def __repr__(self):
+        return f"<DBControllerLog(run_id={self.run_id}, model_version={self.model_version}, threshold={self.threshold}, alpha={self.alpha}, n_observations={self.n_observations})>"
 
 
 class DBChunkEvent(Base):
@@ -187,11 +213,12 @@ class DBTrainingLog(Base):
     id = Column(Integer, primary_key=True)
     run_id = Column(String, nullable=False, index=True)
     training_round = Column(Integer, nullable=False, index=True)
+    member_index = Column(Integer, nullable=False, default=0)
     log_json = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint('run_id', 'training_round', name='uq_training_log_run_round'),
+        UniqueConstraint('run_id', 'training_round', 'member_index', name='uq_training_log_run_round_member'),
     )
 
     def __repr__(self):
@@ -324,11 +351,13 @@ class TrajectoryDB:
         sess,
         traj: DBTrajectory,
         status: TrajectoryStatus,
+        reason: str | None = None,
     ) -> None:
         """Internal helper to update trajectory status."""
         previous_status = traj.status
         if previous_status != status:
             traj.status = status
+            traj.failure_reason = reason
             sess.flush()
 
     def mark_trajectory_status(
@@ -336,6 +365,7 @@ class TrajectoryDB:
         run_id: str,
         traj_id: int,
         status: TrajectoryStatus,
+        reason: str | None = None,
     ) -> bool:
         """Set the lifecycle status for a trajectory."""
         with self.session() as sess:
@@ -350,16 +380,16 @@ class TrajectoryDB:
                     traj_id,
                 )
                 return False
-            self._set_trajectory_status(sess, traj, status)
+            self._set_trajectory_status(sess, traj, status, reason=reason)
             return True
 
     def mark_trajectory_running(self, run_id: str, traj_id: int) -> bool:
         """Mark a trajectory as actively running."""
         return self.mark_trajectory_status(run_id, traj_id, TrajectoryStatus.RUNNING)
 
-    def mark_trajectory_failed(self, run_id: str, traj_id: int) -> bool:
+    def mark_trajectory_failed(self, run_id: str, traj_id: int, reason: str | None = None) -> bool:
         """Mark a trajectory as failed."""
-        return self.mark_trajectory_status(run_id, traj_id, TrajectoryStatus.FAILED)
+        return self.mark_trajectory_status(run_id, traj_id, TrajectoryStatus.FAILED, reason=reason)
 
     def mark_trajectory_completed(self, run_id: str, traj_id: int) -> bool:
         """Mark a trajectory as completed."""
@@ -505,16 +535,18 @@ class TrajectoryDB:
         traj_id: int,
         chunk_id: int,
         attempt_index: int,
-        audit_status: AuditStatus
+        audit_status: AuditStatus,
+        audit_reason: str | None = None,
     ):
         """Update the audit status of a chunk and mark trajectory as done if it is complete
-        
+
         Args:
             run_id: Run identifier
             traj_id: Trajectory identifier
             chunk_id: Chunk identifier
             attempt_index: Attempt index
             audit_status: New audit status
+            audit_reason: Which mechanism produced audit_status (see AuditResult.reason)
         """
         with self.session() as sess:
             chunk = sess.query(DBTrajectoryChunk).filter_by(
@@ -523,14 +555,15 @@ class TrajectoryDB:
                 chunk_id=chunk_id,
                 attempt_index=attempt_index
             ).first()
-            
+
             if not chunk:
                 raise ValueError(
                     f"Chunk not found: run_id={run_id}, traj_id={traj_id}, "
                     f"chunk_id={chunk_id}, attempt_index={attempt_index}"
                 )
-            
+
             chunk.audit_status = audit_status
+            chunk.audit_reason = audit_reason
             
             # If chunk passed, increment chunks_completed on trajectory
             if audit_status == AuditStatus.PASSED:
@@ -710,6 +743,7 @@ class TrajectoryDB:
                 'target_length': traj.target_length,
                 'chunks_completed': traj.chunks_completed,
                 'status': traj.status,
+                'failure_reason': traj.failure_reason,
                 'init_atoms_json': traj.init_atoms_json,
                 'created_at': traj.created_at,
                 'updated_at': traj.updated_at
@@ -1068,6 +1102,8 @@ class TrajectoryDB:
         chunk_id: int,
         attempt_index: int,
         atoms_labeled: Atoms,
+        calibration_uq: Optional[float] = None,
+        calibration_error: Optional[float] = None,
     ) -> DBTrainingFrame:
         """Add a training frame to the database
 
@@ -1079,6 +1115,8 @@ class TrajectoryDB:
             chunk_id: Chunk identifier (denormalized)
             attempt_index: Attempt index (denormalized)
             atoms_labeled: Labeled atoms with energy/forces to store
+            calibration_uq: UQ scalar recorded at sample time, for Controller calibration
+            calibration_error: Observed error vs. the DFT label, for Controller calibration
 
         Returns:
             DBTrainingFrame instance
@@ -1101,6 +1139,8 @@ class TrajectoryDB:
                 attempt_index=attempt_index,
                 training_round=None,
                 atoms_labeled_blob=self._serialize_atoms(atoms_labeled),
+                calibration_uq=calibration_uq,
+                calibration_error=calibration_error,
             )
             sess.add(db_training_frame)
             sess.flush()
@@ -1341,32 +1381,38 @@ class TrajectoryDB:
             )
             sess.add(db_event)
     
-    def write_training_log(self, run_id: str, training_round: int, log: pd.DataFrame) -> None:
+    def write_training_log(self, run_id: str, training_round: int, log: pd.DataFrame, member_index: int = 0) -> None:
         """Persist per-epoch training metrics for a completed training round.
 
         Args:
             run_id: Run identifier
             training_round: Training round number
             log: DataFrame returned by MACEInterface.train, one row per epoch
+            member_index: Which ensemble member this log belongs to (0 if not ensembling)
         """
         with self.session() as sess:
             sess.add(DBTrainingLog(
                 run_id=run_id,
                 training_round=training_round,
-                log_json=log.to_dict(orient='records'),
+                member_index=member_index,
+                # NaN (e.g. from replay columns that only populate every few epochs) is not
+                # valid JSON and Postgres' json/jsonb columns reject it outright. `to_dict`
+                # leaves NaN as-is, but `to_json` correctly renders it as `null`, so round-trip
+                # through that instead.
+                log_json=json.loads(log.to_json(orient='records')),
             ))
 
     def get_training_logs(self, run_id: str) -> pd.DataFrame:
         """Return all training loss history for a run as a single DataFrame.
 
-        Each row is one epoch from one training round. A ``training_round``
-        column is prepended so callers can group or filter by round.
+        Each row is one epoch from one training round/member. ``training_round``
+        and ``member_index`` columns are prepended so callers can group or filter by them.
 
         Args:
             run_id: Run identifier
 
         Returns:
-            DataFrame with columns [training_round, epoch, <metric columns>],
+            DataFrame with columns [training_round, member_index, epoch, <metric columns>],
             or an empty DataFrame if no logs exist yet.
         """
         with self.session() as sess:
@@ -1380,8 +1426,131 @@ class TrajectoryDB:
             for row in rows:
                 df = pd.DataFrame(row.log_json)
                 df.insert(0, 'training_round', row.training_round)
+                df.insert(1, 'member_index', row.member_index)
                 frames.append(df)
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    def get_controller_observations(
+        self,
+        run_id: str,
+        burn_in_model_versions: int,
+        limit: int,
+        traj_id: int | None = None,
+    ) -> tuple[int, list[tuple[float, float]]]:
+        """Return recent (uq, error) pairs for the Controller's threshold calibration.
+
+        Only frames from the newest model version present among labeled
+        frames are returned, so a calibration window is never blended across model
+        versions "Newest" is inferred from the data (MAX(model_version_sampled_from))
+
+        Args:
+            run_id: Run identifier
+            burn_in_model_versions: Ignore frames sampled below this model version
+            limit: Max number of most-recent observations to return
+            traj_id: If set, restrict to this trajectory's own observations only
+                (per-trajectory calibration); if None, pool across all trajectories.
+
+        Returns:
+            (model_version, observations): the model version the window was drawn
+            from, and (calibration_uq, calibration_error) pairs, newest first. Both
+            are empty/None if no qualifying frames exist yet.
+        """
+        with self.session() as sess:
+            base_filters = [
+                DBTrainingFrame.run_id == run_id,
+                DBTrainingFrame.calibration_error.isnot(None),
+            ]
+            if traj_id is not None:
+                base_filters.append(DBTrainingFrame.traj_id == traj_id)
+
+            # sql MAX will occur before filter is applied
+            latest_version = (
+                sess.query(func.max(DBTrainingFrame.model_version_sampled_from))
+                .filter(
+                    *base_filters,
+                    DBTrainingFrame.model_version_sampled_from >= burn_in_model_versions,
+                )
+                .scalar()
+            )
+            if latest_version is None:
+                return None, []
+
+            rows = (
+                sess.query(DBTrainingFrame.calibration_uq, DBTrainingFrame.calibration_error)
+                .filter(
+                    *base_filters,
+                    DBTrainingFrame.model_version_sampled_from == latest_version,
+                )
+                .order_by(DBTrainingFrame.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            return latest_version, [(uq, err) for uq, err in rows]
+
+    def write_controller_log(
+        self,
+        run_id: str,
+        model_version: int,
+        threshold: float,
+        alpha: float,
+        mean_error: float,
+        n_observations: int,
+        traj_id: int | None = None,
+    ) -> None:
+        """Persist ocontroller state for later analysis.
+
+        Args:
+            run_id: Run identifier
+            model_version: model_version_sampled_from of the calibration window
+            threshold: Newly calibrated audit threshold
+            alpha: Newly fit alpha (error / UQ ratio)
+            mean_error: Mean observed error over the calibration window
+            n_observations: Number of observations the calibration window contained
+            traj_id: Trajectory this calibration is specific to, or None if shared
+                across all trajectories
+        """
+        with self.session() as sess:
+            sess.add(DBControllerLog(
+                run_id=run_id,
+                traj_id=traj_id,
+                model_version=model_version,
+                threshold=threshold,
+                alpha=alpha,
+                mean_error=mean_error,
+                n_observations=n_observations,
+            ))
+
+    def get_controller_log(self, run_id: str) -> pd.DataFrame:
+        """Return the full cpntroller state history for a run as a DataFrame.
+
+        Args:
+            run_id: Run identifier
+
+        Returns:
+            DataFrame with columns [traj_id, model_version, threshold, alpha,
+            mean_error, n_observations, created_at], ordered by created_at, or an
+            empty DataFrame if none exist. traj_id is None for entries logged while
+            the threshold was shared across all trajectories.
+        """
+        with self.session() as sess:
+            rows = (
+                sess.query(DBControllerLog)
+                .filter_by(run_id=run_id)
+                .order_by(DBControllerLog.created_at)
+                .all()
+            )
+            return pd.DataFrame([
+                {
+                    'traj_id': r.traj_id,
+                    'model_version': r.model_version,
+                    'threshold': r.threshold,
+                    'alpha': r.alpha,
+                    'mean_error': r.mean_error,
+                    'n_observations': r.n_observations,
+                    'created_at': r.created_at,
+                }
+                for r in rows
+            ])
 
     def has_chunk_event(
         self,
@@ -1437,8 +1606,8 @@ class TrajectoryDB:
                 traj_id=traj_id,
                 chunk_id=chunk_id,
                 attempt_index=attempt_index
-            ).order_by(DBChunkEvent.created_at.desc()).first()
-            
+            ).order_by(DBChunkEvent.created_at.desc(), DBChunkEvent.id.desc()).first()
+
             if not event:
                 return None
             return event.event_type
@@ -1459,7 +1628,7 @@ class TrajectoryDB:
                     func.row_number()
                     .over(
                         partition_by=DBChunkEvent.traj_id,
-                        order_by=DBChunkEvent.created_at.desc(),
+                        order_by=(DBChunkEvent.created_at.desc(), DBChunkEvent.id.desc()),
                     )
                     .label("rn"),
                 )
@@ -1648,12 +1817,36 @@ class TrajectoryDB:
             event = sess.query(DBTrainingEvent).filter_by(
                 run_id=run_id,
                 event_type=ChunkEventType.FINISHED_TRAINING
-            ).order_by(DBTrainingEvent.created_at.desc()).first()
-            
+            ).order_by(DBTrainingEvent.created_at.desc(), DBTrainingEvent.id.desc()).first()
+
             if not event:
                 return None
             return event.created_at
-    
+
+    def get_latest_training_event(self, run_id: str) -> Optional[dict]:
+        """Get the most recent training-level event of any type (for monitoring).
+
+        Args:
+            run_id: Run identifier
+
+        Returns:
+            Dict with event_type, training_round, created_at, or None if no
+            training events exist yet. A latest event_type of STARTED_TRAINING
+            means training round `training_round` is currently in progress.
+        """
+        with self.session() as sess:
+            event = sess.query(DBTrainingEvent).filter_by(
+                run_id=run_id
+            ).order_by(DBTrainingEvent.created_at.desc(), DBTrainingEvent.id.desc()).first()
+
+            if not event:
+                return None
+            return {
+                'event_type': event.event_type,
+                'training_round': event.training_round,
+                'created_at': event.created_at,
+            }
+
     def count_labeled_frames_for_chunk(
         self,
         run_id: str,
@@ -1939,14 +2132,14 @@ class TrajectoryDB:
         Returns:
             List of dicts with trajectory metadata, sorted by traj_id.
             Each dict contains:
-                - traj_id, target_length, chunks_completed, status, done
+                - traj_id, target_length, chunks_completed, status, failure_reason
                 - created_at, updated_at
         """
         with self.session() as sess:
             trajectories = sess.query(DBTrajectory).filter_by(
                 run_id=run_id
             ).order_by(DBTrajectory.traj_id).all()
-            
+
             result = []
             for traj in trajectories:
                 result.append({
@@ -1954,9 +2147,10 @@ class TrajectoryDB:
                     'target_length': traj.target_length,
                     'chunks_completed': traj.chunks_completed,
                     'status': traj.status,
+                    'failure_reason': traj.failure_reason,
                     'created_at': traj.created_at,
                     'updated_at': traj.updated_at
                 })
-            
+
             return result
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from ase.calculators.calculator import Calculator
@@ -18,6 +18,8 @@ if TYPE_CHECKING:
         TrainingFrame,
         Chunk
     )
+    import pandas as pd
+    from cascade.learning.finetuning import MultiHeadConfig
 
 @dataclass
 class CascadeAgentConfig:
@@ -55,8 +57,8 @@ class DynamicsRunnerConfig(CascadeAgentConfig):
     """Task to run dynamics"""
     learner: BaseLearnableForcefield
     """Learner to be used for dynamics"""
-    weights: bytes
-    """Initial weights for dynamics"""
+    weights: list[bytes]
+    """Initial weights for dynamics, one entry per ensemble member"""
     dyn_cls: type[Dynamics]
     """ASE dynamics integrator"""
     dyn_kws: dict[str, object] | None
@@ -66,6 +68,15 @@ class DynamicsRunnerConfig(CascadeAgentConfig):
     device: str = 'cpu'
     """Device to run learner for dynamics"""
     model_version: int = 0  # todo: I am not so sure this belongs here
+    uq_hook: Callable[[Atoms], tuple[dict, dict]] | None = None
+    """Optional hook called on each frame to compute UQ from an ensemble calculator's results"""
+    uq_kws: dict[str, object] = field(default_factory=dict)
+    """Keyword arguments passed to uq_hook"""
+    gpu_flush_interval: int = 10
+    """How often advance_dynamics releases PyTorch's CUDA caching allocator"""
+    max_audit_retries: int | None = None
+    """Max consecutive audit failures a single chunk may accumulate before the
+    trajectory is marked FAILED. None (default) means retry indefinitely"""
 
 
 @dataclass
@@ -77,6 +88,9 @@ class AuditorConfig(CascadeAgentConfig):
     """Keyword arguments to audit_task"""
     executor: Executor
     """Where to run audit task"""
+    random_fail_rate: float = 0.0
+    """If > 0, the Auditor wraps audit_task so a PASSED result is randomly downgraded
+    to FAILED at this frequency, independent of audit_task's own pass/fail logic"""
 
 
 @dataclass
@@ -88,6 +102,10 @@ class SamplerConfig(CascadeAgentConfig):
     """Where to run sample_task"""
     sample_task: Callable[..., list[TrainingFrame]]
     """Method that returns unlabled training frames given a trajectory chunk"""
+    burn_in_model_versions: int = 0
+    """Chunks with model_version below this count use burn_in_n_frames instead of n_frames"""
+    burn_in_n_frames: int | None = None
+    """Frames to sample per chunk while model_version < burn_in_model_versions (falls back to n_frames if unset)"""
 
 
 @dataclass
@@ -99,13 +117,31 @@ class LabelerConfig(CascadeAgentConfig):
     """Create the calculator to use for labeling"""
     label_task: Callable[[TrainingFrame, Callable[..., Calculator]], TrainingFrame]
     """Adds labels to training frames"""
+    error_fn: Callable[[Atoms, Atoms], float]
+    """(predicted_atoms, labeled_atoms) -> observed error, recorded for Controller calibration"""
+    uq_field: str = 'uq_force_std_max'
+    """atoms.info key holding the UQ scalar recorded at sample time"""
+
+
+@dataclass
+class ControllerConfig(CascadeAgentConfig):
+    """Configuration for Controller agent"""
+    target_ferr: float
+    """Target observed error (Eq. 1/3 of the proxima paper)"""
+    history_length: int = 8
+    """Max number of observations pulled per calibration window"""
+    burn_in_model_versions: int = 0
+    """Ignore calibration observations sampled below this model version"""
+    per_trajectory_threshold: bool = False
+    """If set, calibrate each trajectory's alpha/threshold independently
+    instead of pooling all trajectories into one shared threshold"""
 
 @dataclass
 class TrainerConfig(CascadeAgentConfig):
     """Configuration for Trainer agent"""
-    weights: bytes
-    """Initial weights for trainer"""
-    training_task: Callable[..., bytes]
+    weights: list[bytes]
+    """Current weights for each ensemble member"""
+    training_task: Callable[..., tuple[bytes, pd.DataFrame]]
     """Returns trained model weights"""
     training_args: list | tuple
     """passed to training_task"""
@@ -114,6 +150,12 @@ class TrainerConfig(CascadeAgentConfig):
     learner: BaseLearnableForcefield
     executor: Executor
     """Where to run training_task"""
+    bootstrap_fraction: float = 1.0
+    """Fraction of available training frames to resample (with replacement) per ensemble member"""
+    replay: MultiHeadConfig | None = None
+    """Multi-head replay config (see cascade.learning.finetuning.MultiHeadConfig), passed through
+    to learner.train to prevent catastrophic forgetting. Only meaningful for learners whose train()
+    accepts a `replay` kwarg (currently MACEInterface)."""
 
 
 @dataclass
