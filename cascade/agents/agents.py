@@ -276,7 +276,8 @@ class Auditor(CascadeAgent):
         self.logger.info(f'Submitting audit of traj {chunk.traj_id} chunk {chunk.chunk_id} attempt {chunk.attempt_ix} to executor')
 
         audit_kws = {**self.config.audit_kws}
-        audit_kws['threshold'] = self.thresholds.get(chunk.traj_id, self.default_threshold)
+        if 'threshold' in self.config.audit_kws:
+            audit_kws['threshold'] = self.thresholds.get(chunk.traj_id, self.default_threshold)
 
         future = self.config.executor.submit(
             self.audit_task,
@@ -436,6 +437,7 @@ class Sampler(CascadeAgent):
         sample_kws = dict(n_frames=n_frames, reason=audit_reason)
         if audit_threshold is not None:
             # omit: some strategies have defaults we dont want to override with None
+            sample_kws['threshold'] = audit_threshold
         future = self.config.executor.submit(
             self.config.sample_task,
             chunk,
