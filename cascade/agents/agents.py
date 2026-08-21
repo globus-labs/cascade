@@ -320,9 +320,7 @@ class Controller(CascadeAgent):
     Based on the alpha and threshold updates from cascade.proxima.SerialLearningCalculator.
 
     When config.per_trajectory_threshold is set, each trajectory gets its own
-    independently calibrated alpha/threshold, fit only from that trajectory's own
-    observations. Otherwise (the default) all trajectories share one calibration
-    pooled across the whole run, matching the original behavior.
+    independently calibrated alpha/threshold, otherwise they are shared.
     """
 
     def __init__(
@@ -374,7 +372,7 @@ class Controller(CascadeAgent):
             self.alpha[key] = alpha
 
             if key not in self.threshold:
-                # initial, conservative estimate (make this tuneable?)
+                # initial, conservative estimate (todo: make this tuneable?)
                 self.threshold[key] = self.config.target_ferr / alpha / 2
             else:
                 current_err = float(np.mean(obs_errors))
