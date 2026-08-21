@@ -171,8 +171,7 @@ def parse_args() -> argparse.Namespace:
         '--audit-threshold',
         type=float,
         default=0.1,
-        help='Initial UQ threshold for the "uq_threshold" audit strategy, used as a seed '
-             'until --target-ferr calibration produces a real value (if enabled)'
+        help='Used by the uq_threshold audit strategy if the controller is not being used'
     )
     parser.add_argument(
         '--target-ferr',
