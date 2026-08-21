@@ -13,9 +13,7 @@ import logging
 import os
 import warnings
 from concurrent.futures import as_completed
-from functools import partial
 
-from mace.calculators import mace_mp
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 from parsl.providers import LocalProvider
@@ -42,10 +40,27 @@ def parse_args() -> argparse.Namespace:
         help='Number of steps to run per trajectory'
     )
     parser.add_argument(
+        '--calc-type',
+        type=str,
+        choices=['mace', 'fairchem'],
+        default='mace',
+        help='Which reference calculator family to use'
+    )
+    parser.add_argument(
         '--calc-model',
         type=str,
         default='medium',
-        help='MACE-MP model size for the reference calculator'
+        help='For --calc-type=mace, a MACE-MP model size (e.g. "medium") or path to a MACE '
+             'checkpoint. For --calc-type=fairchem, the path to a FairChem .pt checkpoint.'
+    )
+    parser.add_argument(
+        '--calc-task',
+        type=str,
+        default=None,
+        help='FairChem task name selecting the model head (e.g. "omol", "omat", "oc20", '
+             '"odac", "omc"), ignored for --calc-type=mace. Only needed for --calc-type=fairchem '
+             'if the checkpoint supports more than one task; single-task checkpoints infer it '
+             'automatically.'
     )
     parser.add_argument(
         '--device',
@@ -88,7 +103,9 @@ def run_reference_trajectory(
     run_id: str,
     db_url: str,
     target_length: int,
+    calc_type: str,
     calc_model: str,
+    calc_task: str | None,
     device: str,
     log_level: str,
     log_interval: int,
@@ -104,9 +121,8 @@ def run_reference_trajectory(
     from cascade.utils import canonicalize
     from cascade.traj_config import get_dynamics_cls, resolve_dyn_kws, prepare_atoms_for_dynamics
     from cascade.model import AuditStatus
-    from mace.calculators import mace_mp
-    from functools import partial
-    calc_factory = partial(mace_mp, model=calc_model, device=device, default_dtype="float32")
+    from cascade.calculator import get_calc_factory
+    calc_factory = get_calc_factory(calc_type, calc_model, device, calc_task)
     is_cuda = torch.cuda.is_available() and 'cuda' in device
 
     logging.basicConfig(level=log_level)
@@ -229,7 +245,8 @@ def main():
         futures = [
             pool.submit(
                 run_reference_trajectory,
-                traj_id, cfg, run_id, args.db_url, args.target_length, args.calc_model, args.device, args.log_level, args.log_interval,
+                traj_id, cfg, run_id, args.db_url, args.target_length,
+                args.calc_type, args.calc_model, args.calc_task, args.device, args.log_level, args.log_interval,
             )
             for traj_id, cfg in enumerate(init_configs)
         ]
