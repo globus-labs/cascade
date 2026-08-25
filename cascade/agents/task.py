@@ -12,6 +12,7 @@ import torch
 
 from cascade.model import AuditResult, AuditStatus
 from cascade.utils import canonicalize
+from cascade.traj_config import extract_dyn_state, restore_dyn_state
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -162,7 +163,7 @@ def advance_dynamics(
     uq_hook: Callable[[Atoms], tuple[dict, dict]] | None = None,
     uq_kws: dict[str, object] | None = None,
     gpu_flush_interval: int = 10,
-) -> list[Atoms]:
+) -> tuple[list[Atoms], dict | None]:
     """Advance dynamics of a chunk of a trajectory
 
     Arguments:
@@ -208,6 +209,7 @@ def advance_dynamics(
 
     logger.info('Creating dynamics class')
     dyn = dyn_cls(atoms, **dyn_kws)
+    restore_dyn_state(dyn, spec.dyn_state)
 
     frames = []
 
@@ -241,7 +243,8 @@ def advance_dynamics(
     flush_gpu_memory()
     os.remove(logfile)
 
-    return frames
+    new_dyn_state = extract_dyn_state(dyn)
+    return frames, new_dyn_state
 
 
 def ensemble_force_deviation_uq(atoms: Atoms) -> tuple[dict[str, np.ndarray], dict[str, float]]:
