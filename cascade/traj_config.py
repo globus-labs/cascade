@@ -151,16 +151,9 @@ def _restore_mtknpt_state(dyn: MTKNPT, state: dict) -> None:
 
 @dataclass(frozen=True)
 class IntegratorSpec:
-    """Everything cascade needs to know about one supported ASE dynamics integrator:
-    how to build it from an InitialTrajConfig, how to preprocess atoms for it, and how
-    to save/restore its state across a chunk boundary (chunks run as separate executor
-    tasks, so a fresh integrator is constructed each chunk; without saving/restoring
-    state, integrators with extended-system degrees of freedom - e.g. NPT-family
-    barostats/thermostats - would restart from rest at every chunk boundary)."""
+    """Allows us to pass parameters and state across exchange and through pickle"""
     ase_cls: type[ase.md.md.MolecularDynamics]
     config_cls: type | None = None
-    """Friendly-unit dataclass (with to_ase_kwargs()) for this integrator's dyn_kws,
-    or None to pass dyn_kws through to the ASE constructor as-is."""
     extract_state: Callable[[ase.md.md.MolecularDynamics], dict | None] = staticmethod(lambda dyn: None)
     restore_state: Callable[[ase.md.md.MolecularDynamics, dict], None] = staticmethod(lambda dyn, state: None)
     prepare_atoms: Callable[[Atoms], Atoms] = staticmethod(lambda atoms: atoms)
@@ -174,6 +167,7 @@ class IntegratorSpec:
         return kws
 
 
+# SUPPORTED INTEGRATOR REGISTRY
 INTEGRATORS: dict[str, IntegratorSpec] = {
     'velocity-verlet': IntegratorSpec(ase_cls=VelocityVerlet),
     'npt': IntegratorSpec(
