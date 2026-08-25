@@ -108,6 +108,53 @@ def resolve_dyn_kws(cfg: InitialTrajConfig) -> dict:
     return {'timestep': cfg.dt_fs * units.fs, **cfg.dyn_kws}
 
 
+def extract_dyn_state(dyn: ase.md.md.MolecularDynamics) -> dict | None:
+    """Snapshot the extended-system (barostat/thermostat) state of an NPT-family
+    integrator so it can be restored on the next chunk.
+
+    NPT-family integrators keep their barostat/thermostat degrees of freedom as
+    attributes on the Dynamics instance rather than on Atoms, and ASE zeroes them
+    unconditionally in __init__. Without this, reconstructing a fresh integrator
+    for every chunk (necessary since chunks run as separate executor tasks) makes
+    the barostat/thermostat restart from rest at every chunk boundary.
+
+    Returns None for dynamics classes with no such state (e.g. VelocityVerlet).
+    """
+    if isinstance(dyn, MTKNPT):
+        return {
+            'p_g': dyn._p_g.copy(),
+            'thermostat_eta': dyn._thermostat._eta.copy(),
+            'thermostat_p_eta': dyn._thermostat._p_eta.copy(),
+            'barostat_xi': dyn._barostat._xi.copy(),
+            'barostat_p_xi': dyn._barostat._p_xi.copy(),
+        }
+    elif isinstance(dyn, NPT):
+        return dyn.get_data()
+    return None
+
+
+def restore_dyn_state(dyn: ase.md.md.MolecularDynamics, state: dict | None) -> None:
+    """Inverse of extract_dyn_state: re-inject a prior chunk's extended-system
+    state into a freshly constructed integrator, in place.
+
+    For classic NPT this mirrors ASE's own read_from_trajectory restore pattern
+    (construct normally, setattr the get_data() fields, leave `initialized`
+    unset so the next run() call's own initialize() bootstrap derives h_past/
+    q_past consistently from the restored eta/zeta).
+    """
+    if state is None:
+        return
+    if isinstance(dyn, MTKNPT):
+        dyn._p_g = state['p_g']
+        dyn._thermostat._eta = state['thermostat_eta']
+        dyn._thermostat._p_eta = state['thermostat_p_eta']
+        dyn._barostat._xi = state['barostat_xi']
+        dyn._barostat._p_xi = state['barostat_p_xi']
+    elif isinstance(dyn, NPT):
+        for k, v in state.items():
+            setattr(dyn, k, v)
+
+
 def _upper_triangular_cell(atoms: Atoms) -> Atoms:
     """Rigidly rotate a structure's cell + positions so the cell matrix becomes upper
     triangular, preserving all lengths, angles, and volume.
