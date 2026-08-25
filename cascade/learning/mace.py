@@ -218,7 +218,8 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
               reset_weights: bool = False,
               patience: int | None = None,
               num_freeze: int | None = None,
-              replay: MultiHeadConfig | None = None
+              replay: MultiHeadConfig | None = None,
+              grad_clip_norm: float = 10.,
               ) -> tuple[bytes, pd.DataFrame]:
         """Train a model
 
@@ -238,6 +239,8 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
             num_freeze: Number of layers to freeze. Starts from the top of the model (node embedding)
                 See: `Radova et al. <https://arxiv.org/html/2502.15582v1>`_
             replay: Settings for replaying an initial training set
+            grad_clip_norm: Max gradient norm for clipping; guards against a single bad batch
+                (e.g. an unstable/collided sampled structure) blowing up the model weights
         Returns:
             - model: Retrained model
             - history: Training history
@@ -302,7 +305,16 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
                 compute_stress=True,
             )
             loss = criterion(pred=y, ref=batch)
+
+            if not torch.isfinite(loss):
+                logger.warning(
+                    f'Non-finite loss ({loss.item()}) at epoch {engine.state.epoch - 1}; '
+                    'skipping this batch\'s update'
+                )
+                return float('nan')
+
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             opt.step()
 
             # Get the training stats

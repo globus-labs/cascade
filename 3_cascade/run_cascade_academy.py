@@ -143,7 +143,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--burn-in-rounds',
         type=int,
-        default=0,
+        default=1,
         help='Force-fail (and sample) chunks with model_version below this count, '
              'so the ensemble gets some real disagreement before the audit is load-bearing'
     )
@@ -312,6 +312,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--replay-frequency', default=1, type=int, help='How often to replay')
     parser.add_argument('--replay-lr-reduction', default=1, type=float, help='Factor by which to reduce LR during replay')
     parser.add_argument('--replay-batch-size', default=None, type=int, help='Batch size used during replay')
+    parser.add_argument(
+        '--min-interatomic-distance',
+        type=float,
+        default=0.5,
+        help='Training frames with a labeled-atoms minimum interatomic distance below this '
+             '(Angstrom) are dropped before training'
+    )
+    parser.add_argument(
+        '--max-training-retries',
+        type=int,
+        default=1,
+        help='If a member\'s training run diverges (non-finite validation loss), retry it with a '
+             'fresh bootstrap draw up to this many times before keeping its previous weights'
+    )
     args = parser.parse_args()
 
     args.per_trajectory_threshold = bool(args.per_trajectory_threshold)
@@ -543,6 +557,8 @@ async def main():
                 ),
                 learner=learner,
                 replay=replay,
+                min_interatomic_distance=args.min_interatomic_distance,
+                max_training_retries=args.max_training_retries,
             )
 
             # launch all agents

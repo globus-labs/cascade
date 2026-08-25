@@ -156,6 +156,12 @@ class TrainerConfig(CascadeAgentConfig):
     """Multi-head replay config (see cascade.learning.finetuning.MultiHeadConfig), passed through
     to learner.train to prevent catastrophic forgetting. Only meaningful for learners whose train()
     accepts a `replay` kwarg (currently MACEInterface)."""
+    min_interatomic_distance: float = 0.5
+    """Training frames with a labeled-atoms minimum interatomic distance below this (Angstrom) are
+    dropped before training -- guards against training on unphysical/collided sampled structures"""
+    max_training_retries: int = 1
+    """If a member's training run diverges (non-finite validation loss), retry it with a fresh
+    bootstrap draw up to this many times before giving up and keeping its previous weights"""
 
 
 @dataclass
