@@ -62,6 +62,9 @@ class AdvanceSpec:
     """Attempt index for this chunk"""
     steps: int
     """How many steps to run dynamics for"""
+    dyn_state: dict | None = None
+    """Integrator extended-system state (barostat/thermostat) carried over from
+    the previous chunk, or None to start from rest (e.g. at chunk 0)"""
 
 
 class AuditStatus(Enum):

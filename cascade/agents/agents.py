@@ -61,6 +61,7 @@ class DynamicsRunner(CascadeAgent):
 
         # pull out variables that may change from config
         self.atoms = config.atoms.copy()
+        self.dyn_state: dict | None = None
         self.init_chunk_size = config.chunk_size
         self.chunk_size = config.chunk_size
         self.model_version = config.model_version
@@ -92,6 +93,7 @@ class DynamicsRunner(CascadeAgent):
                 traj_id=self.config.traj_id,
                 chunk_id=self.chunk_ix,
                 attempt_index=self.attempt,
+                dyn_state=self.dyn_state,
             )
 
             self.logger.info(f"Running dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index} with {spec.steps} steps")
@@ -142,7 +144,7 @@ class DynamicsRunner(CascadeAgent):
             wrapped_future = wrap_future(chunk_future)
             try:
                 await wrapped_future
-                chunk_atoms = wrapped_future.result()
+                chunk_atoms, new_dyn_state = wrapped_future.result()
             except Exception as exc:
                 reason = f"dynamics failed for chunk {spec.chunk_id} attempt {spec.attempt_index}: {exc!r}"
                 self.logger.error(f"Traj {self.config.traj_id} {reason}")
@@ -214,6 +216,7 @@ class DynamicsRunner(CascadeAgent):
                 else:
                     # audit passed but not done: use the new atoms to run a new chunk in next pass of while loop
                     self.atoms = chunk_atoms[-1]
+                    self.dyn_state = new_dyn_state
                     self.chunk_ix += 1
                     self.attempt = 0
                     self.logger.info(f"Updating traj {self.config.traj_id} to chunk {self.chunk_ix} attempt {self.attempt}")
