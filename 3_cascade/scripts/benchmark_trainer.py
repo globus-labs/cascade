@@ -2,13 +2,18 @@
 """Benchmark MACE Trainer batch_size / num_epochs against real labeled data.
 
 Sweeps every combination of candidate batch_size x replay_batch_size (a 1x1
-grid when replay is off or only one of each is given).
+grid when replay is off or only one of each is given). Each candidate trains
+an ensemble of --n-ensemble members, routed through cascade.agents.task.train
+(the same task cascade.agents.agents.Trainer.train_model submits in
+production) via a Parsl executor, bootstrapping each member's training set
+the same way Trainer.train_model does.
 
-Records wall-clock time, peak GPU memory, and per-epoch train/valid loss ]
+Records wall-clock time and per-epoch train/valid loss.
 
 Example:
     python scripts/benchmark_trainer.py --run-id my-reference-run \\
-        --batch-sizes 4,8,16,32,64 --num-epochs 200 --patience 10 --device cuda
+        --batch-sizes 4,8,16,32,64 --num-epochs 200 --patience 10 --device cuda \\
+        --n-ensemble 4
 """
 from __future__ import annotations
 
@@ -18,21 +23,24 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from ase.io import read
 from mace.calculators import mace_mp
+from parsl.concurrent import ParslPoolExecutor
+from parsl.config import Config
+from parsl.executors import HighThroughputExecutor
+from parsl.providers import LocalProvider
+from parsl.usage_tracking.levels import LEVEL_1
 from sklearn.model_selection import train_test_split
 
 from cascade.agents.db_orm import TrajectoryDB
+from cascade.agents.task import train as training_task
 from cascade.learning.finetuning import MultiHeadConfig
 from cascade.learning.mace import MACEInterface
 
-PHASE_MEMORY_FIELDS = [
-    'peak_gpu_mb_train', 'peak_gpu_mb_valid', 'peak_gpu_mb_replay',
-    'reserved_gpu_mb_train', 'reserved_gpu_mb_valid', 'reserved_gpu_mb_replay',
-]
-SUMMARY_FIELDS = ['batch_size', 'replay_batch_size', 'status', 'epochs_run', 'wall_clock_s', 'sec_per_epoch',
-                   'peak_gpu_mb', 'final_valid_loss', 'n_train', 'n_atoms_train'] + PHASE_MEMORY_FIELDS
+SUMMARY_FIELDS = ['batch_size', 'replay_batch_size', 'member_index', 'status', 'epochs_run',
+                   'wall_clock_s', 'sec_per_epoch', 'final_valid_loss', 'n_train', 'n_atoms_train']
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,7 +98,29 @@ def parse_args() -> argparse.Namespace:
         '--out-dir',
         type=str,
         default='benchmark_trainer_out',
-        help='Where summary.csv and per-batch-size epoch CSVs are written',
+        help='Where summary.csv and per-member epoch CSVs are written',
+    )
+    parser.add_argument(
+        '--n-ensemble',
+        type=int,
+        default=1,
+        help='Ensemble members trained per (batch_size, replay_batch_size) candidate, each on an '
+             'independent bootstrap resample -- mirrors the bootstrap/submit/gather loop '
+             'cascade.agents.agents.Trainer.train_model uses in production',
+    )
+    parser.add_argument(
+        '--max-workers',
+        type=int,
+        default=None,
+        help='Max concurrent Parsl training tasks (defaults to --n-ensemble, i.e. full concurrency, '
+             'matching production). Lower this if concurrent ensemble members OOM on a shared GPU.',
+    )
+    parser.add_argument(
+        '--bootstrap-fraction',
+        type=float,
+        default=1.0,
+        help='Fraction of train_data resampled with replacement per ensemble member '
+             "(matches TrainerConfig's default of 1.0)",
     )
     parser.add_argument('--replay-dataset', default=None, help='Path to an ASE database containing data to replay during finetuning')
     parser.add_argument('--replay-downselect', default=None, type=int, help='Max number of entries to use from replay dataset')
@@ -153,83 +183,103 @@ def _load_data(db: TrajectoryDB, run_id: str, traj_id: int | None, max_frames: i
     return atoms
 
 
-def _read_completed_combos(summary_path: Path) -> set[tuple[int, str]]:
+def _read_completed_combos(summary_path: Path) -> set[tuple[int, str, int]]:
+    """(batch_size, replay_batch_size_label, member_index) triples already recorded.
+
+    Rows from a pre-ensemble summary.csv (no member_index column, e.g. an --out-dir reused
+    from before this script trained ensembles) are skipped rather than treated as a completed
+    member 0, since they weren't trained on a bootstrap resample and aren't a like-for-like
+    match for the new per-member semantics.
+    """
     if not summary_path.exists():
         return set()
+    completed = set()
     with open(summary_path, newline='') as f:
-        return {(int(row['batch_size']), row['replay_batch_size']) for row in csv.DictReader(f)}
+        for row in csv.DictReader(f):
+            if not row.get('member_index'):
+                continue
+            completed.add((int(row['batch_size']), row['replay_batch_size'], int(row['member_index'])))
+    return completed
 
 
-def _run_candidate(learner: MACEInterface, weights: bytes, train_data: list, valid_data: list,
-                    batch_size: int, args: argparse.Namespace, epoch_path: Path, is_cuda: bool,
-                    replay: MultiHeadConfig | None, replay_label: str) -> dict:
-    """Train one (batch_size, replay_batch_size) combination, writing its per-epoch loss live to epoch_path."""
-    tag = f'batch_size={batch_size} replay_batch_size={replay_label}'
-    epoch_writer = None
-    with open(epoch_path, 'w', newline='') as ef:
+def _run_ensemble_candidate(pool: ParslPoolExecutor, learner: MACEInterface, init_ensemble_weights: list[bytes],
+                             train_data: list, valid_data: list, batch_size: int,
+                             replay: MultiHeadConfig | None, replay_label: str, args: argparse.Namespace,
+                             out_dir: Path, completed_members: set[int]):
+    """Submit one bootstrapped training_task per not-yet-completed ensemble member for this
+    (batch_size, replay) candidate -- mirrors Trainer.train_model's bootstrap/submit/gather loop.
 
-        def on_epoch(row: dict) -> None:
-            nonlocal epoch_writer
-            if epoch_writer is None:
-                epoch_writer = csv.DictWriter(ef, fieldnames=list(row))
-                epoch_writer.writeheader()
-            epoch_writer.writerow(row)
-            ef.flush()
+    Yields each member's result as soon as it's ready (rather than returning a fully-materialized
+    list), so the caller can write summary.csv rows incrementally -- otherwise a crash partway
+    through the ensemble would lose the summary row for every already-finished member too, even
+    though their epoch CSVs were already safely on disk.
+    """
+    rng = np.random.default_rng()
+    n_sample = int(len(train_data) * args.bootstrap_fraction)
+    train_kws = dict(num_epochs=args.num_epochs, batch_size=batch_size,
+                      device=args.device, patience=args.patience)
 
-        if is_cuda:
-            torch.cuda.reset_peak_memory_stats(args.device)
-        t0 = time.perf_counter()
-        status = 'ok'
-        log = None
-        try:
-            _, log = learner.train(
-                weights, train_data, valid_data,
-                num_epochs=args.num_epochs, batch_size=batch_size,
-                device=args.device, patience=args.patience,
-                epoch_callback=on_epoch, replay=replay,
-            )
-        except RuntimeError as e:
-            if not _is_oom(e):
-                raise
-            status = 'oom'
-            print(f'{tag}: OOM, recording partial progress and continuing')
-        wall_s = time.perf_counter() - t0
+    pending = {}
+    for member_index, member_weights in enumerate(init_ensemble_weights):
+        if member_index in completed_members:
+            continue
+        boot_idx = rng.integers(0, len(train_data), size=n_sample)
+        boot_data = [train_data[i] for i in boot_idx]
+        future = pool.submit(
+            training_task,
+            learner=learner,
+            weights=member_weights,
+            train_data=boot_data,
+            valid_data=valid_data,
+            train_kws=train_kws,
+            replay=replay,
+        )
+        pending[member_index] = {
+            'future': future,
+            't_submit': time.perf_counter(),
+            'n_train': len(boot_data),
+            'n_atoms_train': sum(len(a) for a in boot_data),
+        }
 
-    peak_mb = torch.cuda.max_memory_allocated(args.device) / 1e6 if is_cuda else 0.0
+    for member_index, meta in pending.items():
+        yield _collect_member_result(meta, member_index, batch_size, replay_label, out_dir)
 
-    with open(epoch_path, newline='') as ef2:
-        epoch_rows = list(csv.DictReader(ef2))
+
+def _collect_member_result(meta: dict, member_index: int, batch_size: int, replay_label: str,
+                            out_dir: Path) -> dict:
+    tag = f'batch_size={batch_size} replay_batch_size={replay_label} member={member_index}'
+    status, log = 'ok', None
+    try:
+        _, log = meta['future'].result()
+    except Exception as e:
+        if not _is_oom(e):
+            raise
+        status = 'oom'
+        print(f'{tag}: OOM, recording partial result and continuing (other members unaffected)')
+    wall_s = time.perf_counter() - meta['t_submit']
 
     if log is not None and len(log):
+        epoch_path = out_dir / f'bs{batch_size}_replay{replay_label}_member{member_index}_epochs.csv'
+        log.to_csv(epoch_path, index=False)
         epochs_run = int(log['epoch'].max()) + 1
         last_epoch = log[log['epoch'] == log['epoch'].max()]
         valid_col = 'total_loss_valid' if 'total_loss_valid' in log.columns else None
         final_valid_loss = float(last_epoch[valid_col].mean()) if valid_col else ''
     else:
         epochs_run, final_valid_loss = 0, ''
-        if epoch_rows:
-            epochs_run = len(epoch_rows)
-            final_valid_loss = epoch_rows[-1].get('total_loss_valid', '')
 
-    result = {
+    return {
         'batch_size': batch_size,
         'replay_batch_size': replay_label,
+        'member_index': member_index,
         'status': status,
         'epochs_run': epochs_run,
-        'n_train': len(train_data),
-        'n_atoms_train': sum(len(a) for a in train_data),
+        'n_train': meta['n_train'],
+        'n_atoms_train': meta['n_atoms_train'],
         'wall_clock_s': round(wall_s, 2),
         'sec_per_epoch': round(wall_s / epochs_run, 3) if epochs_run else '',
-        'peak_gpu_mb': round(peak_mb, 1),
         'final_valid_loss': final_valid_loss,
     }
-
-    for col in PHASE_MEMORY_FIELDS:
-        values = [float(r[col]) for r in epoch_rows if r.get(col)]
-        if values:
-            result[col] = round(max(values), 1)
-
-    return result
 
 
 def main() -> None:
@@ -248,16 +298,33 @@ def main() -> None:
 
     learner = MACEInterface()
     init_weights = learner.serialize_model(learner.get_model(mace_mp(args.base_model).models[0]))
+    init_ensemble_weights = [init_weights] * args.n_ensemble
     replay_variants = _build_replay_variants(args)
 
     batch_sizes = [int(b) for b in args.batch_sizes.split(',')]
     completed = _read_completed_combos(summary_path)
-    is_cuda = torch.cuda.is_available() and 'cuda' in args.device
-    print(f'Sweeping {len(batch_sizes)} batch_size x {len(replay_variants)} replay_batch_size = '
-          f'{len(batch_sizes) * len(replay_variants)} combinations')
+    max_workers = args.max_workers or args.n_ensemble
+
+    n_total = len(batch_sizes) * len(replay_variants) * args.n_ensemble
+    print(f'Sweeping {len(batch_sizes)} batch_size x {len(replay_variants)} replay_batch_size x '
+          f'{args.n_ensemble} ensemble members = {n_total} training tasks ({max_workers} concurrent)')
+
+    config = Config(
+        executors=[
+            HighThroughputExecutor(
+                label='htex_local',
+                max_workers_per_node=max_workers,
+                provider=LocalProvider(
+                    init_blocks=1,
+                    max_blocks=1,
+                ),
+            )
+        ],
+        usage_tracking=LEVEL_1,
+    )
 
     write_header = not summary_path.exists()
-    with open(summary_path, 'a', newline='') as sf:
+    with ParslPoolExecutor(config=config) as pool, open(summary_path, 'a', newline='') as sf:
         summary_writer = csv.DictWriter(sf, fieldnames=SUMMARY_FIELDS)
         if write_header:
             summary_writer.writeheader()
@@ -265,24 +332,29 @@ def main() -> None:
 
         for batch_size in batch_sizes:
             for replay, replay_label in replay_variants:
-                combo_key = (batch_size, replay_label)
-                if combo_key in completed:
-                    print(f'batch_size={batch_size} replay_batch_size={replay_label}: already in {summary_path}, skipping')
+                completed_members = {
+                    m for (bs, rl, m) in completed if bs == batch_size and rl == replay_label
+                }
+                if len(completed_members) == args.n_ensemble:
+                    print(f'batch_size={batch_size} replay_batch_size={replay_label}: all '
+                          f'{args.n_ensemble} members already in {summary_path}, skipping')
                     continue
 
-                print(f'batch_size={batch_size} replay_batch_size={replay_label}: starting')
-                epoch_path = out_dir / f'bs{batch_size}_replay{replay_label}_epochs.csv'
-                result = _run_candidate(
-                    learner, init_weights, train_data, valid_data, batch_size, args,
-                    epoch_path, is_cuda, replay, replay_label,
+                print(f'batch_size={batch_size} replay_batch_size={replay_label}: starting '
+                      f'({args.n_ensemble - len(completed_members)} of {args.n_ensemble} members)')
+                results = _run_ensemble_candidate(
+                    pool, learner, init_ensemble_weights, train_data, valid_data, batch_size,
+                    replay, replay_label, args, out_dir, completed_members,
                 )
 
-                summary_writer.writerow(result)
-                sf.flush()
-                print(
-                    f"batch_size={batch_size} replay_batch_size={replay_label}: status={result['status']} "
-                    f"epochs_run={result['epochs_run']} wall_s={result['wall_clock_s']} peak_gpu_mb={result['peak_gpu_mb']}"
-                )
+                for result in results:
+                    summary_writer.writerow(result)
+                    sf.flush()
+                    print(
+                        f"batch_size={batch_size} replay_batch_size={replay_label} "
+                        f"member={result['member_index']}: status={result['status']} "
+                        f"epochs_run={result['epochs_run']} wall_s={result['wall_clock_s']}"
+                    )
 
     print(f'Done. Summary at {summary_path}')
 

@@ -6,7 +6,7 @@ source /home/michael/miniconda3/etc/profile.d/conda.sh
 conda activate cascade
 source "${SLURM_SUBMIT_DIR:-$(dirname "${BASH_SOURCE[0]}")}/env_setup.sh"
 python scripts/benchmark_trainer.py \
-    --run-id reference-2026.08.07-17:51:00-bd260f \
+    --run-id reference-2026.08.21-19:31:10-43722e \
     --max-frames 1000 \
     --base-model small \
     --batch-sizes 2 \
@@ -14,11 +14,13 @@ python scripts/benchmark_trainer.py \
     --num-epochs 200 \
     --patience 15 \
     --device cuda:0 \
+    --n-ensemble 4 \
+    --max-workers 1 \
     --replay-dataset ./datasets/mace-mp/sampled_1000.traj \
-    --out-dir benchmark_trainer_out_batch_small_200
+    --out-dir benchmark_trainer_out_batch_small_200_ensemble4
 
 # python scripts/benchmark_trainer.py \
-#     --run-id reference-2026.08.07-17:51:00-bd260f \
+#     --run-id reference-2026.08.21-19:31:10-43722e \
 #     --max-frames 1000 \
 #     --base-model small \
 #     --batch-sizes 2 \
