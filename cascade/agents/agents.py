@@ -140,8 +140,16 @@ class DynamicsRunner(CascadeAgent):
 
             # get future result
             wrapped_future = wrap_future(chunk_future)
-            await wrapped_future
-            chunk_atoms = wrapped_future.result()
+            try:
+                await wrapped_future
+                chunk_atoms = wrapped_future.result()
+            except Exception as exc:
+                reason = f"dynamics failed for chunk {spec.chunk_id} attempt {spec.attempt_index}: {exc!r}"
+                self.logger.error(f"Traj {self.config.traj_id} {reason}")
+                self._traj_db.mark_trajectory_failed(run_id=self.config.run_id, traj_id=self.config.traj_id, reason=reason)
+                self.done = True
+                self.agent_shutdown()
+                continue
 
             # write atoms # todo wrap this up
             frame_ids = []
