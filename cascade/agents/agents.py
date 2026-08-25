@@ -140,8 +140,16 @@ class DynamicsRunner(CascadeAgent):
 
             # get future result
             wrapped_future = wrap_future(chunk_future)
-            await wrapped_future
-            chunk_atoms = wrapped_future.result()
+            try:
+                await wrapped_future
+                chunk_atoms = wrapped_future.result()
+            except Exception as exc:
+                reason = f"dynamics failed for chunk {spec.chunk_id} attempt {spec.attempt_index}: {exc!r}"
+                self.logger.error(f"Traj {self.config.traj_id} {reason}")
+                self._traj_db.mark_trajectory_failed(run_id=self.config.run_id, traj_id=self.config.traj_id, reason=reason)
+                self.done = True
+                self.agent_shutdown()
+                continue
 
             # write atoms # todo wrap this up
             frame_ids = []
@@ -550,32 +558,35 @@ class Trainer(CascadeAgent):
         self.config = config
         self.weights = deepcopy(config.weights)
 
-    @action
-    async def train_model(
-        self,
-        training_round: int,
-    ) -> list[bytes]:
-        from sklearn.model_selection import train_test_split
-        import numpy as np
+    def _filter_unphysical_frames(self, frames):
+        """Drop frames whose minimum interatomic distance is below a physically-plausible
+        threshold (e.g. from a collapsing/unstable cell), so training never sees collided
+        structures."""
+        kept = []
+        for atoms in frames:
+            dists = atoms.get_all_distances(mic=True)
+            np.fill_diagonal(dists, np.inf)
+            if dists.min() >= self.config.min_interatomic_distance:
+                kept.append(atoms)
+        n_dropped = len(frames) - len(kept)
+        if n_dropped:
+            self.logger.warning(
+                f'Dropped {n_dropped}/{len(frames)} training frames with min interatomic '
+                f'distance < {self.config.min_interatomic_distance} A'
+            )
+        return kept
 
-        self.logger.info(f'Fetching training data for training round {training_round}')
-        train_data = self._traj_db.get_training_frames(
-            self.config.run_id,
-            training_round=training_round,
-        )
-        if not train_data:
-            self.logger.warning(f'No training frames found for round {training_round}, skipping training')
-            return self.weights
-        self.logger.info(f'Got {len(train_data)} training frames')
-        train_data, valid_data = train_test_split(train_data, test_size=0.2)
-        self.logger.info(f'Train size: {len(train_data)}, val size: {len(valid_data)}')
+    @staticmethod
+    def _training_diverged(log) -> bool:
+        """Whether a member's returned training log shows the run diverged (non-finite loss)."""
+        loss_col = 'total_loss_valid' if 'total_loss_valid' in log.columns else 'total_loss_train'
+        return not np.isfinite(log[loss_col].iloc[-1])
 
-        rng = np.random.default_rng()
-        n_sample = int(len(train_data) * self.config.bootstrap_fraction)
-
-        self.logger.info(f'Submitting {len(self.weights)} bootstrapped training tasks')
-        futures = []
-        for member_weights in self.weights:
+    async def _train_member(self, member_index, member_weights, train_data, valid_data, n_sample, rng):
+        """Train one ensemble member, retrying with a fresh bootstrap draw if it diverges.
+        Falls back to this member's current weights (logging the diverged run for
+        observability) if it's still diverged after max_training_retries."""
+        for attempt in range(self.config.max_training_retries + 1):
             boot_idx = rng.integers(0, len(train_data), size=n_sample)
             boot_data = [train_data[i] for i in boot_idx]
             future = self.config.executor.submit(
@@ -587,8 +598,48 @@ class Trainer(CascadeAgent):
                 train_kws=self.config.training_kws,
                 replay=self.config.replay,
             )
-            futures.append(wrap_future(future))
+            new_weights, log = await wrap_future(future)
+            if not self._training_diverged(log):
+                return new_weights, log
+            remaining = self.config.max_training_retries - attempt
+            self.logger.warning(
+                f'Member {member_index} training diverged on attempt {attempt + 1}/'
+                f'{self.config.max_training_retries + 1}'
+                + (f'; retrying ({remaining} attempt(s) left)' if remaining > 0 else '; keeping previous weights')
+            )
+        return member_weights, log
 
+    @action
+    async def train_model(
+        self,
+        training_round: int,
+    ) -> list[bytes]:
+        from sklearn.model_selection import train_test_split
+
+        self.logger.info(f'Fetching training data for training round {training_round}')
+        train_data = self._traj_db.get_training_frames(
+            self.config.run_id,
+            training_round=training_round,
+        )
+        if not train_data:
+            self.logger.warning(f'No training frames found for round {training_round}, skipping training')
+            return self.weights
+        self.logger.info(f'Got {len(train_data)} training frames')
+        train_data = self._filter_unphysical_frames(train_data)
+        if not train_data:
+            self.logger.warning(f'All training frames for round {training_round} were filtered as unphysical, skipping training')
+            return self.weights
+        train_data, valid_data = train_test_split(train_data, test_size=0.2)
+        self.logger.info(f'Train size: {len(train_data)}, val size: {len(valid_data)}')
+
+        rng = np.random.default_rng()
+        n_sample = int(len(train_data) * self.config.bootstrap_fraction)
+
+        self.logger.info(f'Submitting {len(self.weights)} bootstrapped training tasks')
+        futures = [
+            self._train_member(member_index, member_weights, train_data, valid_data, n_sample, rng)
+            for member_index, member_weights in enumerate(self.weights)
+        ]
         results = await asyncio.gather(*futures)
 
         self.logger.info('Retrieving new weights')
