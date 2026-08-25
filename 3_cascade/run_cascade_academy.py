@@ -78,7 +78,13 @@ def parse_args() -> argparse.Namespace:
         '--log-level',
         type=str,
         default='INFO',
-        help='Logging levl'
+        help='Logging level'
+    )
+    parser.add_argument(
+        '--max-workers',
+        type=int,
+        default=None,
+        help='Max workers in the executor pool'
     )
     parser.add_argument(
         '--init-config-json',
@@ -416,7 +422,7 @@ async def main():
     # a new model while training is happening. can possibly do some math based on the retrain
     # logic to figure out the real max number of used workers
     # but this may not make as much sense once we distribute the workflow, so no worries for now
-    n_parsl_workers = len(initial_specs) + args.n_ensemble
+    n_parsl_workers = args.max_workers or len(initial_specs) + args.n_ensemble
     # only meaningful alongside the uq_threshold audit strategy, which is the
     # only audit_task that reads a 'threshold' kwarg
     use_controller = args.audit_task == 'uq_threshold' and args.target_ferr is not None
