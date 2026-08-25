@@ -185,6 +185,9 @@ def advance_dynamics(
         gpu_flush_interval: how often to release PyTorch's CUDA caching
             allocator back to the driver. Without this NPT dynamics will cause
             memory leaks through neighbor list size changes
+
+        Returns:
+            (traj, integrator_state)
     """
 
     uq_kws = uq_kws or {}
