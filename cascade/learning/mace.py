@@ -14,7 +14,7 @@ from ase import Atoms, data
 from ase.calculators.calculator import Calculator
 from ignite.engine import Engine, Events
 from mace.data import AtomicData
-from mace.data.utils import config_from_atoms
+from mace.data.utils import config_from_atoms, KeySpecification
 from mace.modules import WeightedHuberEnergyForcesStressLoss, ScaleShiftMACE
 from mace.tools import AtomicNumberTable
 from mace.tools.torch_geometric.dataloader import DataLoader
@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 MACEState = ScaleShiftMACE
 """Just the model, which we require being the MACE which includes scale shifting logic"""
 
+_KEYSPEC = KeySpecification.from_defaults()
+"""Key names MACE reads labels from (REF_energy/REF_forces/REF_stress)"""
+
 
 def _update_offset_factors(model: ScaleShiftMACE, train_data: list[Atoms], train_loader: DataLoader, device: str):
     """Update the atomic energies and scale offset layers of a model
@@ -42,10 +45,14 @@ def _update_offset_factors(model: ScaleShiftMACE, train_data: list[Atoms], train
     """
     # Update the atomic energies using the data from all trajectories
     z_table = AtomicNumberTable(model.atomic_numbers.cpu().numpy().tolist())
-    new_ae = model.atomic_energies_fn.atomic_energies.cpu().numpy()
+    raw_ae = model.atomic_energies_fn.atomic_energies.cpu().numpy()
+    has_head_dim = raw_ae.ndim == 2  # newer MACE models carry a size-1 head axis even when single-headed
+    new_ae = raw_ae[0].copy() if has_head_dim else raw_ae.copy()
     atomic_energies_dict = estimate_atomic_energies(train_data)
     for s, e in atomic_energies_dict.items():
         new_ae[z_table.zs.index(data.atomic_numbers[s])] = e
+    if has_head_dim:
+        new_ae = new_ae[None, :]
     with torch.no_grad():
         old_ae = model.atomic_energies_fn.atomic_energies
         model.atomic_energies_fn.atomic_energies = torch.from_numpy(new_ae).to(old_ae.dtype).to(old_ae.device)
@@ -107,32 +114,32 @@ def atoms_to_loader(atoms: list[Atoms], batch_size: int, z_table: AtomicNumberTa
     """
 
     def _prepare_atoms(my_atoms: Atoms):
-        """MACE expects the training outputs to be stored in `info` and `arrays`"""
+        """MACE reads training outputs from `info` and `arrays` under the keys in _KEYSPEC"""
         # Start with a copy of positions, which should be available always
         my_atoms.arrays.update({
             'positions': my_atoms.positions,
         })
 
         if my_atoms.calc is None:
-            return my_atoms  # No calc, no results
+            return my_atoms  # No calc; labels are already under the REF_ keys, if present at all
 
         # Now make an info dictionary if one doesn't exist yet
         if my_atoms.info is None:
             my_atoms.info = {}
 
-        # Copy over all property data which exists
+        # Copy over all property data into REF_keys
         if 'energy' in my_atoms.calc.results:
-            my_atoms.info['energy'] = my_atoms.get_potential_energy()
+            my_atoms.info['REF_energy'] = my_atoms.get_potential_energy()
 
         if 'stress' in my_atoms.calc.results:
-            my_atoms.info['stress'] = my_atoms.get_stress()
+            my_atoms.info['REF_stress'] = my_atoms.get_stress()
 
         if 'forces' in my_atoms.calc.results:
-            my_atoms.arrays['forces'] = my_atoms.get_forces()
+            my_atoms.arrays['REF_forces'] = my_atoms.get_forces()
 
         return my_atoms
 
-    atoms = [config_from_atoms(_prepare_atoms(a)) for a in atoms]
+    atoms = [config_from_atoms(_prepare_atoms(a), key_specification=_KEYSPEC) for a in atoms]
     return DataLoader(
         [AtomicData.from_config(c, z_table=z_table, cutoff=r_max) for c in atoms],
         batch_size=batch_size,
