@@ -10,9 +10,11 @@ from ase.optimize.optimize import Dynamics
 from mace.calculators import mace_mp
 import torch
 
-from cascade.model import AuditResult, AuditStatus
+from cascade.model import AuditResult, AuditStatus, TrajectoryDiverged
 from cascade.utils import canonicalize
 from cascade.traj_config import extract_dyn_state, restore_dyn_state
+
+_module_logger = logging.getLogger(__name__)
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -117,12 +119,17 @@ def boundary_uq_sample(
     field: str = 'uq_force_std_max',
     **kwargs
 ) -> list[TrainingFrame]:
-    """Frames clustered around the first frame that crossed threshold"""
+    """Frames leading up to and including the first frame that crossed threshold.
+
+    Never selects frames after the crossing -- anything past the point divergence
+    started is likely nonsense and not useful training data.
+    """
     values = np.array([a.info[field] for a in chunk.atoms])
     crossings = np.flatnonzero(values >= threshold)
     n_sample = min(n_frames, len(chunk.atoms))
     crossing_idx = int(crossings[0])
-    indices = sorted(range(len(chunk.atoms)), key=lambda i: abs(i - crossing_idx))[:n_sample]
+    start = max(0, crossing_idx - n_sample + 1)
+    indices = list(range(start, crossing_idx + 1))
     return _frames_from_indices(chunk, indices, n_sample)
 
 
@@ -163,6 +170,9 @@ def advance_dynamics(
     uq_hook: Callable[[Atoms], tuple[dict, dict]] | None = None,
     uq_kws: dict[str, object] | None = None,
     gpu_flush_interval: int = 10,
+    early_stop_threshold: float | None = None,
+    uq_field: str = 'uq_force_std_max',
+    catch_crashes: bool = True,
 ) -> tuple[list[Atoms], dict | None]:
     """Advance dynamics of a chunk of a trajectory
 
@@ -185,6 +195,16 @@ def advance_dynamics(
         gpu_flush_interval: how often to release PyTorch's CUDA caching
             allocator back to the driver. Without this NPT dynamics will cause
             memory leaks through neighbor list size changes
+        early_stop_threshold: if set, stop dynamics the first step whose
+            atoms.info[uq_field] >= this value, returning the frames captured so far
+            instead of running the full spec.steps. None disables early stopping.
+        uq_field: atoms.info key checked against early_stop_threshold each step
+        catch_crashes: if True (default), a hard crash (e.g. LinAlgError from the NPT
+            barostat) is also caught and treated like a controlled early stop. If
+            False, only a TrajectoryDiverged (UQ-threshold) stop is caught; a hard
+            crash propagates and fails the trajectory, same as before this feature
+            existed. Set False to test whether early_stop_threshold alone is
+            sufficient to prevent a crash, without the safety net masking it.
 
         Returns:
             (traj, integrator_state)
@@ -238,11 +258,36 @@ def advance_dynamics(
         logger.info('writing frame to db')
         frames.append(canonical_atoms)
 
+        if early_stop_threshold is not None and uq_field in atoms.info:
+            uq_value = atoms.info[uq_field]
+            if uq_value >= early_stop_threshold:
+                logger.warning(
+                    f'{uq_field}={uq_value:.4g} >= early-stop threshold '
+                    f'{early_stop_threshold:.4g} at frame {len(frames) - 1}; stopping chunk early'
+                )
+                raise TrajectoryDiverged(f'{uq_field}={uq_value:.4g} >= threshold {early_stop_threshold:.4g}')
+
     dyn.attach(write_frame)
     dyn.attach(flush_gpu_memory, interval=gpu_flush_interval)
 
     logger.info('Starting dynamics')
-    dyn.run(spec.steps, **run_kws)
+    try:
+        dyn.run(spec.steps, **run_kws)
+    except TrajectoryDiverged as exc:
+        # A controlled early stop: always caught. Returning the partial frames lets
+        # DynamicsRunner treat this as a short chunk through the normal pipeline
+        # instead of failing the whole trajectory.
+        msg = f'traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}: dynamics stopped early (TrajectoryDiverged): {exc}'
+        logger.warning(msg)
+        _module_logger.warning(msg)  # per-attempt logfile below is deleted; this one isn't
+    except Exception as exc:
+        if not catch_crashes:
+            raise
+        # Hard crash (e.g. LinAlgError from the NPT barostat), caught only because
+        # catch_crashes=True -- treated the same as a controlled early stop.
+        msg = f'traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}: dynamics stopped early ({type(exc).__name__}): {exc}'
+        logger.warning(msg)
+        _module_logger.warning(msg)
     flush_gpu_memory()
     os.remove(logfile)
 
