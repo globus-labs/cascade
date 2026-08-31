@@ -31,6 +31,13 @@ class AuditResult:
     reason: str | None = None
     """Which mechanism produced this result, e.g. 'threshold', 'burn_in', 'random_fail', 'random_accept'"""
 
+
+class TrajectoryDiverged(Exception):
+    """Raised from advance_dynamics's write_frame callback when a per-frame UQ score
+    crosses the calibrated threshold mid-chunk, or from a caught hard crash. The
+    triggering/last frame is already appended to `frames` before this is raised."""
+
+
 @dataclass
 class TrainingFrame:
     atoms: Atoms
@@ -85,6 +92,7 @@ class ChunkEventType(Enum):
     """Event types tracked for trajectory chunks"""
     STARTED_DYNAMICS = auto()
     FINISHED_DYNAMICS = auto()
+    DYNAMICS_DIVERGED = auto()
     STARTED_AUDIT = auto()
     AUDIT_PASSED = auto()
     AUDIT_FAILED = auto()
