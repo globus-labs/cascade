@@ -113,6 +113,9 @@ class DynamicsRunner(CascadeAgent):
                     attempt_index=spec.attempt_index,
                     event_type=ChunkEventType.STARTED_DYNAMICS,
                 )
+                early_stop_threshold = None
+                if self.config.early_stop_enabled:
+                    early_stop_threshold = await self.auditor.get_threshold(spec.traj_id)
                 # submit dynamics for evaluation
                 chunk_future = self.config.executor.submit(
                     self.config.advance_dynamics_task,
@@ -127,6 +130,9 @@ class DynamicsRunner(CascadeAgent):
                     uq_hook=self.config.uq_hook,
                     uq_kws=self.config.uq_kws,
                     gpu_flush_interval=self.config.gpu_flush_interval,
+                    early_stop_threshold=early_stop_threshold,
+                    uq_field=self.config.uq_field,
+                    catch_crashes=self.config.catch_crashes,
                 )
 
             #todo mt.2026.04.27 does this still need to be logged?
@@ -153,6 +159,19 @@ class DynamicsRunner(CascadeAgent):
                 self.agent_shutdown()
                 continue
 
+            # chunk_atoms includes one leading frame duplicating the previous chunk's
+            # endpoint (see the self.timestep update below) -- n_frames counts real
+            # new steps, matching the pre-dynamics placeholder call above.
+            self._traj_db.add_chunk_attempt(
+                run_id=self.config.run_id,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                model_version=self.model_version,
+                n_frames=len(chunk_atoms) - 1,
+                audit_status=AuditStatus.PENDING,
+                attempt_index=self.attempt,
+            )
+
             # write atoms # todo wrap this up
             frame_ids = []
             for frame_index, _atoms in enumerate(chunk_atoms):
@@ -174,6 +193,19 @@ class DynamicsRunner(CascadeAgent):
                 attempt_index=spec.attempt_index,
                 event_type=ChunkEventType.FINISHED_DYNAMICS,
             )
+            if len(chunk_atoms) - 1 < spec.steps:
+                self.logger.warning(
+                    f"Traj {self.config.traj_id} chunk {spec.chunk_id} attempt "
+                    f"{spec.attempt_index} stopped early after {len(chunk_atoms) - 1}/{spec.steps} steps"
+                )
+                self._traj_db.record_chunk_event(
+                    run_id=self.config.run_id,
+                    traj_id=spec.traj_id,
+                    chunk_id=spec.chunk_id,
+                    attempt_index=spec.attempt_index,
+                    event_type=ChunkEventType.DYNAMICS_DIVERGED,
+                    frame_id=frame_ids[-1],
+                )
 
             # submit to auditor
             chunk = Chunk(
@@ -205,7 +237,11 @@ class DynamicsRunner(CascadeAgent):
             if audit_result.status == AuditStatus.PASSED:
 
                 self.logger.info(f"Audit status passed for traj {self.config.traj_id} chunk {self.chunk_ix} attempt {self.attempt}")
-                self.timestep += self.chunk_size
+                # chunk_atoms includes one leading frame duplicating the previous
+                # chunk's endpoint (ASE calls observers once before the first step of
+                # a freshly-constructed Dynamics object) -- len(chunk_atoms) - 1 is
+                # always the real number of new steps integrated.
+                self.timestep += len(chunk_atoms) - 1
                 self.logger.info(f"On timestep {self.timestep} of {self.config.n_steps}")
                 self.done = self.timestep >= self.config.n_steps
                 if self.done:
@@ -280,6 +316,10 @@ class Auditor(CascadeAgent):
         else:
             self.thresholds[traj_id] = threshold
             self.logger.info(f"Received new audit threshold {threshold} for traj {traj_id}")
+
+    @action
+    async def get_threshold(self, traj_id: int | None = None) -> float | None:
+        return self.thresholds.get(traj_id, self.default_threshold)
 
     @action
     async def audit(self, chunk: Chunk) -> AuditResult:
@@ -526,7 +566,7 @@ class Labeler(CascadeAgent):
             f"chunk={frame.chunk_id}, attempt={frame.attempt_index};"
             f"labled from chunk={labeled_count}, sampled from chunk:{frame.n_sampled_frames}"
         )
-        if labeled_count == frame.n_sampled_frames-1:  # recall the chunk stores an initial frame which wont get labeled
+        if labeled_count == frame.n_sampled_frames:  # n_sampled_frames is already the real dispatched-batch size
             self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.FINISHED_LABELING)
         self.logger.info(
             f"Added training frame to database: traj={frame.traj_id}, "
