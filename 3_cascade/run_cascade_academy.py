@@ -12,6 +12,7 @@ from functools import partial
 from typing import Callable
 
 import ase
+import numpy as np
 from ase.io import read
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 
@@ -106,6 +107,14 @@ def parse_args() -> argparse.Namespace:
         help='How often to release the CUDA caching allocator during dynamics'
     )
     parser.add_argument(
+        '--seed',
+        type=int,
+        default=None,
+        help='Seed numpy\'s global RNG before drawing each trajectory\'s initial '
+             'MaxwellBoltzmannDistribution velocities, for reproducible runs. '
+             'Unset (default) leaves velocities unseeded.'
+    )
+    parser.add_argument(
         '--target-length',
         type=int,
         default=10,
@@ -189,6 +198,25 @@ def parse_args() -> argparse.Namespace:
              'at --audit-threshold for the whole run.'
     )
     parser.add_argument(
+        '--early-stop-on-uq-spike',
+        type=int,
+        default=1,
+        help='Stop a chunk\'s dynamics mid-integration the instant its UQ score crosses '
+             'the audit threshold, instead of always running the full --chunk-size steps. '
+             'Only meaningful with --audit-task uq_threshold. The resulting short chunk '
+             'still goes through the normal audit/sample/label/retrain/retry pipeline.'
+    )
+    parser.add_argument(
+        '--catch-dynamics-crashes',
+        type=int,
+        default=1,
+        help='If 1 (default), a hard crash during dynamics (e.g. LinAlgError from the '
+             'NPT barostat) is also caught and treated like a controlled early stop. '
+             'If 0, only --early-stop-on-uq-spike stops are caught; a hard crash fails '
+             'the trajectory as before this feature existed -- set 0 to test whether '
+             'the UQ-based stop alone is enough to prevent a crash.'
+    )
+    parser.add_argument(
         '--calibration-history-length',
         type=int,
         default=8,
@@ -248,6 +276,14 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default='mace',
         help='Learner to use'
+    )
+    parser.add_argument(
+        '--init-weights-paths',
+        type=str,
+        default=None,
+        help='Comma-separated paths to pretrained checkpoints (learner.serialize_model bytes), '
+             'used as initial ensemble weights instead of a stock mace_mp("small") clone. '
+             'Supply 1 path or one per ensemble member.'
     )
     parser.add_argument(
         '--calc-type',
@@ -329,6 +365,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
 
     args.per_trajectory_threshold = bool(args.per_trajectory_threshold)
+    args.early_stop_on_uq_spike = bool(args.early_stop_on_uq_spike)
+    args.catch_dynamics_crashes = bool(args.catch_dynamics_crashes)
 
     return args
 
@@ -380,8 +418,21 @@ async def main():
 
     # read in initial model
     learner = get_learner(args.learner)
-    init_weights = learner.serialize_model(learner.get_model(mace_mp('small').models[0]))
-    init_ensemble_weights = [init_weights] * args.n_ensemble
+    if args.init_weights_paths is not None:
+        weight_paths = [pathlib.Path(p) for p in args.init_weights_paths.split(',')]
+        if len(weight_paths) == 1:
+            print(f'--init-weights-paths gave 1 path; cloning it for all {args.n_ensemble} ensemble members')
+            init_ensemble_weights = [weight_paths[0].read_bytes()] * args.n_ensemble
+        elif len(weight_paths) != args.n_ensemble:
+            raise ValueError(
+                f'--init-weights-paths gave {len(weight_paths)} paths but --n-ensemble={args.n_ensemble}; '
+                'supply either 1 path or one path per member'
+            )
+        else:
+            init_ensemble_weights = [p.read_bytes() for p in weight_paths]
+    else:
+        init_weights = learner.serialize_model(learner.get_model(mace_mp('small').models[0]))
+        init_ensemble_weights = [init_weights] * args.n_ensemble
 
     # initialize database
     traj_db = TrajectoryDB(args.db_url)
@@ -409,6 +460,8 @@ async def main():
         a = prepare_atoms_for_dynamics(a, cfg)
 
         if cfg.temperature_K is not None:
+            if args.seed is not None:
+                np.random.seed(args.seed + i)
             MaxwellBoltzmannDistribution(a, temperature_K=cfg.temperature_K)
 
         # create trajectory entry in the database
@@ -625,6 +678,8 @@ async def main():
                         uq_hook=ensemble_force_deviation_uq,
                         gpu_flush_interval=args.gpu_flush_interval,
                         max_audit_retries=args.max_audit_retries,
+                        early_stop_enabled=(args.early_stop_on_uq_spike and args.audit_task == 'uq_threshold'),
+                        catch_crashes=args.catch_dynamics_crashes,
                 )
                 await manager.launch(
                     DynamicsRunner,
