@@ -398,6 +398,7 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
                 logger.info(f'Started replay for epoch {engine.state.epoch - 1}')
 
                 for batch in replay_loader:
+                    replay_opt.zero_grad()
                     batch = batch.to(device)
                     y = replay_model(
                         batch.to_dict(),
@@ -407,7 +408,16 @@ class MACEInterface(BaseLearnableForcefield[MACEState]):
                         compute_stress=True,
                     )
                     loss = criterion(pred=y, ref=batch)
+
+                    if not torch.isfinite(loss):
+                        logger.warning(
+                            f'Non-finite replay loss ({loss.item()}) at epoch {engine.state.epoch - 1}; '
+                            'skipping this batch\'s update'
+                        )
+                        continue
+
                     loss.backward()
+                    torch.nn.utils.clip_grad_norm_(replay_model.parameters(), max_norm=grad_clip_norm)
                     replay_opt.step()
 
                     detailed_loss = dict((f'{k}_replay', v) for k, v in get_loss_stats(batch, y).items())
