@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import pathlib
 import warnings
 from concurrent.futures import as_completed
 
@@ -224,6 +225,13 @@ def main():
     run_id = f"reference-{start_time}-{params_hash}"
 
     init_configs = load_initial_configs(args.init_config_json)
+
+    # Save the init config contents, not just the path, since the file may be edited later
+    run_dir = pathlib.Path("run") / run_id
+    run_dir.mkdir(parents=True)
+    with open(args.init_config_json) as f:
+        params["init_configs"] = json.load(f)
+    (run_dir / "params.json").write_text(json.dumps(params, indent=2))
 
     max_workers = args.max_workers or len(init_configs)
     config = Config(

@@ -412,7 +412,9 @@ async def main():
     )
     run_dir.mkdir(parents=True)
 
-    # Save the run parameters to disk
+    # Save the run parameters to disk, including the init config contents since the file may be edited later
+    with open(args.init_config_json) as f:
+        params["init_configs"] = json.load(f)
     (run_dir / "params.json").write_text(json.dumps(params))
     logfile = run_dir / "runtime.log"
 
