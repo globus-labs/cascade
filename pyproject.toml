@@ -52,6 +52,13 @@ mace = [
     'mace-torch',
     'pytorch-ignite'
 ]
+# fairchem-core requires e3nn>=0.5, but mace-torch requires e3nn==0.4.4. UMA/eSEN models
+# (used via FAIRChemCalculator) don't actually depend on e3nn at runtime, so if installing
+# alongside the mace extra, force e3nn back down afterwards: pip install e3nn==0.4.4
+# See https://github.com/ACEsuit/mace/issues/555
+fairchem = [
+    'fairchem-core',
+]
 docs = [
     'sphinx',
     'pydata-sphinx-theme',

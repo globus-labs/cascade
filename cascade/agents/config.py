@@ -77,6 +77,18 @@ class DynamicsRunnerConfig(CascadeAgentConfig):
     max_audit_retries: int | None = None
     """Max consecutive audit failures a single chunk may accumulate before the
     trajectory is marked FAILED. None (default) means retry indefinitely"""
+    uq_field: str = 'uq_force_std_max'
+    """atoms.info key checked against the early-stop threshold each step"""
+    early_stop_enabled: bool = False
+    """If True, pull the Auditor's current threshold for this trajectory before each
+    chunk and stop dynamics the first step whose atoms.info[uq_field] crosses it,
+    instead of always running the full chunk_size steps"""
+    catch_crashes: bool = True
+    """If True (default), advance_dynamics also catches a hard crash (e.g. LinAlgError
+    from the NPT barostat) and treats it like a controlled early stop. If False, only
+    the UQ-threshold stop is caught; a hard crash fails the trajectory as before this
+    feature existed -- set False to test whether early_stop_enabled alone prevents a
+    crash, without this safety net masking the result."""
 
 
 @dataclass
@@ -156,6 +168,12 @@ class TrainerConfig(CascadeAgentConfig):
     """Multi-head replay config (see cascade.learning.finetuning.MultiHeadConfig), passed through
     to learner.train to prevent catastrophic forgetting. Only meaningful for learners whose train()
     accepts a `replay` kwarg (currently MACEInterface)."""
+    min_interatomic_distance: float = 0.5
+    """Training frames with a labeled-atoms minimum interatomic distance below this (Angstrom) are
+    dropped before training -- guards against training on unphysical/collided sampled structures"""
+    max_training_retries: int = 1
+    """If a member's training run diverges (non-finite validation loss), retry it with a fresh
+    bootstrap draw up to this many times before giving up and keeping its previous weights"""
 
 
 @dataclass

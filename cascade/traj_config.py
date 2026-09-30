@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import pathlib
 from dataclasses import dataclass, field
+from typing import Callable
 
 import numpy as np
 from ase import Atoms, units
@@ -27,7 +28,7 @@ class InitialTrajConfig:
     temperature_K: float | None = None
     """If set, initialize velocities via a Maxwell-Boltzmann distribution at this temperature"""
     dyn_cls: str = 'velocity-verlet'
-    """Dynamics integrator to use (see get_dynamics_cls)"""
+    """Dynamics integrator to use (see INTEGRATORS)"""
     dt_fs: float = 1.0
     """Timestep in femtoseconds"""
     dyn_kws: dict = field(default_factory=dict)
@@ -39,17 +40,6 @@ class InitialTrajConfig:
 def load_initial_configs(path: str) -> list[InitialTrajConfig]:
     data = json.loads(pathlib.Path(path).read_text())
     return [InitialTrajConfig(**entry) for entry in data]
-
-
-def get_dynamics_cls(cls_name: str) -> type[ase.md.md.MolecularDynamics]:
-    if cls_name == 'velocity-verlet':
-        return VelocityVerlet
-    elif cls_name == 'npt':
-        return NPT
-    elif cls_name == 'mtknpt':
-        return MTKNPT
-    else:
-        raise ValueError(f'Unknown dynamics class: {cls_name}')
 
 
 @dataclass
@@ -99,15 +89,6 @@ class MTKNPTConfig:
         )
 
 
-def resolve_dyn_kws(cfg: InitialTrajConfig) -> dict:
-    """Build the real ASE dynamics-constructor kwargs for a trajectory config"""
-    if cfg.dyn_cls == 'npt':
-        return {'timestep': cfg.dt_fs * units.fs, **NPTConfig(**cfg.dyn_kws).to_ase_kwargs()}
-    elif cfg.dyn_cls == 'mtknpt':
-        return {'timestep': cfg.dt_fs * units.fs, **MTKNPTConfig(**cfg.dyn_kws).to_ase_kwargs()}
-    return {'timestep': cfg.dt_fs * units.fs, **cfg.dyn_kws}
-
-
 def _upper_triangular_cell(atoms: Atoms) -> Atoms:
     """Rigidly rotate a structure's cell + positions so the cell matrix becomes upper
     triangular, preserving all lengths, angles, and volume.
@@ -141,8 +122,109 @@ def _upper_triangular_cell(atoms: Atoms) -> Atoms:
     return atoms
 
 
+def _restore_npt_state(dyn: NPT, state: dict) -> None:
+    """Mirrors ASE's own read_from_trajectory restore pattern (construct normally,
+    setattr the get_data() fields, leave `initialized` unset so the next run() call's
+    own initialize() bootstrap derives h_past/q_past consistently from the restored
+    eta/zeta)."""
+    for k, v in state.items():
+        setattr(dyn, k, v)
+
+
+def _extract_mtknpt_state(dyn: MTKNPT) -> dict:
+    return {
+        'p_g': dyn._p_g.copy(),
+        'thermostat_eta': dyn._thermostat._eta.copy(),
+        'thermostat_p_eta': dyn._thermostat._p_eta.copy(),
+        'barostat_xi': dyn._barostat._xi.copy(),
+        'barostat_p_xi': dyn._barostat._p_xi.copy(),
+    }
+
+
+def _restore_mtknpt_state(dyn: MTKNPT, state: dict) -> None:
+    dyn._p_g = state['p_g']
+    dyn._thermostat._eta = state['thermostat_eta']
+    dyn._thermostat._p_eta = state['thermostat_p_eta']
+    dyn._barostat._xi = state['barostat_xi']
+    dyn._barostat._p_xi = state['barostat_p_xi']
+
+
+@dataclass(frozen=True)
+class IntegratorSpec:
+    """Allows us to pass parameters and state across exchange and through pickle"""
+    ase_cls: type[ase.md.md.MolecularDynamics]
+    config_cls: type | None = None
+    extract_state: Callable[[ase.md.md.MolecularDynamics], dict | None] = staticmethod(lambda dyn: None)
+    restore_state: Callable[[ase.md.md.MolecularDynamics, dict], None] = staticmethod(lambda dyn, state: None)
+    prepare_atoms: Callable[[Atoms], Atoms] = staticmethod(lambda atoms: atoms)
+
+    def to_ase_kwargs(self, cfg: InitialTrajConfig) -> dict:
+        kws = {'timestep': cfg.dt_fs * units.fs}
+        if self.config_cls is not None:
+            kws.update(self.config_cls(**cfg.dyn_kws).to_ase_kwargs())
+        else:
+            kws.update(cfg.dyn_kws)
+        return kws
+
+
+# SUPPORTED INTEGRATOR REGISTRY
+INTEGRATORS: dict[str, IntegratorSpec] = {
+    'velocity-verlet': IntegratorSpec(ase_cls=VelocityVerlet),
+    'npt': IntegratorSpec(
+        ase_cls=NPT,
+        config_cls=NPTConfig,
+        extract_state=NPT.get_data,
+        restore_state=_restore_npt_state,
+        prepare_atoms=_upper_triangular_cell,
+    ),
+    'mtknpt': IntegratorSpec(
+        ase_cls=MTKNPT,
+        config_cls=MTKNPTConfig,
+        extract_state=_extract_mtknpt_state,
+        restore_state=_restore_mtknpt_state,
+    ),
+}
+
+
+def _lookup(cls_name: str) -> IntegratorSpec:
+    try:
+        return INTEGRATORS[cls_name]
+    except KeyError:
+        raise ValueError(
+            f'Unknown dynamics class: {cls_name!r}. Supported: {sorted(INTEGRATORS)}'
+        ) from None
+
+
+def get_dynamics_cls(cls_name: str) -> type[ase.md.md.MolecularDynamics]:
+    return _lookup(cls_name).ase_cls
+
+
+def resolve_dyn_kws(cfg: InitialTrajConfig) -> dict:
+    """Build the real ASE dynamics-constructor kwargs for a trajectory config"""
+    return _lookup(cfg.dyn_cls).to_ase_kwargs(cfg)
+
+
 def prepare_atoms_for_dynamics(atoms: Atoms, cfg: InitialTrajConfig) -> Atoms:
     """Apply any structure preprocessing a trajectory's dynamics integrator requires"""
-    if cfg.dyn_cls == 'npt':
-        atoms = _upper_triangular_cell(atoms)
-    return atoms
+    return _lookup(cfg.dyn_cls).prepare_atoms(atoms)
+
+
+def extract_dyn_state(dyn: ase.md.md.MolecularDynamics) -> dict | None:
+    """Snapshot the extended-system (barostat/thermostat) state of an NPT-family
+    integrator so it can be restored on the next chunk. Returns None for dynamics
+    classes with no such state (e.g. VelocityVerlet)."""
+    for spec in INTEGRATORS.values():
+        if isinstance(dyn, spec.ase_cls):
+            return spec.extract_state(dyn)
+    return None
+
+
+def restore_dyn_state(dyn: ase.md.md.MolecularDynamics, state: dict | None) -> None:
+    """Inverse of extract_dyn_state: re-inject a prior chunk's extended-system
+    state into a freshly constructed integrator, in place."""
+    if state is None:
+        return
+    for spec in INTEGRATORS.values():
+        if isinstance(dyn, spec.ase_cls):
+            spec.restore_state(dyn, state)
+            return

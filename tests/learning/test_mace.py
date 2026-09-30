@@ -1,3 +1,4 @@
+from ase.calculators.singlepoint import SinglePointCalculator
 from mace.calculators import mace_mp
 from pytest import fixture, mark
 import numpy as np
@@ -87,3 +88,64 @@ def test_replay(example_data, mace, epoch_frequency, num_downselect):
     _, log = mi.train(mace, example_data, example_data, 4, batch_size=2, patience=1, replay=replay)
     assert 'total_loss_replay' in log.columns
     assert log['total_loss_replay'].isna().sum() == (4 - 4 // epoch_frequency)  # Ensure reply is skipped occasionally
+
+
+def _labelled_frames() -> list:
+    """Two frames carrying distinctive, non-zero energy/forces/stress"""
+    from ase import Atoms
+
+    frames = []
+    for i, energy in enumerate([-11.5, -22.25]):
+        atoms = Atoms(symbols=['H', 'He'], positions=[[0., 0., 0.], [1.5, 0., 0.]],
+                      cell=[6., 6., 6.], pbc=True)
+        forces = np.array([[0.3 + i, -0.4, 0.5], [-0.3 - i, 0.4, -0.5]])
+        stress = np.array([0.11, 0.12, 0.13, 0.14, 0.15, 0.16]) * (i + 1)
+        atoms.calc = SinglePointCalculator(atoms, energy=energy, forces=forces, stress=stress)
+        frames.append(atoms)
+    return frames
+
+
+def _first_batch(frames):
+    from cascade.learning.mace import atoms_to_loader
+    from mace.tools import AtomicNumberTable
+
+    loader = atoms_to_loader(frames, batch_size=2, z_table=AtomicNumberTable([1, 2]),
+                             r_max=4.0, shuffle=False, drop_last=False)
+    return next(iter(loader)).to_dict()
+
+
+def test_atoms_to_loader_keeps_labels_from_calculator():
+    """Style A: labels held by a SinglePointCalculator must reach the batch, not be zeroed"""
+    frames = _labelled_frames()
+    expected_e = [f.get_potential_energy() for f in frames]
+    expected_f = np.concatenate([f.get_forces() for f in frames])
+
+    batch = _first_batch(frames)
+
+    assert not np.allclose(batch['energy'].numpy(), 0.), 'energies silently dropped to zero'
+    assert not np.allclose(batch['forces'].numpy(), 0.), 'forces silently dropped to zero'
+    assert not np.allclose(batch['stress'].numpy(), 0.), 'stresses silently dropped to zero'
+    assert np.allclose(batch['energy'].numpy(), expected_e)
+    assert np.allclose(batch['forces'].numpy(), expected_f)
+
+
+def test_atoms_to_loader_keeps_labels_from_ref_keys():
+    """Style B: labels already stored under MACE's REF_ keys, with no calculator attached"""
+    frames = []
+    for f in _labelled_frames():
+        bare = f.copy()
+        bare.info['REF_energy'] = f.get_potential_energy()
+        bare.info['REF_stress'] = f.get_stress()
+        bare.arrays['REF_forces'] = f.get_forces()
+        bare.calc = None
+        frames.append(bare)
+
+    expected_e = [f.info['REF_energy'] for f in frames]
+    expected_f = np.concatenate([f.arrays['REF_forces'] for f in frames])
+
+    batch = _first_batch(frames)
+
+    assert not np.allclose(batch['energy'].numpy(), 0.), 'energies silently dropped to zero'
+    assert not np.allclose(batch['forces'].numpy(), 0.), 'forces silently dropped to zero'
+    assert np.allclose(batch['energy'].numpy(), expected_e)
+    assert np.allclose(batch['forces'].numpy(), expected_f)

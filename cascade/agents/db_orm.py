@@ -2080,6 +2080,8 @@ class TrajectoryDB:
                 - attempt_index: Attempt number for this chunk
                 - n_frames: Number of frames in this attempt
                 - audit_status: Audit status (PENDING, PASSED, or FAILED)
+                - audit_reason: Which mechanism produced audit_status (e.g. 'threshold',
+                  'burn_in', 'random_fail'); None while PENDING
                 - model_version: Model version used for this attempt
                 - created_at: When this attempt was created
                 - updated_at: When this attempt was last updated
@@ -2116,6 +2118,7 @@ class TrajectoryDB:
                     'attempt_index': attempt.attempt_index,
                     'n_frames': attempt.n_frames,
                     'audit_status': status_str,
+                    'audit_reason': attempt.audit_reason,
                     'model_version': attempt.model_version,
                     'created_at': attempt.created_at,
                     'updated_at': attempt.updated_at
