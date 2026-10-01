@@ -25,7 +25,14 @@ classifiers = [
 dependencies = [
     "ase>3.22",
     "academy-py",
-    "sqlalchemy>=1.4.0"
+    "sqlalchemy>=1.4.0",
+    "matplotlib",
+    "papermill",
+    "scikit_learn>=1",
+    "jupyterlab",
+    "parsl",
+    "sigfig",
+    "psycopg[binary]"
 ]
 
 [tool.setuptools.packages.find]
