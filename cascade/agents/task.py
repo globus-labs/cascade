@@ -319,11 +319,13 @@ def label_noop(spec: TrainingFrame, calc_factory: Callable[..., Calculator]) -> 
 
 def label_frame(frame: TrainingFrame, calc_factory: Callable[..., Calculator]) -> TrainingFrame:
     """runs the specified calculator on the atoms"""
+    from ase.calculators.calculator import all_changes
     from cascade.utils import canonicalize
     calc = calc_factory()
     atoms_labeled = frame.atoms.copy()
     atoms_labeled.calc = calc
-    calc.calculate(atoms_labeled)
+    # pass properties explicitly: some calculators (e.g., FAIRChemCalculator) have no defaults
+    calc.calculate(atoms_labeled, properties=['energy', 'forces', 'stress'], system_changes=all_changes)
     frame.atoms_labeled = canonicalize(atoms_labeled)
     return frame
 
