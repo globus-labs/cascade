@@ -18,10 +18,6 @@ from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase import units
 from ase.md.verlet import VelocityVerlet
 from mace.calculators import mace_mp
-from parsl.config import Config
-from parsl.executors import HighThroughputExecutor
-from parsl.providers import LocalProvider
-from parsl.usage_tracking.levels import LEVEL_1
 from parsl.concurrent import ParslPoolExecutor
 from academy.logging.recommended import recommended_logging
 from academy.exchange import LocalExchangeFactory
@@ -47,7 +43,7 @@ from cascade.agents.config import (
 )
 from cascade.model import AdvanceSpec, AuditResult, TrainingFrame
 from cascade.learning.mace import MACEInterface
-from cascade.learning.finetuning import MultiHeadConfig
+from cascade.learning.finetuning import MultiHeadConfig, ReplaySampler
 from cascade.agents.db_orm import TrajectoryDB
 from cascade.agents.task import (
     random_audit,
@@ -70,9 +66,16 @@ from cascade.traj_config import (
     prepare_atoms_for_dynamics,
 )
 
+from config import CONFIGS, get_parsl_config
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument('--parsl-config', choices=list(CONFIGS), default='local', help='Parsl config from config.py')
+    parser.add_argument('--queue', default='debug', help='PBS queue for --parsl-config aurora')
+    parser.add_argument('--walltime', default='0:30:00', help='PBS walltime for --parsl-config aurora')
+    parser.add_argument('--nodes', type=int, default=1,
+                        help='Nodes for --parsl-config aurora (12 workers per node, one per tile)')
     parser.add_argument(
         '--log-level',
         type=str,
@@ -282,8 +285,8 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help='Batch size for training',
     )
-    parser.add_argument('--replay-dataset', default=None, help='Path to an ASE database containing data to replay during finetuning')
-    parser.add_argument('--replay-downselect', default=None, type=int, help='Max number of entries to use from replay dataset')
+    parser.add_argument('--replay-dataset', default=None, help='Path to an ASE-readable file, or a directory of extxyz files, containing data to replay during finetuning')
+    parser.add_argument('--replay-downselect', default=None, type=int, help='Number of replay frames sampled for each training round (required for a directory)')
     parser.add_argument('--replay-frequency', default=1, type=int, help='How often to replay')
     parser.add_argument('--replay-lr-reduction', default=1, type=float, help='Factor by which to reduce LR during replay')
     parser.add_argument('--replay-batch-size', default=None, type=int, help='Batch size used during replay')
@@ -330,9 +333,8 @@ async def main():
     start_time = datetime.datetime.utcnow().strftime("%Y.%m.%d-%H:%M:%S")
     params_hash = hashlib.sha256(json.dumps(params).encode()).hexdigest()[:6]
     run_id = f"{start_time}-{params_hash}"
-    run_dir = pathlib.Path("run") / (
-        f"run-{run_id}"
-    )
+    # absolute, since remote workers write dynamics output here
+    run_dir = (pathlib.Path("run") / f"run-{run_id}").resolve()
     run_dir.mkdir(parents=True)
 
     # Save the run parameters to disk
@@ -343,6 +345,8 @@ async def main():
     learner = get_learner(args.learner)
     init_weights = learner.serialize_model(learner.get_model(mace_mp('small').models[0]))
     init_ensemble_weights = [init_weights] * args.n_ensemble
+    # cache the labeling model on the driver, since compute nodes have no internet
+    mace_mp('medium')
 
     # initialize database
     traj_db = TrajectoryDB(args.db_url)
@@ -350,15 +354,15 @@ async def main():
 
     # set up multi-head replay, if requested
     if args.replay_dataset is not None:
+        replay_sampler = ReplaySampler(args.replay_dataset, args.replay_downselect)
         replay = MultiHeadConfig(
-            original_dataset=read(args.replay_dataset, slice(None)),
-            num_downselect=args.replay_downselect,
+            original_dataset=[],  # filled with a new sample each training round
             epoch_frequency=args.replay_frequency,
             lr_reduction=args.replay_lr_reduction,
             batch_size=args.replay_batch_size,
         )
     else:
-        replay = None
+        replay = replay_sampler = None
 
     # read initial configuration for each trajectory
     init_configs = load_initial_configs(args.init_config_json)
@@ -402,19 +406,11 @@ async def main():
     # only audit_task that reads a 'threshold' kwarg
     use_controller = args.audit_task == 'uq_threshold' and args.target_ferr is not None
     n_agents = len(initial_specs) + 5 + (1 if use_controller else 0)  # one dynamics runner per traj and one of each other agent
-    config = Config(
-        executors=[
-            HighThroughputExecutor(
-                label="htex_local",
-                max_workers_per_node=n_parsl_workers,
-                provider=LocalProvider(
-                    init_blocks=1,
-                    max_blocks=1,
-                ),
-            )
-        ],
-        usage_tracking=LEVEL_1,
-    )
+    if args.parsl_config == 'local':
+        parsl_kws = dict(workers_per_node=n_parsl_workers)
+    else:
+        parsl_kws = dict(queue=args.queue, walltime=args.walltime, nodes_per_job=args.nodes)
+    config = get_parsl_config(args.parsl_config, str(run_dir / 'parsl'), **parsl_kws)
 
     with ParslPoolExecutor(config=config) as pool:
         async with await Manager.from_exchange_factory(
@@ -518,6 +514,7 @@ async def main():
                 ),
                 learner=learner,
                 replay=replay,
+                replay_sampler=replay_sampler,
             )
 
             # launch all agents
