@@ -36,6 +36,7 @@ def random_audit(
     chunk: Chunk,
     accept_prob: float = 0.5,
     sleep_time: float = 0.,
+    **kwargs
 ) -> AuditResult:
     """Random audit of a chunk of a trajectory
 
@@ -370,12 +371,13 @@ def label_noop(spec: TrainingFrame, calc_factory: Callable[..., Calculator]) -> 
 
 def label_frame(frame: TrainingFrame, calc_factory: Callable[..., Calculator]) -> TrainingFrame:
     """runs the specified calculator on the atoms"""
-    from ase.calculators.calculator import all_changes # required by some calcs (e.g. FairChemCalculator)
+    from ase.calculators.calculator import all_changes
     from cascade.utils import canonicalize
     calc = calc_factory()
     atoms_labeled = frame.atoms.copy()
     atoms_labeled.calc = calc
-    calc.calculate(atoms_labeled, properties=calc.implemented_properties, system_changes=all_changes)
+    # pass properties explicitly: some calculators (e.g., FAIRChemCalculator) have no defaults
+    calc.calculate(atoms_labeled, properties=['energy', 'forces', 'stress'], system_changes=all_changes)
     frame.atoms_labeled = canonicalize(atoms_labeled)
     return frame
 

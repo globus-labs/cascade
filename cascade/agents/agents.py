@@ -11,6 +11,7 @@ from asyncio import Event, Lock, wrap_future
 from functools import partial
 import logging
 from copy import deepcopy
+from dataclasses import replace
 
 import numpy as np
 
@@ -678,11 +679,28 @@ class Trainer(CascadeAgent):
         rng = np.random.default_rng()
         n_sample = int(len(train_data) * self.config.bootstrap_fraction)
 
+        replay = self.config.replay
+        if self.config.replay_sampler is not None:
+            replay_data = await asyncio.to_thread(self.config.replay_sampler.sample, rng)
+            replay = replace(replay, original_dataset=replay_data, num_downselect=None)
+            self.logger.info(f'Sampled {len(replay_data)} replay frames')
+
         self.logger.info(f'Submitting {len(self.weights)} bootstrapped training tasks')
-        futures = [
-            self._train_member(member_index, member_weights, train_data, valid_data, n_sample, rng)
-            for member_index, member_weights in enumerate(self.weights)
-        ]
+        futures = []
+        for member_weights in self.weights:
+            boot_idx = rng.integers(0, len(train_data), size=n_sample)
+            boot_data = [train_data[i] for i in boot_idx]
+            future = self.config.executor.submit(
+                self.config.training_task,
+                learner=self.config.learner,
+                weights=member_weights,
+                train_data=boot_data,
+                valid_data=valid_data,
+                train_kws=self.config.training_kws,
+                replay=replay,
+            )
+            futures.append(wrap_future(future))
+
         results = await asyncio.gather(*futures)
 
         self.logger.info('Retrieving new weights')

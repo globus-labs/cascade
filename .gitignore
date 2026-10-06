@@ -183,3 +183,5 @@ cython_debug/
 **/db/
 **/data/
 **/*.zip
+conda-env/*
+pg/logs/*

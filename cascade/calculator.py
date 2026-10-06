@@ -161,6 +161,39 @@ def make_calculator(
                 **cp2k_opts)
 
 
+# One fairchem calculator per (checkpoint, task, device) in each process, so repeated
+# calls (e.g., one per labeled frame on the same worker) don't reload the checkpoint
+_fairchem_calculators: dict[tuple[str, str, str], Calculator] = {}
+
+
+def make_fairchem_calculator(checkpoint: str | Path, task_name: str = 'omat', device: str = 'cpu') -> Calculator:
+    """Load a fairchem (e.g., UMA) checkpoint as an ASE calculator, cached per process
+
+    fairchem only accepts 'cpu' or 'cuda' devices. For other devices (e.g., 'xpu'), the
+    predictor is built on the CPU and its device swapped before first use; it moves the
+    model to that device on its first prediction.
+
+    Args:
+        checkpoint: Path to the inference checkpoint
+        task_name: Task head to use for predictions
+        device: Torch device on which to run the model
+    Returns:
+        A FAIRChemCalculator
+    """
+    key = (str(checkpoint), task_name, device)
+    if key not in _fairchem_calculators:
+        # e3nn<0.5 loads its constants with torch.load, which torch>=2.6 refuses by default
+        os.environ.setdefault('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
+        from fairchem.core import FAIRChemCalculator, pretrained_mlip
+
+        supported = device in ('cpu', 'cuda')
+        predictor = pretrained_mlip.load_predict_unit(str(checkpoint), device=device if supported else 'cpu')
+        if not supported:
+            predictor.device = device
+        _fairchem_calculators[key] = FAIRChemCalculator(predictor, task_name=task_name)
+    return _fairchem_calculators[key]
+
+
 class EnsembleCalculator(Calculator):
     """A single calculator which combines the results of many
 
