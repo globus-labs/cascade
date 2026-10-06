@@ -94,3 +94,39 @@ async def test_bootstrap_and_parallel_submit(temp_db_url, traj_db, populated_run
     logs = traj_db.get_training_logs(populated_run)
     assert sorted(logs['member_index']) == [0, 1, 2]
     assert (logs['training_round'] == 0).all()
+
+
+class _FakeSampler:
+    def __init__(self, n):
+        self.n = n
+        self.calls = 0
+
+    def sample(self, rng=None):
+        self.calls += 1
+        return [molecule('H2O') for _ in range(self.n)]
+
+
+@pytest.mark.asyncio
+async def test_replay_sampled_each_round(temp_db_url, traj_db, populated_run):
+    """A fresh replay sample is drawn once per round and shared by all members"""
+    from cascade.learning.finetuning import MultiHeadConfig
+
+    replays = []
+
+    def fake_training_task(learner, weights, train_data, valid_data, train_kws, replay=None):
+        replays.append(replay)
+        return weights, pd.DataFrame({'epoch': [0], 'loss': [0.1]})
+
+    agent = _make_trainer(temp_db_url, populated_run, [b'w0', b'w1'], fake_training_task)
+    sampler = _FakeSampler(3)
+    agent.config.replay = MultiHeadConfig(original_dataset=[], num_downselect=10, epoch_frequency=2)
+    agent.config.replay_sampler = sampler
+    await agent.agent_on_startup()
+
+    await agent.train_model(training_round=0)
+
+    assert sampler.calls == 1
+    assert len(replays) == 2
+    assert all(len(r.original_dataset) == 3 for r in replays)
+    assert all(r.num_downselect is None and r.epoch_frequency == 2 for r in replays)
+    assert agent.config.replay.original_dataset == []

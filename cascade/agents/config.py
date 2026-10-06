@@ -19,7 +19,7 @@ if TYPE_CHECKING:
         Chunk
     )
     import pandas as pd
-    from cascade.learning.finetuning import MultiHeadConfig
+    from cascade.learning.finetuning import MultiHeadConfig, ReplaySampler
 
 @dataclass
 class CascadeAgentConfig:
@@ -156,6 +156,9 @@ class TrainerConfig(CascadeAgentConfig):
     """Multi-head replay config (see cascade.learning.finetuning.MultiHeadConfig), passed through
     to learner.train to prevent catastrophic forgetting. Only meaningful for learners whose train()
     accepts a `replay` kwarg (currently MACEInterface)."""
+    replay_sampler: ReplaySampler | None = None
+    """If set, each training round replaces `replay.original_dataset` with a fresh sample from this
+    sampler, so only the sampled frames are sent to the training tasks."""
 
 
 @dataclass

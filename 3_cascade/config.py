@@ -13,17 +13,12 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def get_parsl_config(name: str, run_dir: str, **kwargs: Any) -> Config:
-    if name == "local":
-        return get_local_config(run_dir, **kwargs)
-    elif name == "aurora":
-        return get_aurora_config(run_dir, **kwargs)
-    else:
-        raise AssertionError(f"Unknown Parsl config name: {name}.")
+    return CONFIGS[name](run_dir, **kwargs)
 
 
 def get_local_config(
     run_dir: str,
-    workers_per_node: int,
+    workers_per_node: int = 4,
 ) -> Config:
     executor = HighThroughputExecutor(
         label="htex-local",
@@ -103,3 +98,9 @@ def get_aurora_config(
         # whose tasks may be interrupted by a PBS job ending
         retries=0,
     )
+
+
+CONFIGS = {
+    "local": get_local_config,
+    "aurora": get_aurora_config,
+}

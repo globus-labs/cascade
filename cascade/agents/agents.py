@@ -11,6 +11,7 @@ from asyncio import Event, Lock, wrap_future
 from functools import partial
 import logging
 from copy import deepcopy
+from dataclasses import replace
 
 import numpy as np
 
@@ -436,6 +437,7 @@ class Sampler(CascadeAgent):
         sample_kws = dict(n_frames=n_frames, reason=audit_reason)
         if audit_threshold is not None:
             # omit: some strategies have defaults we dont want to override with None
+            sample_kws['threshold'] = audit_threshold
         future = self.config.executor.submit(
             self.config.sample_task,
             chunk,
@@ -571,6 +573,12 @@ class Trainer(CascadeAgent):
         rng = np.random.default_rng()
         n_sample = int(len(train_data) * self.config.bootstrap_fraction)
 
+        replay = self.config.replay
+        if self.config.replay_sampler is not None:
+            replay_data = await asyncio.to_thread(self.config.replay_sampler.sample, rng)
+            replay = replace(replay, original_dataset=replay_data, num_downselect=None)
+            self.logger.info(f'Sampled {len(replay_data)} replay frames')
+
         self.logger.info(f'Submitting {len(self.weights)} bootstrapped training tasks')
         futures = []
         for member_weights in self.weights:
@@ -583,7 +591,7 @@ class Trainer(CascadeAgent):
                 train_data=boot_data,
                 valid_data=valid_data,
                 train_kws=self.config.training_kws,
-                replay=self.config.replay,
+                replay=replay,
             )
             futures.append(wrap_future(future))
 

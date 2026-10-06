@@ -33,6 +33,7 @@ def random_audit(
     chunk: Chunk,
     accept_prob: float = 0.5,
     sleep_time: float = 0.,
+    **kwargs
 ) -> AuditResult:
     """Random audit of a chunk of a trajectory
 
