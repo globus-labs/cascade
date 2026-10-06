@@ -150,6 +150,37 @@ class DBTrainingFrame(Base):
         return f"<DBTrainingFrame(run_id={self.run_id}, trajectory_frame_id={self.trajectory_frame_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, training_round={self.training_round})>"
 
 
+class DBReferenceEvaluation(Base):
+    """Post-hoc reference-calculator evaluation of an already-accepted (passed) chunk's
+    frame. Offline QA data -- distinct from DBTrainingFrame, which backs the live
+    Controller's calibration and must never be mixed with this."""
+    __tablename__ = 'reference_evaluations'
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String, nullable=False, index=True)
+    traj_id = Column(Integer, nullable=False, index=True)
+    chunk_id = Column(Integer, nullable=False, index=True)
+    attempt_index = Column(Integer, nullable=False)
+    model_version = Column(Integer, nullable=False)
+    trajectory_frame_id = Column(Integer, ForeignKey('trajectory_frames.id'), nullable=False, index=True)
+    frame_index = Column(Integer, nullable=False)  # denormalized, as stored on DBTrajectoryFrame
+    uq = Column(Float, nullable=True)
+    force_error = Column(Float, nullable=False)
+    energy_surrogate = Column(Float, nullable=True)
+    energy_reference = Column(Float, nullable=True)
+    calc_type = Column(String, nullable=False)
+    calc_model = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'trajectory_frame_id', 'calc_type', 'calc_model',
+                          name='uq_reference_eval_frame_calc'),
+    )
+
+    def __repr__(self):
+        return f"<DBReferenceEvaluation(run_id={self.run_id}, traj_id={self.traj_id}, chunk_id={self.chunk_id}, attempt_index={self.attempt_index}, force_error={self.force_error})>"
+
+
 class DBControllerLog(Base):
     """ORM model for the Controller's threshold/alpha history"""
     __tablename__ = 'controller_log'
@@ -1178,7 +1209,146 @@ class TrajectoryDB:
 
         gc.collect()
         return atoms_list
-    
+
+    def add_reference_evaluation(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int,
+        model_version: int,
+        trajectory_frame_id: int,
+        frame_index: int,
+        force_error: float,
+        calc_type: str,
+        calc_model: str,
+        uq: Optional[float] = None,
+        energy_surrogate: Optional[float] = None,
+        energy_reference: Optional[float] = None,
+    ) -> dict:
+        """Record a post-hoc reference-calculator evaluation of an already-passed chunk's frame.
+
+        Idempotent on (run_id, trajectory_frame_id, calc_type, calc_model): re-evaluating the
+        same frame with the same reference calculator is a no-op that returns the existing row,
+        so a killed-and-restarted evaluation script never double-writes or wastes recomputation.
+        Evaluating the same frame against a *different* calc_type/calc_model adds a new row.
+
+        Args:
+            run_id: Run identifier
+            traj_id: Trajectory identifier (denormalized)
+            chunk_id: Chunk identifier (denormalized)
+            attempt_index: Attempt index this frame belongs to (denormalized)
+            model_version: Model version that was driving dynamics for this frame
+            trajectory_frame_id: ID of the frame in the trajectory_frames table
+            frame_index: Chunk-local frame index (denormalized)
+            force_error: max_force_error(surrogate, reference) -- same metric/units as
+                DBTrainingFrame.calibration_error
+            calc_type: Reference calculator family used (e.g. 'fairchem')
+            calc_model: Reference calculator checkpoint/model identifier used
+            uq: Surrogate's own UQ estimate at MD time, if available
+            energy_surrogate: Surrogate-predicted energy, if available
+            energy_reference: Reference-calculator energy, if available
+
+        Returns:
+            Dict of the row's fields (existing or newly created) -- a plain dict rather than the
+            ORM instance, since the instance would be detached (and its attributes unreadable)
+            once this method's session closes.
+        """
+        with self.session() as sess:
+            existing = sess.query(DBReferenceEvaluation).filter_by(
+                run_id=run_id,
+                trajectory_frame_id=trajectory_frame_id,
+                calc_type=calc_type,
+                calc_model=calc_model,
+            ).first()
+
+            if existing:
+                db_eval = existing
+            else:
+                db_eval = DBReferenceEvaluation(
+                    run_id=run_id,
+                    traj_id=traj_id,
+                    chunk_id=chunk_id,
+                    attempt_index=attempt_index,
+                    model_version=model_version,
+                    trajectory_frame_id=trajectory_frame_id,
+                    frame_index=frame_index,
+                    uq=uq,
+                    force_error=force_error,
+                    energy_surrogate=energy_surrogate,
+                    energy_reference=energy_reference,
+                    calc_type=calc_type,
+                    calc_model=calc_model,
+                )
+                sess.add(db_eval)
+                sess.flush()
+
+            return {
+                'id': db_eval.id,
+                'run_id': db_eval.run_id,
+                'traj_id': db_eval.traj_id,
+                'chunk_id': db_eval.chunk_id,
+                'attempt_index': db_eval.attempt_index,
+                'model_version': db_eval.model_version,
+                'trajectory_frame_id': db_eval.trajectory_frame_id,
+                'frame_index': db_eval.frame_index,
+                'uq': db_eval.uq,
+                'force_error': db_eval.force_error,
+                'energy_surrogate': db_eval.energy_surrogate,
+                'energy_reference': db_eval.energy_reference,
+                'calc_type': db_eval.calc_type,
+                'calc_model': db_eval.calc_model,
+            }
+            sess.refresh(db_eval)
+            return db_eval
+
+    def get_reference_evaluations(
+        self,
+        run_id: str,
+        traj_id: Optional[int] = None,
+    ) -> list[dict]:
+        """List post-hoc reference-calculator evaluations for a run.
+
+        Args:
+            run_id: Run identifier
+            traj_id: Restrict to a single trajectory, or None for all trajectories in the run
+
+        Returns:
+            List of dicts, one per evaluated frame, ordered by traj_id, chunk_id, attempt_index,
+            frame_index. Each dict has keys: traj_id, chunk_id, attempt_index, model_version,
+            trajectory_frame_id, frame_index, uq, force_error, energy_surrogate,
+            energy_reference, calc_type, calc_model, created_at.
+        """
+        with self.session() as sess:
+            query = sess.query(DBReferenceEvaluation).filter_by(run_id=run_id)
+            if traj_id is not None:
+                query = query.filter_by(traj_id=traj_id)
+            rows = query.order_by(
+                DBReferenceEvaluation.traj_id,
+                DBReferenceEvaluation.chunk_id,
+                DBReferenceEvaluation.attempt_index,
+                DBReferenceEvaluation.frame_index,
+            ).all()
+
+            return [
+                {
+                    'traj_id': r.traj_id,
+                    'chunk_id': r.chunk_id,
+                    'attempt_index': r.attempt_index,
+                    'model_version': r.model_version,
+                    'trajectory_frame_id': r.trajectory_frame_id,
+                    'frame_index': r.frame_index,
+                    'uq': r.uq,
+                    'force_error': r.force_error,
+                    'energy_surrogate': r.energy_surrogate,
+                    'energy_reference': r.energy_reference,
+                    'calc_type': r.calc_type,
+                    'calc_model': r.calc_model,
+                    'created_at': r.created_at,
+                }
+                for r in rows
+            ]
+
     def count_training_frames(self, run_id: str) -> int:
         """Count the number of training frames for a run
         
@@ -2080,6 +2250,8 @@ class TrajectoryDB:
                 - attempt_index: Attempt number for this chunk
                 - n_frames: Number of frames in this attempt
                 - audit_status: Audit status (PENDING, PASSED, or FAILED)
+                - audit_reason: Which mechanism produced audit_status (e.g. 'threshold',
+                  'burn_in', 'random_fail'); None while PENDING
                 - model_version: Model version used for this attempt
                 - created_at: When this attempt was created
                 - updated_at: When this attempt was last updated
@@ -2116,6 +2288,7 @@ class TrajectoryDB:
                     'attempt_index': attempt.attempt_index,
                     'n_frames': attempt.n_frames,
                     'audit_status': status_str,
+                    'audit_reason': attempt.audit_reason,
                     'model_version': attempt.model_version,
                     'created_at': attempt.created_at,
                     'updated_at': attempt.updated_at

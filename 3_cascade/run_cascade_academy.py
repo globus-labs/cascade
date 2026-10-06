@@ -12,6 +12,7 @@ from functools import partial
 from typing import Callable
 
 import ase
+import numpy as np
 from ase.io import read
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 
@@ -45,6 +46,7 @@ from cascade.model import AdvanceSpec, AuditResult, TrainingFrame
 from cascade.learning.mace import MACEInterface
 from cascade.learning.finetuning import MultiHeadConfig, ReplaySampler
 from cascade.agents.db_orm import TrajectoryDB
+from cascade.calculator import get_calc_factory
 from cascade.agents.task import (
     random_audit,
     uq_threshold_audit,
@@ -80,7 +82,13 @@ def parse_args() -> argparse.Namespace:
         '--log-level',
         type=str,
         default='INFO',
-        help='Logging levl'
+        help='Logging level'
+    )
+    parser.add_argument(
+        '--max-workers',
+        type=int,
+        default=None,
+        help='Max workers in the executor pool'
     )
     parser.add_argument(
         '--init-config-json',
@@ -100,6 +108,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help='How often to release the CUDA caching allocator during dynamics'
+    )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=None,
+        help='Seed numpy\'s global RNG before drawing each trajectory\'s initial '
+             'MaxwellBoltzmannDistribution velocities, for reproducible runs. '
+             'Unset (default) leaves velocities unseeded.'
     )
     parser.add_argument(
         '--target-length',
@@ -139,7 +155,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--burn-in-rounds',
         type=int,
-        default=0,
+        default=1,
         help='Force-fail (and sample) chunks with model_version below this count, '
              'so the ensemble gets some real disagreement before the audit is load-bearing'
     )
@@ -183,6 +199,25 @@ def parse_args() -> argparse.Namespace:
         help='Target observed force error for adaptive threshold calibration (Controller agent). '
              'Only used with --audit-task uq_threshold; if unset, the threshold stays fixed '
              'at --audit-threshold for the whole run.'
+    )
+    parser.add_argument(
+        '--early-stop-on-uq-spike',
+        type=int,
+        default=1,
+        help='Stop a chunk\'s dynamics mid-integration the instant its UQ score crosses '
+             'the audit threshold, instead of always running the full --chunk-size steps. '
+             'Only meaningful with --audit-task uq_threshold. The resulting short chunk '
+             'still goes through the normal audit/sample/label/retrain/retry pipeline.'
+    )
+    parser.add_argument(
+        '--catch-dynamics-crashes',
+        type=int,
+        default=1,
+        help='If 1 (default), a hard crash during dynamics (e.g. LinAlgError from the '
+             'NPT barostat) is also caught and treated like a controlled early stop. '
+             'If 0, only --early-stop-on-uq-spike stops are caught; a hard crash fails '
+             'the trajectory as before this feature existed -- set 0 to test whether '
+             'the UQ-based stop alone is enough to prevent a crash.'
     )
     parser.add_argument(
         '--calibration-history-length',
@@ -246,10 +281,36 @@ def parse_args() -> argparse.Namespace:
         help='Learner to use'
     )
     parser.add_argument(
-        '--calc',
+        '--init-weights-paths',
         type=str,
+        default=None,
+        help='Comma-separated paths to pretrained checkpoints (learner.serialize_model bytes), '
+             'used as initial ensemble weights instead of a stock mace_mp("small") clone. '
+             'Supply 1 path or one per ensemble member.'
+    )
+    parser.add_argument(
+        '--calc-type',
+        type=str,
+        choices=['mace', 'fairchem'],
         default='mace',
-        help='Calculator to use'
+        help='Which reference calculator family the Labeler uses to compute ground-truth '
+             'energies/forces/stress for sampled frames'
+    )
+    parser.add_argument(
+        '--calc-model',
+        type=str,
+        default='medium',
+        help='For --calc-type=mace, a MACE-MP model size (e.g. "medium") or path to a MACE '
+             'checkpoint. For --calc-type=fairchem, the path to a FairChem .pt checkpoint.'
+    )
+    parser.add_argument(
+        '--calc-task',
+        type=str,
+        default=None,
+        help='FairChem task name selecting the model head (e.g. "omol", "omat", "oc20", '
+             '"odac", "omc"), ignored for --calc-type=mace. Only needed for --calc-type=fairchem '
+             'if the checkpoint supports more than one task; single-task checkpoints infer it '
+             'automatically.'
     )
     parser.add_argument(
         '--db-url',
@@ -290,9 +351,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--replay-frequency', default=1, type=int, help='How often to replay')
     parser.add_argument('--replay-lr-reduction', default=1, type=float, help='Factor by which to reduce LR during replay')
     parser.add_argument('--replay-batch-size', default=None, type=int, help='Batch size used during replay')
+    parser.add_argument(
+        '--min-interatomic-distance',
+        type=float,
+        default=0.5,
+        help='Training frames with a labeled-atoms minimum interatomic distance below this '
+             '(Angstrom) are dropped before training'
+    )
+    parser.add_argument(
+        '--max-training-retries',
+        type=int,
+        default=1,
+        help='If a member\'s training run diverges (non-finite validation loss), retry it with a '
+             'fresh bootstrap draw up to this many times before keeping its previous weights'
+    )
     args = parser.parse_args()
 
     args.per_trajectory_threshold = bool(args.per_trajectory_threshold)
+    args.early_stop_on_uq_spike = bool(args.early_stop_on_uq_spike)
+    args.catch_dynamics_crashes = bool(args.catch_dynamics_crashes)
 
     return args
 
@@ -337,16 +414,29 @@ async def main():
     run_dir = (pathlib.Path("run") / f"run-{run_id}").resolve()
     run_dir.mkdir(parents=True)
 
-    # Save the run parameters to disk
+    # Save the run parameters to disk, including the init config contents since the file may be edited later
+    with open(args.init_config_json) as f:
+        params["init_configs"] = json.load(f)
     (run_dir / "params.json").write_text(json.dumps(params))
     logfile = run_dir / "runtime.log"
 
     # read in initial model
     learner = get_learner(args.learner)
-    init_weights = learner.serialize_model(learner.get_model(mace_mp('small').models[0]))
-    init_ensemble_weights = [init_weights] * args.n_ensemble
-    # cache the labeling model on the driver, since compute nodes have no internet
-    mace_mp('medium')
+    if args.init_weights_paths is not None:
+        weight_paths = [pathlib.Path(p) for p in args.init_weights_paths.split(',')]
+        if len(weight_paths) == 1:
+            print(f'--init-weights-paths gave 1 path; cloning it for all {args.n_ensemble} ensemble members')
+            init_ensemble_weights = [weight_paths[0].read_bytes()] * args.n_ensemble
+        elif len(weight_paths) != args.n_ensemble:
+            raise ValueError(
+                f'--init-weights-paths gave {len(weight_paths)} paths but --n-ensemble={args.n_ensemble}; '
+                'supply either 1 path or one path per member'
+            )
+        else:
+            init_ensemble_weights = [p.read_bytes() for p in weight_paths]
+    else:
+        init_weights = learner.serialize_model(learner.get_model(mace_mp('small').models[0]))
+        init_ensemble_weights = [init_weights] * args.n_ensemble
 
     # initialize database
     traj_db = TrajectoryDB(args.db_url)
@@ -374,6 +464,8 @@ async def main():
         a = prepare_atoms_for_dynamics(a, cfg)
 
         if cfg.temperature_K is not None:
+            if args.seed is not None:
+                np.random.seed(args.seed + i)
             MaxwellBoltzmannDistribution(a, temperature_K=cfg.temperature_K)
 
         # create trajectory entry in the database
@@ -401,7 +493,7 @@ async def main():
     # a new model while training is happening. can possibly do some math based on the retrain
     # logic to figure out the real max number of used workers
     # but this may not make as much sense once we distribute the workflow, so no worries for now
-    n_parsl_workers = len(initial_specs) + args.n_ensemble
+    n_parsl_workers = args.max_workers or len(initial_specs) + args.n_ensemble
     # only meaningful alongside the uq_threshold audit strategy, which is the
     # only audit_task that reads a 'threshold' kwarg
     use_controller = args.audit_task == 'uq_threshold' and args.target_ferr is not None
@@ -488,7 +580,7 @@ async def main():
                 db_url=args.db_url,
                 executor=pool,
                 label_task=label_frame,
-                calc_factory=partial(mace_mp, model='medium', device=args.device_label, default_dtype="float32"),
+                calc_factory=get_calc_factory(args.calc_type, args.calc_model, args.device_label, args.calc_task),
                 error_fn=max_force_error,
                 )
             if use_controller:
@@ -515,6 +607,8 @@ async def main():
                 learner=learner,
                 replay=replay,
                 replay_sampler=replay_sampler,
+                min_interatomic_distance=args.min_interatomic_distance,
+                max_training_retries=args.max_training_retries,
             )
 
             # launch all agents
@@ -581,6 +675,8 @@ async def main():
                         uq_hook=ensemble_force_deviation_uq,
                         gpu_flush_interval=args.gpu_flush_interval,
                         max_audit_retries=args.max_audit_retries,
+                        early_stop_enabled=(args.early_stop_on_uq_spike and args.audit_task == 'uq_threshold'),
+                        catch_crashes=args.catch_dynamics_crashes,
                 )
                 await manager.launch(
                     DynamicsRunner,

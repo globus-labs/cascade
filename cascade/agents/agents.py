@@ -62,6 +62,7 @@ class DynamicsRunner(CascadeAgent):
 
         # pull out variables that may change from config
         self.atoms = config.atoms.copy()
+        self.dyn_state: dict | None = None
         self.init_chunk_size = config.chunk_size
         self.chunk_size = config.chunk_size
         self.model_version = config.model_version
@@ -93,6 +94,7 @@ class DynamicsRunner(CascadeAgent):
                 traj_id=self.config.traj_id,
                 chunk_id=self.chunk_ix,
                 attempt_index=self.attempt,
+                dyn_state=self.dyn_state,
             )
 
             self.logger.info(f"Running dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index} with {spec.steps} steps")
@@ -112,6 +114,9 @@ class DynamicsRunner(CascadeAgent):
                     attempt_index=spec.attempt_index,
                     event_type=ChunkEventType.STARTED_DYNAMICS,
                 )
+                early_stop_threshold = None
+                if self.config.early_stop_enabled:
+                    early_stop_threshold = await self.auditor.get_threshold(spec.traj_id)
                 # submit dynamics for evaluation
                 chunk_future = self.config.executor.submit(
                     self.config.advance_dynamics_task,
@@ -126,6 +131,9 @@ class DynamicsRunner(CascadeAgent):
                     uq_hook=self.config.uq_hook,
                     uq_kws=self.config.uq_kws,
                     gpu_flush_interval=self.config.gpu_flush_interval,
+                    early_stop_threshold=early_stop_threshold,
+                    uq_field=self.config.uq_field,
+                    catch_crashes=self.config.catch_crashes,
                 )
 
             #todo mt.2026.04.27 does this still need to be logged?
@@ -141,8 +149,29 @@ class DynamicsRunner(CascadeAgent):
 
             # get future result
             wrapped_future = wrap_future(chunk_future)
-            await wrapped_future
-            chunk_atoms = wrapped_future.result()
+            try:
+                await wrapped_future
+                chunk_atoms, new_dyn_state = wrapped_future.result()
+            except Exception as exc:
+                reason = f"dynamics failed for chunk {spec.chunk_id} attempt {spec.attempt_index}: {exc!r}"
+                self.logger.error(f"Traj {self.config.traj_id} {reason}")
+                self._traj_db.mark_trajectory_failed(run_id=self.config.run_id, traj_id=self.config.traj_id, reason=reason)
+                self.done = True
+                self.agent_shutdown()
+                continue
+
+            # chunk_atoms includes one leading frame duplicating the previous chunk's
+            # endpoint (see the self.timestep update below) -- n_frames counts real
+            # new steps, matching the pre-dynamics placeholder call above.
+            self._traj_db.add_chunk_attempt(
+                run_id=self.config.run_id,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                model_version=self.model_version,
+                n_frames=len(chunk_atoms) - 1,
+                audit_status=AuditStatus.PENDING,
+                attempt_index=self.attempt,
+            )
 
             # write atoms # todo wrap this up
             frame_ids = []
@@ -165,6 +194,19 @@ class DynamicsRunner(CascadeAgent):
                 attempt_index=spec.attempt_index,
                 event_type=ChunkEventType.FINISHED_DYNAMICS,
             )
+            if len(chunk_atoms) - 1 < spec.steps:
+                self.logger.warning(
+                    f"Traj {self.config.traj_id} chunk {spec.chunk_id} attempt "
+                    f"{spec.attempt_index} stopped early after {len(chunk_atoms) - 1}/{spec.steps} steps"
+                )
+                self._traj_db.record_chunk_event(
+                    run_id=self.config.run_id,
+                    traj_id=spec.traj_id,
+                    chunk_id=spec.chunk_id,
+                    attempt_index=spec.attempt_index,
+                    event_type=ChunkEventType.DYNAMICS_DIVERGED,
+                    frame_id=frame_ids[-1],
+                )
 
             # submit to auditor
             chunk = Chunk(
@@ -196,7 +238,11 @@ class DynamicsRunner(CascadeAgent):
             if audit_result.status == AuditStatus.PASSED:
 
                 self.logger.info(f"Audit status passed for traj {self.config.traj_id} chunk {self.chunk_ix} attempt {self.attempt}")
-                self.timestep += self.chunk_size
+                # chunk_atoms includes one leading frame duplicating the previous
+                # chunk's endpoint (ASE calls observers once before the first step of
+                # a freshly-constructed Dynamics object) -- len(chunk_atoms) - 1 is
+                # always the real number of new steps integrated.
+                self.timestep += len(chunk_atoms) - 1
                 self.logger.info(f"On timestep {self.timestep} of {self.config.n_steps}")
                 self.done = self.timestep >= self.config.n_steps
                 if self.done:
@@ -207,6 +253,7 @@ class DynamicsRunner(CascadeAgent):
                 else:
                     # audit passed but not done: use the new atoms to run a new chunk in next pass of while loop
                     self.atoms = chunk_atoms[-1]
+                    self.dyn_state = new_dyn_state
                     self.chunk_ix += 1
                     self.attempt = 0
                     self.logger.info(f"Updating traj {self.config.traj_id} to chunk {self.chunk_ix} attempt {self.attempt}")
@@ -272,12 +319,17 @@ class Auditor(CascadeAgent):
             self.logger.info(f"Received new audit threshold {threshold} for traj {traj_id}")
 
     @action
+    async def get_threshold(self, traj_id: int | None = None) -> float | None:
+        return self.thresholds.get(traj_id, self.default_threshold)
+
+    @action
     async def audit(self, chunk: Chunk) -> AuditResult:
         """Submit a chunk for audit"""
         self.logger.info(f'Submitting audit of traj {chunk.traj_id} chunk {chunk.chunk_id} attempt {chunk.attempt_ix} to executor')
 
         audit_kws = {**self.config.audit_kws}
-        audit_kws['threshold'] = self.thresholds.get(chunk.traj_id, self.default_threshold)
+        if 'threshold' in self.config.audit_kws:
+            audit_kws['threshold'] = self.thresholds.get(chunk.traj_id, self.default_threshold)
 
         future = self.config.executor.submit(
             self.audit_task,
@@ -515,7 +567,7 @@ class Labeler(CascadeAgent):
             f"chunk={frame.chunk_id}, attempt={frame.attempt_index};"
             f"labled from chunk={labeled_count}, sampled from chunk:{frame.n_sampled_frames}"
         )
-        if labeled_count == frame.n_sampled_frames-1:  # recall the chunk stores an initial frame which wont get labeled
+        if labeled_count == frame.n_sampled_frames:  # n_sampled_frames is already the real dispatched-batch size
             self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.FINISHED_LABELING)
         self.logger.info(
             f"Added training frame to database: traj={frame.traj_id}, "
@@ -550,13 +602,63 @@ class Trainer(CascadeAgent):
         self.config = config
         self.weights = deepcopy(config.weights)
 
+    def _filter_unphysical_frames(self, frames):
+        """Drop frames whose minimum interatomic distance is below a physically-plausible
+        threshold (e.g. from a collapsing/unstable cell), so training never sees collided
+        structures."""
+        kept = []
+        for atoms in frames:
+            dists = atoms.get_all_distances(mic=True)
+            np.fill_diagonal(dists, np.inf)
+            if dists.min() >= self.config.min_interatomic_distance:
+                kept.append(atoms)
+        n_dropped = len(frames) - len(kept)
+        if n_dropped:
+            self.logger.warning(
+                f'Dropped {n_dropped}/{len(frames)} training frames with min interatomic '
+                f'distance < {self.config.min_interatomic_distance} A'
+            )
+        return kept
+
+    @staticmethod
+    def _training_diverged(log) -> bool:
+        """Whether a member's returned training log shows the run diverged (non-finite loss)."""
+        loss_col = 'total_loss_valid' if 'total_loss_valid' in log.columns else 'total_loss_train'
+        return not np.isfinite(log[loss_col].iloc[-1])
+
+    async def _train_member(self, member_index, member_weights, train_data, valid_data, n_sample, rng):
+        """Train one ensemble member, retrying with a fresh bootstrap draw if it diverges.
+        Falls back to this member's current weights (logging the diverged run for
+        observability) if it's still diverged after max_training_retries."""
+        for attempt in range(self.config.max_training_retries + 1):
+            boot_idx = rng.integers(0, len(train_data), size=n_sample)
+            boot_data = [train_data[i] for i in boot_idx]
+            future = self.config.executor.submit(
+                self.config.training_task,
+                learner=self.config.learner,
+                weights=member_weights,
+                train_data=boot_data,
+                valid_data=valid_data,
+                train_kws=self.config.training_kws,
+                replay=self.config.replay,
+            )
+            new_weights, log = await wrap_future(future)
+            if not self._training_diverged(log):
+                return new_weights, log
+            remaining = self.config.max_training_retries - attempt
+            self.logger.warning(
+                f'Member {member_index} training diverged on attempt {attempt + 1}/'
+                f'{self.config.max_training_retries + 1}'
+                + (f'; retrying ({remaining} attempt(s) left)' if remaining > 0 else '; keeping previous weights')
+            )
+        return member_weights, log
+
     @action
     async def train_model(
         self,
         training_round: int,
     ) -> list[bytes]:
         from sklearn.model_selection import train_test_split
-        import numpy as np
 
         self.logger.info(f'Fetching training data for training round {training_round}')
         train_data = self._traj_db.get_training_frames(
@@ -567,6 +669,10 @@ class Trainer(CascadeAgent):
             self.logger.warning(f'No training frames found for round {training_round}, skipping training')
             return self.weights
         self.logger.info(f'Got {len(train_data)} training frames')
+        train_data = self._filter_unphysical_frames(train_data)
+        if not train_data:
+            self.logger.warning(f'All training frames for round {training_round} were filtered as unphysical, skipping training')
+            return self.weights
         train_data, valid_data = train_test_split(train_data, test_size=0.2)
         self.logger.info(f'Train size: {len(train_data)}, val size: {len(valid_data)}')
 
