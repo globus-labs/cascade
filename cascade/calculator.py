@@ -23,19 +23,7 @@ def _build_mace_calc(calc_model: str, device: str) -> Calculator:
 
 
 def _build_fairchem_calc(calc_model: str, calc_task: str | None, device: str) -> Calculator:
-    # See https://github.com/ACEsuit/mace/issues/555.
-    os.environ.setdefault('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
-    from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
-    # FAIRChemCalculator only accepts bare "cpu"/"cuda" (unlike mace_mp), and resolves
-    # "cuda" via torch.cuda.current_device()
-    if device.startswith('cuda:'):
-        import torch
-        torch.cuda.set_device(int(device.split(':', 1)[1]))
-    return FAIRChemCalculator.from_model_checkpoint(
-        name_or_path=calc_model,
-        task_name=calc_task,
-        device='cuda' if device.startswith('cuda') else device,
-    )
+    return make_fairchem_calculator(calc_model, calc_task, device)
 
 
 def get_calc_factory(
@@ -166,16 +154,16 @@ def make_calculator(
 _fairchem_calculators: dict[tuple[str, str, str], Calculator] = {}
 
 
-def make_fairchem_calculator(checkpoint: str | Path, task_name: str = 'omat', device: str = 'cpu') -> Calculator:
+def make_fairchem_calculator(checkpoint: str | Path, task_name: str | None = None, device: str = 'cpu') -> Calculator:
     """Load a fairchem (e.g., UMA) checkpoint as an ASE calculator, cached per process
 
-    fairchem only accepts 'cpu' or 'cuda' devices. For other devices (e.g., 'xpu'), the
-    predictor is built on the CPU and its device swapped before first use; it moves the
-    model to that device on its first prediction.
+    fairchem only accepts bare 'cpu' or 'cuda' devices. 'cuda:N' selects the current CUDA
+    device. For other devices (e.g., 'xpu'), the predictor is built on the CPU and its device
+    swapped before first use; it moves the model to that device on its first prediction.
 
     Args:
         checkpoint: Path to the inference checkpoint
-        task_name: Task head to use for predictions
+        task_name: Task head to use for predictions; inferred for single-task checkpoints
         device: Torch device on which to run the model
     Returns:
         A FAIRChemCalculator
@@ -186,10 +174,15 @@ def make_fairchem_calculator(checkpoint: str | Path, task_name: str = 'omat', de
         os.environ.setdefault('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
         from fairchem.core import FAIRChemCalculator, pretrained_mlip
 
-        supported = device in ('cpu', 'cuda')
-        predictor = pretrained_mlip.load_predict_unit(str(checkpoint), device=device if supported else 'cpu')
+        if device.startswith('cuda:'):
+            # fairchem resolves "cuda" via torch.cuda.current_device()
+            import torch
+            torch.cuda.set_device(int(device.split(':', 1)[1]))
+        fc_device = 'cuda' if device.startswith('cuda') else device
+        supported = fc_device in ('cpu', 'cuda')
+        predictor = pretrained_mlip.load_predict_unit(str(checkpoint), device=fc_device if supported else 'cpu')
         if not supported:
-            predictor.device = device
+            predictor.device = fc_device
         _fairchem_calculators[key] = FAIRChemCalculator(predictor, task_name=task_name)
     return _fairchem_calculators[key]
 
