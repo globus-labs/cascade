@@ -1,5 +1,6 @@
 import asyncio
 import argparse
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
@@ -19,7 +20,9 @@ from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase import units
 from ase.md.verlet import VelocityVerlet
 from mace.calculators import mace_mp
+import parsl
 from parsl.concurrent import ParslPoolExecutor
+from parsl.executors import HighThroughputExecutor
 from academy.logging.recommended import recommended_logging
 from academy.exchange import LocalExchangeFactory
 from academy.manager import Manager
@@ -78,6 +81,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--walltime', default='0:30:00', help='PBS walltime for --parsl-config aurora')
     parser.add_argument('--nodes', type=int, default=1,
                         help='Nodes for --parsl-config aurora (12 workers per node, one per tile)')
+    parser.add_argument('--max-wall-hours', type=float, default=None,
+                        help='Shut the run down after the batch job(s) have been running this many hours '
+                             '(queue wait not counted). Default: run until all trajectories finish.')
     parser.add_argument(
         '--log-level',
         type=str,
@@ -281,11 +287,18 @@ def parse_args() -> argparse.Namespace:
         help='Learner to use'
     )
     parser.add_argument(
+        '--learner-model',
+        type=str,
+        default='small',
+        help='Initial model for the learner ensemble: a MACE-MP model size (e.g. "small", '
+             '"medium", "large") or path to a MACE checkpoint. Cloned for every ensemble member.'
+    )
+    parser.add_argument(
         '--init-weights-paths',
         type=str,
         default=None,
         help='Comma-separated paths to pretrained checkpoints (learner.serialize_model bytes), '
-             'used as initial ensemble weights instead of a stock mace_mp("small") clone. '
+             'used as initial ensemble weights; overrides --learner-model. '
              'Supply 1 path or one per ensemble member.'
     )
     parser.add_argument(
@@ -374,6 +387,20 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+async def wait_for_wall_hours(hours: float, interval: float = 30.) -> None:
+    """Return once Parsl workers have been connected for `hours` in total.
+
+    Time only counts while at least one manager (node) is connected, so PBS queue
+    wait is excluded and runtime from successive jobs adds up.
+    """
+    htex = next(e for e in parsl.dfk().executors.values() if isinstance(e, HighThroughputExecutor))
+    used = 0.
+    while used < hours * 3600:
+        await asyncio.sleep(interval)
+        if await asyncio.to_thread(htex.connected_managers):
+            used += interval
+
+
 def get_learner(learner_name: str) -> type[ase.calculators.calculator.Calculator]:
     if learner_name == 'mace':
         return MACEInterface()
@@ -435,8 +462,15 @@ async def main():
         else:
             init_ensemble_weights = [p.read_bytes() for p in weight_paths]
     else:
-        init_weights = learner.serialize_model(learner.get_model(mace_mp('small').models[0]))
+        init_weights = learner.serialize_model(learner.get_model(mace_mp(model=args.learner_model).models[0]))
         init_ensemble_weights = [init_weights] * args.n_ensemble
+
+    # compute nodes have no internet: load the reference model here so MACE-MP
+    # downloads land in the shared ~/.cache/mace, and bad names/paths fail early
+    if args.calc_type == 'mace':
+        mace_mp(model=args.calc_model)
+    elif not pathlib.Path(args.calc_model).is_file():
+        raise FileNotFoundError(f'--calc-model {args.calc_model} is not a local {args.calc_type} checkpoint')
 
     # initialize database
     traj_db = TrajectoryDB(args.db_url)
@@ -697,9 +731,34 @@ async def main():
                 ),
                 registration=db_reg,
             )
-            # wait for the run to finish!
+            # wait for the run to finish, or for --max-wall-hours of batch-job runtime
             try:
-                await manager.wait([db_handle])
+                finished = asyncio.create_task(manager.wait([db_handle]))
+                waits = {finished}
+                if args.max_wall_hours is not None:
+                    waits.add(asyncio.create_task(wait_for_wall_hours(args.max_wall_hours)))
+                done, pending = await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+                if finished not in done:
+                    print(f'--max-wall-hours {args.max_wall_hours} reached, shutting down')
+                    # stop callers before the agents they call, so no agent is left waiting on
+                    # an agent that has already exited, and all exit before Parsl goes away
+                    waves = [
+                        [db_handle, *dyn_handles],
+                        [auditor_handle],
+                        [sampler_handle],
+                        [labeler_handle],
+                        [h for h in (controller_handle, trainer_handle) if h is not None],
+                    ]
+                    for wave in waves:
+                        for handle in wave:
+                            await manager.shutdown(handle, blocking=False)
+                        with contextlib.suppress(TimeoutError):
+                            await manager.wait(wave, timeout=60)
+                    # don't wait for in-flight chunks/training; this also deletes the PBS job.
+                    # It clears the pool's DFK, so the `with` block's shutdown becomes a no-op
+                    pool.shutdown(wait=False)
             except KeyboardInterrupt:
                 # attempt graceful shutdown on keyboard interrupt
                 for handle in handles:
