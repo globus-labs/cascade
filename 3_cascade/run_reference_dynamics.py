@@ -15,19 +15,21 @@ import pathlib
 import warnings
 from concurrent.futures import as_completed
 
-from parsl.config import Config
-from parsl.executors import HighThroughputExecutor
-from parsl.providers import LocalProvider
-from parsl.usage_tracking.levels import LEVEL_1
 from parsl.concurrent import ParslPoolExecutor
 
 from cascade.traj_config import InitialTrajConfig, load_initial_configs
+from config import CONFIGS, get_parsl_config
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="mace.calculators")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument('--parsl-config', choices=list(CONFIGS), default='local', help='Parsl config from config.py')
+    parser.add_argument('--queue', default='debug', help='PBS queue for --parsl-config aurora')
+    parser.add_argument('--walltime', default='0:30:00', help='PBS walltime for --parsl-config aurora')
+    parser.add_argument('--nodes', type=int, default=1,
+                        help='Nodes for --parsl-config aurora (12 workers per node, one per tile)')
     parser.add_argument(
         '--init-config-json',
         type=str,
@@ -83,6 +85,12 @@ def parse_args() -> argparse.Namespace:
              'so get_trajectory_atoms reflects live progress rather than only the final result'
     )
     parser.add_argument(
+        '--save-interval',
+        type=int,
+        default=1,
+        help='Write a frame to the database every this many steps'
+    )
+    parser.add_argument(
         '--db-url',
         type=str,
         default=os.environ.get('CASCADE_DB_URL'),
@@ -110,6 +118,7 @@ def run_reference_trajectory(
     device: str,
     log_level: str,
     log_interval: int,
+    save_interval: int = 1,
 ) -> None:
     """Run one trajectory to completion using a fixed reference calculator, writing frames directly to the DB"""
     import csv
@@ -200,7 +209,7 @@ def run_reference_trajectory(
         ])
         mem_csv.flush()
 
-    dyn.attach(write_frame)
+    dyn.attach(write_frame, interval=save_interval)
     dyn.attach(mark_progress, interval=log_interval)
     dyn.attach(manage_and_log_gpu_memory, interval=log_interval)
     logger.info(f'Starting reference dynamics for traj {traj_id}, {target_length} steps')
@@ -227,26 +236,26 @@ def main():
     init_configs = load_initial_configs(args.init_config_json)
 
     # Save the init config contents, not just the path, since the file may be edited later
-    run_dir = pathlib.Path("run") / run_id
+    # (absolute, since it is also Parsl's run dir)
+    run_dir = (pathlib.Path("run") / run_id).resolve()
     run_dir.mkdir(parents=True)
     with open(args.init_config_json) as f:
         params["init_configs"] = json.load(f)
     (run_dir / "params.json").write_text(json.dumps(params, indent=2))
 
-    max_workers = args.max_workers or len(init_configs)
-    config = Config(
-        executors=[
-            HighThroughputExecutor(
-                label="htex_local",
-                max_workers_per_node=max_workers,
-                provider=LocalProvider(
-                    init_blocks=1,
-                    max_blocks=1,
-                ),
-            )
-        ],
-        usage_tracking=LEVEL_1,
-    )
+    # compute nodes have no internet: load the model here so MACE-MP downloads land in
+    # the shared ~/.cache/mace, and bad names/paths fail before any job is submitted
+    if args.calc_type == 'mace':
+        from mace.calculators import mace_mp
+        mace_mp(model=args.calc_model)
+    elif not pathlib.Path(args.calc_model).is_file():
+        raise FileNotFoundError(f'--calc-model {args.calc_model} is not a local {args.calc_type} checkpoint')
+
+    if args.parsl_config == 'local':
+        parsl_kws = dict(workers_per_node=args.max_workers or len(init_configs))
+    else:
+        parsl_kws = dict(queue=args.queue, walltime=args.walltime, nodes_per_job=args.nodes)
+    config = get_parsl_config(args.parsl_config, str(run_dir / 'parsl'), **parsl_kws)
 
     logger.info(f'Running {len(init_configs)} reference trajectories under run_id={run_id}')
     with ParslPoolExecutor(config=config) as pool:
@@ -255,6 +264,7 @@ def main():
                 run_reference_trajectory,
                 traj_id, cfg, run_id, args.db_url, args.target_length,
                 args.calc_type, args.calc_model, args.calc_task, args.device, args.log_level, args.log_interval,
+                args.save_interval,
             )
             for traj_id, cfg in enumerate(init_configs)
         ]
