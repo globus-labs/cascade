@@ -9,6 +9,7 @@ import contextlib
 import gc
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
@@ -37,6 +38,9 @@ from sqlalchemy.orm import relationship, sessionmaker, declarative_base
 from cascade.model import AuditStatus, TrajectoryStatus, ChunkEventType
 
 Base = declarative_base()
+
+GC_INTERVAL_S = 60.
+_last_gc = 0.
 
 
 class DBTrajectory(Base):
@@ -290,8 +294,12 @@ class TrajectoryDB:
             raise
         finally:
             session.close()
-            # Force garbage collection after session close to release any held references
-            gc.collect()
+            # Periodic full collection to release leaked references (it walks every live object,
+            # so running it per session dominated driver time at 48 trajectories)
+            global _last_gc
+            if time.monotonic() - _last_gc > GC_INTERVAL_S:
+                _last_gc = time.monotonic()
+                gc.collect()
     
     @staticmethod
     def _serialize_atoms(atoms: Atoms) -> bytes:
@@ -376,7 +384,54 @@ class TrajectoryDB:
             sess.flush()
             sess.refresh(db_frame)
             return db_frame.id
-    
+
+    def write_frames(
+        self,
+        run_id: str,
+        traj_id: int,
+        chunk_id: int,
+        attempt_index: int,
+        start_index: int,
+        atoms_list: list[Atoms]
+    ) -> list[int]:
+        """Write consecutive frames in one session (same semantics as write_frame per frame)
+
+        Frame i gets frame_index start_index + i.
+
+        Returns:
+            IDs of the frame records, in the order of atoms_list
+        """
+        with self.session() as sess:
+            existing = {
+                f.frame_index: f
+                for f in sess.query(DBTrajectoryFrame).filter_by(
+                    run_id=run_id,
+                    traj_id=traj_id,
+                    chunk_id=chunk_id,
+                    attempt_index=attempt_index,
+                ).filter(DBTrajectoryFrame.frame_index.between(start_index, start_index + len(atoms_list) - 1))
+            }
+            db_frames = []
+            for i, atoms in enumerate(atoms_list):
+                atoms_blob = self._serialize_atoms(atoms)
+                frame_index = start_index + i
+                if frame_index in existing:
+                    db_frame = existing[frame_index]
+                    db_frame.atoms_blob = atoms_blob
+                else:
+                    db_frame = DBTrajectoryFrame(
+                        run_id=run_id,
+                        traj_id=traj_id,
+                        chunk_id=chunk_id,
+                        attempt_index=attempt_index,
+                        frame_index=frame_index,
+                        atoms_blob=atoms_blob
+                    )
+                    sess.add(db_frame)
+                db_frames.append(db_frame)
+            sess.flush()
+            return [f.id for f in db_frames]
+
     def _set_trajectory_status(
         self,
         sess,

@@ -173,19 +173,16 @@ class DynamicsRunner(CascadeAgent):
                 attempt_index=self.attempt,
             )
 
-            # write atoms # todo wrap this up
-            frame_ids = []
-            for frame_index, _atoms in enumerate(chunk_atoms):
-                frame_index += self.timestep
-                _id = self._traj_db.write_frame(
-                    run_id=spec.run_id,
-                    traj_id=spec.traj_id,
-                    chunk_id=spec.chunk_id,
-                    attempt_index=spec.attempt_index,
-                    frame_index=frame_index,
-                    atoms=_atoms
-                )
-                frame_ids.append(_id)
+            # one session per chunk; in a thread so the other agents' loops keep running
+            frame_ids = await asyncio.to_thread(
+                self._traj_db.write_frames,
+                run_id=spec.run_id,
+                traj_id=spec.traj_id,
+                chunk_id=spec.chunk_id,
+                attempt_index=spec.attempt_index,
+                start_index=self.timestep,
+                atoms_list=chunk_atoms,
+            )
             self.logger.info(f"Finished dynamics for traj {spec.traj_id} chunk {spec.chunk_id} attempt {spec.attempt_index}")
             self._traj_db.record_chunk_event(
                 run_id=self.config.run_id,
