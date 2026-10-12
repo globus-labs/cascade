@@ -53,13 +53,14 @@ def random_audit(
     return AuditResult(status=status, score=score, reason='random_accept')
 
 
-def _frames_from_indices(chunk: Chunk, indices, n_sample: int) -> list[TrainingFrame]:
+def _frames_from_indices(chunk: Chunk, indices) -> list[TrainingFrame]:
     """Build one TrainingFrame per index into chunk.atoms/frame_ids.
 
     Used by sampling tasks to create training frames for labeler
     """
     from cascade.model import TrainingFrame
 
+    n_sample = len(indices)
     return [
         TrainingFrame(
             atoms=chunk.atoms[i],
@@ -92,7 +93,7 @@ def random_sample(
     rng = np.random.default_rng(seed=None)
     n_sample = min(n_frames, len(chunk.atoms))
     indices = rng.choice(len(chunk.atoms), size=n_sample, replace=False)
-    return _frames_from_indices(chunk, indices, n_sample)
+    return _frames_from_indices(chunk, indices)
 
 
 def max_uq_sample(
@@ -110,7 +111,7 @@ def max_uq_sample(
     values = np.array([a.info[field] for a in chunk.atoms])
     n_sample = min(n_frames, len(chunk.atoms))
     indices = np.argsort(-values)[:n_sample]
-    return _frames_from_indices(chunk, indices, n_sample)
+    return _frames_from_indices(chunk, indices)
 
 
 def boundary_uq_sample(
@@ -131,7 +132,7 @@ def boundary_uq_sample(
     crossing_idx = int(crossings[0])
     start = max(0, crossing_idx - n_sample + 1)
     indices = list(range(start, crossing_idx + 1))
-    return _frames_from_indices(chunk, indices, n_sample)
+    return _frames_from_indices(chunk, indices)
 
 
 def audit_reason_sample(
