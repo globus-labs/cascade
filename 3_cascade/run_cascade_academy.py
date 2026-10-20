@@ -1,7 +1,7 @@
 import asyncio
 import argparse
 import contextlib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor, ThreadPoolExecutor
 import logging
 import os
 import warnings
@@ -191,6 +191,15 @@ def parse_args() -> argparse.Namespace:
         choices=['random', 'uq_threshold'],
         help='Audit strategy: "random" accepts/rejects chunks randomly (--accept-rate); '
              '"uq_threshold" fails chunks whose ensemble force-disagreement exceeds --audit-threshold'
+    )
+    parser.add_argument(
+        '--local-executor',
+        nargs='*',
+        default=[],
+        choices=['dynamics', 'auditor', 'sampler', 'labeler', 'trainer'],
+        help='Agents whose tasks run in a thread pool in this process instead of on the Parsl pool. '
+             'Intended for cheap tasks (e.g., auditor with uq_threshold, sampler); local dynamics, '
+             'labeler, or trainer use whatever device they name on the launch host'
     )
     parser.add_argument(
         '--audit-threshold',
@@ -538,7 +547,20 @@ async def main():
         parsl_kws = dict(queue=args.queue, walltime=args.walltime, nodes_per_job=args.nodes)
     config = get_parsl_config(args.parsl_config, str(run_dir / 'parsl'), **parsl_kws)
 
-    with ParslPoolExecutor(config=config) as pool:
+    with ParslPoolExecutor(config=config) as pool, contextlib.ExitStack() as stack:
+        # one pool per local agent so e.g. a sampling backlog can't delay audits;
+        # sized to the trajectory count, which bounds each agent's in-flight tasks
+        local_pools = {}
+        for name in args.local_executor:
+            local_pools[name] = ThreadPoolExecutor(thread_name_prefix=f'{name}-local')
+            # don't block exit on in-flight tasks, matching the Parsl pool on --max-wall-hours
+            stack.callback(local_pools[name].shutdown, wait=False, cancel_futures=True)
+        if local_pools:
+            print(f'Running tasks locally for agents: {sorted(local_pools)}')
+
+        def executor_for(name: str) -> Executor:
+            return local_pools.get(name, pool)
+
         async with await Manager.from_exchange_factory(
             factory=LocalExchangeFactory(),
             executors=ThreadPoolExecutor(max_workers=n_agents),
@@ -585,7 +607,7 @@ async def main():
                 audit_kws = dict(threshold=args.audit_threshold, burn_in_model_versions=args.burn_in_rounds)
             auditor_config = AuditorConfig(
                 audit_task=get_audit_task(args.audit_task),
-                executor=pool,
+                executor=executor_for('auditor'),
                 run_id=run_id,
                 db_url=args.db_url,
                 audit_kws=audit_kws,
@@ -604,7 +626,7 @@ async def main():
                 run_id=run_id,
                 db_url=args.db_url,
                 n_frames=args.n_sample_frames,
-                executor=pool,
+                executor=executor_for('sampler'),
                 sample_task=sample_task,
                 burn_in_model_versions=args.burn_in_rounds,
                 burn_in_n_frames=args.burn_in_n_frames,
@@ -612,7 +634,7 @@ async def main():
             labeler_config = LabelerConfig(
                 run_id=run_id,
                 db_url=args.db_url,
-                executor=pool,
+                executor=executor_for('labeler'),
                 label_task=label_frame,
                 calc_factory=get_calc_factory(args.calc_type, args.calc_model, args.device_label, args.calc_task),
                 error_fn=max_force_error,
@@ -630,7 +652,7 @@ async def main():
                 run_id=run_id,
                 db_url=args.db_url,
                 weights=init_ensemble_weights,
-                executor=pool,
+                executor=executor_for('trainer'),
                 training_task=train,
                 training_args=(),
                 training_kws=dict(
@@ -696,7 +718,7 @@ async def main():
                         traj_id=spec.traj_id,
                         chunk_size=args.chunk_size,
                         n_steps=args.target_length,
-                        executor=pool,
+                        executor=executor_for('dynamics'),
                         advance_dynamics_task=advance_dynamics,
                         learner=learner,
                         run_dir=run_dir,
