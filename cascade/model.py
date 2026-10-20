@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from ase import Atoms
@@ -30,6 +30,8 @@ class AuditResult:
     """How good or bad the chunk was in terms of uncertainty"""
     reason: str | None = None
     """Which mechanism produced this result, e.g. 'threshold', 'burn_in', 'random_fail', 'random_accept'"""
+    labeled_frames: list[TrainingFrame] = field(default_factory=list)
+    """Frames the audit labeled with the reference calculator; the Auditor stores them as training data"""
 
 
 class TrajectoryDiverged(Exception):
