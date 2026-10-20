@@ -155,9 +155,9 @@ class DBTrainingFrame(Base):
 
 
 class DBReferenceEvaluation(Base):
-    """Post-hoc reference-calculator evaluation of an already-accepted (passed) chunk's
-    frame. Offline QA data -- distinct from DBTrainingFrame, which backs the live
-    Controller's calibration and must never be mixed with this."""
+    """Post-hoc reference-calculator evaluation of a frame from an already-audited chunk
+    Offline QA data -- distinct from DBTrainingFrame, which backs the live Controller's
+    calibration and must never be mixed with this."""
     __tablename__ = 'reference_evaluations'
 
     id = Column(Integer, primary_key=True)
@@ -1281,7 +1281,7 @@ class TrajectoryDB:
         energy_surrogate: Optional[float] = None,
         energy_reference: Optional[float] = None,
     ) -> dict:
-        """Record a post-hoc reference-calculator evaluation of an already-passed chunk's frame.
+        """Record a post-hoc reference-calculator evaluation of an already-audited chunk's frame.
 
         Idempotent on (run_id, trajectory_frame_id, calc_type, calc_model): re-evaluating the
         same frame with the same reference calculator is a no-op that returns the existing row,
