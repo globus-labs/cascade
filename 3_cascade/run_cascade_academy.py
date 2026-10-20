@@ -53,6 +53,7 @@ from cascade.calculator import get_calc_factory
 from cascade.agents.task import (
     random_audit,
     uq_threshold_audit,
+    last_frame_error_audit,
     advance_dynamics,
     random_sample,
     max_uq_sample,
@@ -188,9 +189,11 @@ def parse_args() -> argparse.Namespace:
         '--audit-task',
         type=str,
         default='random',
-        choices=['random', 'uq_threshold'],
+        choices=['random', 'uq_threshold', 'last_frame_error'],
         help='Audit strategy: "random" accepts/rejects chunks randomly (--accept-rate); '
-             '"uq_threshold" fails chunks whose ensemble force-disagreement exceeds --audit-threshold'
+             '"uq_threshold" fails chunks whose ensemble force-disagreement exceeds --audit-threshold; '
+             '"last_frame_error" labels each chunk\'s last frame with the reference calc and fails the '
+             'chunk if its max force error exceeds --target-ferr (no UQ; needs the auditor on the Parsl pool)'
     )
     parser.add_argument(
         '--local-executor',
@@ -212,8 +215,9 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help='Target observed force error for adaptive threshold calibration (Controller agent). '
-             'Only used with --audit-task uq_threshold; if unset, the threshold stays fixed '
-             'at --audit-threshold for the whole run.'
+             'With --audit-task uq_threshold; if unset, the threshold stays fixed '
+             'at --audit-threshold for the whole run. With --audit-task last_frame_error it is '
+             'the (required) pass/fail force-error threshold.'
     )
     parser.add_argument(
         '--early-stop-on-uq-spike',
@@ -263,7 +267,8 @@ def parse_args() -> argparse.Namespace:
         help='Sampling strategy for picking training frames out of a failed chunk: "random" (current '
              'default), "max_uq" (highest per-frame UQ), "boundary" (frames around the first frame '
              'crossing threshold), or "audit_reason" (routes to one of the three per why the chunk '
-             'failed audit -- see --burn-in-sample-task/--threshold-sample-task/--random-fail-sample-task)'
+             'failed audit -- see --burn-in-sample-task/--threshold-sample-task/--random-fail-sample-task/'
+             '--last-frame-error-sample-task)'
     )
     parser.add_argument(
         '--burn-in-sample-task',
@@ -288,6 +293,14 @@ def parse_args() -> argparse.Namespace:
         choices=['random', 'max_uq', 'boundary'],
         help='Only used with --sample-task audit_reason: strategy for chunks failed by '
              '--audit-random-fail-rate, which have no real crossing to anchor on'
+    )
+    parser.add_argument(
+        '--last-frame-error-sample-task',
+        type=str,
+        default='random',
+        choices=['random', 'max_uq', 'boundary'],
+        help='Only used with --sample-task audit_reason: strategy for chunks failed by the '
+             'last_frame_error audit, which does not use UQ'
     )
     parser.add_argument(
         '--learner',
@@ -422,6 +435,8 @@ def get_audit_task(audit_task_name: str) -> Callable[..., AuditResult]:
         return random_audit
     elif audit_task_name == 'uq_threshold':
         return uq_threshold_audit
+    elif audit_task_name == 'last_frame_error':
+        return last_frame_error_audit
     else:
         raise ValueError(f'Unknown audit task: {audit_task_name}')
 
@@ -537,8 +552,9 @@ async def main():
     # logic to figure out the real max number of used workers
     # but this may not make as much sense once we distribute the workflow, so no worries for now
     n_parsl_workers = args.max_workers or len(initial_specs) + args.n_ensemble
-    # only meaningful alongside the uq_threshold audit strategy, which is the
-    # only audit_task that reads a 'threshold' kwarg
+    if args.audit_task == 'last_frame_error' and args.target_ferr is None:
+        raise ValueError('--audit-task last_frame_error requires --target-ferr')
+    # the Controller calibrates a UQ threshold, so it only applies to the uq_threshold audit
     use_controller = args.audit_task == 'uq_threshold' and args.target_ferr is not None
     n_agents = len(initial_specs) + 5 + (1 if use_controller else 0)  # one dynamics runner per traj and one of each other agent
     if args.parsl_config == 'local':
@@ -601,8 +617,18 @@ async def main():
                 retrain_len=args.retrain_len,
                 retrain_fraction=args.retrain_fraction,
             )
+            # shared by labeler and last_frame_error audit so both label and score frames the same way
+            calc_factory = get_calc_factory(args.calc_type, args.calc_model, args.device_label, args.calc_task)
+            error_fn = max_force_error
             if args.audit_task == 'random':
                 audit_kws = dict(accept_prob=args.accept_rate)
+            elif args.audit_task == 'last_frame_error':
+                audit_kws = dict(
+                    threshold=args.target_ferr,
+                    calc_factory=calc_factory,
+                    error_fn=error_fn,
+                    burn_in_model_versions=args.burn_in_rounds,
+                )
             else:
                 audit_kws = dict(threshold=args.audit_threshold, burn_in_model_versions=args.burn_in_rounds)
             auditor_config = AuditorConfig(
@@ -611,6 +637,7 @@ async def main():
                 run_id=run_id,
                 db_url=args.db_url,
                 audit_kws=audit_kws,
+                error_fn=error_fn,
                 random_fail_rate=args.audit_random_fail_rate,
             )
             if args.sample_task == 'audit_reason':
@@ -619,6 +646,7 @@ async def main():
                     burn_in_sampler=get_sample_task(args.burn_in_sample_task),
                     threshold_sampler=get_sample_task(args.threshold_sample_task),
                     random_sampler=get_sample_task(args.random_fail_sample_task),
+                    last_frame_error_sampler=get_sample_task(args.last_frame_error_sample_task),
                 )
             else:
                 sample_task = get_sample_task(args.sample_task)
@@ -636,8 +664,8 @@ async def main():
                 db_url=args.db_url,
                 executor=executor_for('labeler'),
                 label_task=label_frame,
-                calc_factory=get_calc_factory(args.calc_type, args.calc_model, args.device_label, args.calc_task),
-                error_fn=max_force_error,
+                calc_factory=calc_factory,
+                error_fn=error_fn,
                 )
             if use_controller:
                 controller_config = ControllerConfig(

@@ -145,17 +145,20 @@ def audit_reason_sample(
     burn_in_sampler: Callable[..., list[TrainingFrame]] = random_sample,
     threshold_sampler: Callable[..., list[TrainingFrame]] = boundary_uq_sample,
     random_sampler: Callable[..., list[TrainingFrame]] = max_uq_sample,
+    last_frame_error_sampler: Callable[..., list[TrainingFrame]] = random_sample,
 ) -> list[TrainingFrame]:
     """Dispatches to different smapling methods based on audit failure reason
 
     burn_in_sampler: when the audit failure reasion is "burn_in"
     threshold_sampler: when the audit failure reason is "threshold"
     random_sampler: when the audit failure reason is "random_fail"
+    last_frame_error_sampler: when the audit failure reason is "last_frame_error"
     """
     strategy = {
         'burn_in': burn_in_sampler,
         'threshold': threshold_sampler,
         'random_fail': random_sampler,
+        'last_frame_error': last_frame_error_sampler,
     }.get(reason)
     return strategy(chunk, n_frames, threshold=threshold, field=field)
 
