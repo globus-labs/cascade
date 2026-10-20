@@ -14,6 +14,7 @@ from copy import deepcopy
 from dataclasses import replace
 
 import numpy as np
+from ase.neighborlist import neighbor_list
 
 from academy.handle import Handle
 from academy.agent import Agent, action, loop
@@ -389,7 +390,7 @@ class Controller(CascadeAgent):
     async def update_threshold(self, traj_id: int) -> None:
         """Recalibrate threshold/alpha from labeled frames, if enough observations exist.
 
-        Called by: Labeler, on every newly labeled frame
+        Called by: Labeler, once each chunk finishes labeling
         Invokes: Auditor (to update threshold)
         """
         key = traj_id if self.config.per_trajectory_threshold else None
@@ -541,7 +542,8 @@ class Labeler(CascadeAgent):
             self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.STARTED_LABELING)
         self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.STARTED_LABELING_FRAME, frame_id=frame.frame_id)
 
-    def _record_labeling_finished(self, frame: TrainingFrame) -> None:
+    def _record_labeling_finished(self, frame: TrainingFrame) -> bool:
+        """Store the labeled frame; return whether it completed its chunk"""
         chunk_kws = dict(
             run_id=self.config.run_id,
             traj_id=frame.traj_id,
@@ -564,13 +566,15 @@ class Labeler(CascadeAgent):
             f"chunk={frame.chunk_id}, attempt={frame.attempt_index};"
             f"labled from chunk={labeled_count}, sampled from chunk:{frame.n_sampled_frames}"
         )
-        if labeled_count == frame.n_sampled_frames:  # n_sampled_frames is already the real dispatched-batch size
+        chunk_done = labeled_count == frame.n_sampled_frames  # n_sampled_frames is already the real dispatched-batch size
+        if chunk_done:
             self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.FINISHED_LABELING)
         self.logger.info(
             f"Added training frame to database: traj={frame.traj_id}, "
             f"chunk={frame.chunk_id}, attempt={frame.attempt_index}, "
             f"model_version={frame.model_version}"
         )
+        return chunk_done
 
     @action
     async def label_data(self, frame: TrainingFrame) -> None:
@@ -585,8 +589,8 @@ class Labeler(CascadeAgent):
         await wrapped_future
         frame = wrapped_future.result()
 
-        self._record_labeling_finished(frame)
-        if self.controller is not None:
+        chunk_done = self._record_labeling_finished(frame)
+        if chunk_done and self.controller is not None:
             asyncio.create_task(self.controller.update_threshold(traj_id=frame.traj_id))
 
 
@@ -603,12 +607,8 @@ class Trainer(CascadeAgent):
         """Drop frames whose minimum interatomic distance is below a physically-plausible
         threshold (e.g. from a collapsing/unstable cell), so training never sees collided
         structures."""
-        kept = []
-        for atoms in frames:
-            dists = atoms.get_all_distances(mic=True)
-            np.fill_diagonal(dists, np.inf)
-            if dists.min() >= self.config.min_interatomic_distance:
-                kept.append(atoms)
+        kept = [atoms for atoms in frames
+                if len(neighbor_list('i', atoms, self.config.min_interatomic_distance)) == 0]
         n_dropped = len(frames) - len(kept)
         if n_dropped:
             self.logger.warning(
@@ -666,7 +666,7 @@ class Trainer(CascadeAgent):
             self.logger.warning(f'No training frames found for round {training_round}, skipping training')
             return self.weights
         self.logger.info(f'Got {len(train_data)} training frames')
-        train_data = self._filter_unphysical_frames(train_data)
+        train_data = await asyncio.to_thread(self._filter_unphysical_frames, train_data)
         if not train_data:
             self.logger.warning(f'All training frames for round {training_round} were filtered as unphysical, skipping training')
             return self.weights
