@@ -115,3 +115,44 @@ def test_audit_reason_sample_routes_by_reason():
     audit_reason_sample(chunk, 1, reason=None, **kwargs)
 
     assert calls == ['burn_in', 'threshold', 'random_fail', 'default']
+
+
+def _emt_chunk(force_offset: float) -> Chunk:
+    """3-frame Cu chunk whose 'ML' forces are the EMT forces plus force_offset on one component"""
+    from ase.build import bulk
+    from ase.calculators.emt import EMT
+    from ase.calculators.singlepoint import SinglePointCalculator
+
+    atoms = []
+    for seed in range(3):
+        a = bulk('Cu', 'fcc', a=3.6, cubic=True)
+        a.rattle(0.05, seed=seed)
+        a.calc = EMT()
+        forces = a.get_forces().copy()
+        forces[0, 0] += force_offset
+        a.calc = SinglePointCalculator(a, energy=a.get_potential_energy(), forces=forces)
+        atoms.append(a)
+    return Chunk(atoms=atoms, frame_ids=[10, 11, 12], traj_id=0, chunk_id=0, attempt_ix=0, model_version=1)
+
+
+def test_last_frame_error_audit():
+    from ase.calculators.emt import EMT
+    from cascade.agents.task import last_frame_error_audit, max_force_error
+    from cascade.model import AuditStatus
+
+    kws = dict(calc_factory=EMT, error_fn=max_force_error, threshold=0.1)
+
+    passed = last_frame_error_audit(_emt_chunk(0.05), **kws)
+    assert passed.status == AuditStatus.PASSED
+    assert np.isclose(passed.score, 0.05)
+    assert [f.frame_id for f in passed.labeled_frames] == [12]  # only the last frame is labeled
+
+    failed = last_frame_error_audit(_emt_chunk(0.5), **kws)
+    assert failed.status == AuditStatus.FAILED
+    assert failed.reason == 'last_frame_error'
+    assert np.isclose(failed.score, 0.5)
+    assert len(failed.labeled_frames) == 1  # labeled frame is returned on failure too
+
+    burn_in = last_frame_error_audit(_emt_chunk(0.0), burn_in_model_versions=2, **kws)
+    assert burn_in.reason == 'burn_in'
+    assert burn_in.labeled_frames == []
