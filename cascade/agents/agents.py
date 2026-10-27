@@ -34,6 +34,21 @@ from cascade.agents.task import audit_with_random_failure
 from cascade.model import Chunk, TrainingFrame
 
 
+def store_labeled_frame(traj_db: TrajectoryDB, run_id: str, frame: TrainingFrame, error_fn, uq_field: str) -> None:
+    """Save a reference-labeled frame as training data (shared by Labeler and Auditor)"""
+    traj_db.add_training_frame(
+        run_id=run_id,
+        traj_id=frame.traj_id,
+        chunk_id=frame.chunk_id,
+        attempt_index=frame.attempt_index,
+        trajectory_frame_id=frame.frame_id,
+        model_version_sampled_from=frame.model_version,
+        atoms_labeled=frame.atoms_labeled,
+        calibration_uq=frame.atoms.info.get(uq_field),
+        calibration_error=error_fn(frame.atoms, frame.atoms_labeled),
+    )
+
+
 class CascadeAgent(Agent):
     """Base class for all cascade agents"""
 
@@ -347,6 +362,15 @@ class Auditor(CascadeAgent):
             audit_status=status,
             audit_reason=result.reason,
         )
+        # Audits that ran the reference calc hand back their labeled frames; keep them as training data.
+        # No chunk labeling events are recorded, so the Labeler's per-chunk frame counts are unaffected.
+        for frame in result.labeled_frames:
+            store_labeled_frame(self._traj_db, self.config.run_id, frame, self.config.error_fn, self.config.uq_field)
+        if result.labeled_frames:
+            self.logger.info(
+                f'Stored {len(result.labeled_frames)} audit-labeled frames for traj {chunk.traj_id} '
+                f'chunk {chunk.chunk_id} attempt {chunk.attempt_ix}'
+            )
         if status == AuditStatus.PASSED:
             self.logger.info(
                 f'Audit passed for traj {chunk.traj_id} chunk {chunk.chunk_id} attempt {chunk.attempt_ix}'
@@ -550,14 +574,7 @@ class Labeler(CascadeAgent):
             chunk_id=frame.chunk_id,
             attempt_index=frame.attempt_index,
         )
-        self._traj_db.add_training_frame(
-            **chunk_kws,
-            trajectory_frame_id=frame.frame_id,
-            model_version_sampled_from=frame.model_version,
-            atoms_labeled=frame.atoms_labeled,
-            calibration_uq=frame.atoms.info.get(self.config.uq_field),
-            calibration_error=self.error_fn(frame.atoms, frame.atoms_labeled),
-        )
+        store_labeled_frame(self._traj_db, self.config.run_id, frame, self.error_fn, self.config.uq_field)
         self._traj_db.record_chunk_event(**chunk_kws, event_type=ChunkEventType.FINISHED_LABELING_FRAME, frame_id=frame.frame_id)
 
         labeled_count = self._traj_db.count_labeled_frames_for_chunk(**chunk_kws)
