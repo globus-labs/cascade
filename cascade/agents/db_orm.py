@@ -33,7 +33,9 @@ from sqlalchemy import (
     LargeBinary,
     UniqueConstraint,
     Index,
+    text,
 )
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import relationship, sessionmaker, declarative_base
 from cascade.model import AuditStatus, TrajectoryStatus, ChunkEventType
 
@@ -260,6 +262,37 @@ class DBTrainingLog(Base):
         return f"<DBTrainingLog(run_id={self.run_id}, training_round={self.training_round})>"
 
 
+def sync_enum_types(engine: Engine) -> None:
+    """Add Python enum members that are missing from existing PostgreSQL enum types.
+
+    ``create_all`` creates a native enum type with every member, but never alters a type that
+    already exists. A member added to the Python enum later is then rejected on insert.
+    Values are only added, never removed, and each goes after its predecessor in the Python
+    enum so the order matches. No-op on other databases (e.g. SQLite stores enums as strings).
+    """
+    if engine.dialect.name != 'postgresql':
+        return
+    enum_types = {col.type.name: col.type for table in Base.metadata.tables.values() for col in table.columns
+                  if isinstance(col.type, SQLEnum) and col.type.native_enum}
+    # ADD VALUE takes effect at commit, so run each statement in its own transaction
+    with engine.connect().execution_options(isolation_level='AUTOCOMMIT') as conn:
+        for name, enum_type in enum_types.items():
+            existing = conn.execute(text(
+                'select e.enumlabel from pg_enum e join pg_type t on t.oid = e.enumtypid '
+                'where t.typname = :name and pg_type_is_visible(t.oid) order by e.enumsortorder'
+            ), {'name': name}).scalars().all()
+            if not existing:
+                continue  # type doesn't exist; create_all makes it complete
+            previous = None
+            for label in enum_type.enums:
+                if label not in existing:
+                    position = f"AFTER '{previous}'" if previous else f"BEFORE '{existing[0]}'"
+                    # IF NOT EXISTS: another process (e.g. an agent starting up) may add it at the same time
+                    conn.execute(text(f"ALTER TYPE {name} ADD VALUE IF NOT EXISTS '{label}' {position}"))
+                    logger.info(f'Added value {label} to enum type {name}')
+                previous = label
+
+
 class TrajectoryDB:
     """Wrapper for the database representations of trajectories and chunks"""
     
@@ -279,8 +312,9 @@ class TrajectoryDB:
         self._logger.info(f"Created TrajectoryDB engine (id={id(self.engine)})")
         
     def create_tables(self):
-        """Create all tables if they don't exist"""
+        """Create all tables if they don't exist, and add any new enum values to existing enum types"""
         Base.metadata.create_all(self.engine)
+        sync_enum_types(self.engine)
     
     @contextlib.contextmanager
     def session(self):

@@ -145,17 +145,20 @@ def audit_reason_sample(
     burn_in_sampler: Callable[..., list[TrainingFrame]] = random_sample,
     threshold_sampler: Callable[..., list[TrainingFrame]] = boundary_uq_sample,
     random_sampler: Callable[..., list[TrainingFrame]] = max_uq_sample,
+    last_frame_error_sampler: Callable[..., list[TrainingFrame]] = random_sample,
 ) -> list[TrainingFrame]:
     """Dispatches to different smapling methods based on audit failure reason
 
     burn_in_sampler: when the audit failure reasion is "burn_in"
     threshold_sampler: when the audit failure reason is "threshold"
     random_sampler: when the audit failure reason is "random_fail"
+    last_frame_error_sampler: when the audit failure reason is "last_frame_error"
     """
     strategy = {
         'burn_in': burn_in_sampler,
         'threshold': threshold_sampler,
         'random_fail': random_sampler,
+        'last_frame_error': last_frame_error_sampler,
     }.get(reason)
     return strategy(chunk, n_frames, threshold=threshold, field=field)
 
@@ -340,6 +343,30 @@ def uq_threshold_audit(
     return AuditResult(status=status, score=score, reason='threshold')
 
 
+def last_frame_error_audit(
+    chunk: Chunk,
+    calc_factory: Callable[..., Calculator],
+    threshold: float,
+    error_fn: Callable[[Atoms, Atoms], float],
+    burn_in_model_versions: int = 0,
+) -> AuditResult:
+    """Audit a chunk by labeling its last frame and comparing against the reference
+
+    Fails the chunk if the error between the ML and reference forces on the last frame
+    is at or above threshold. Does not use UQ. The labeled frame is returned in
+    labeled_frames whether the chunk passes or fails, so it can be stored as training data.
+    """
+    from cascade.model import AuditResult, AuditStatus
+
+    if chunk.model_version < burn_in_model_versions:
+        return AuditResult(status=AuditStatus.FAILED, score=float('inf'), reason='burn_in')
+
+    frame = label_frame(_frames_from_indices(chunk, [-1])[0], calc_factory)
+    err = error_fn(frame.atoms, frame.atoms_labeled)
+    status = AuditStatus.PASSED if err < threshold else AuditStatus.FAILED
+    return AuditResult(status=status, score=err, reason='last_frame_error', labeled_frames=[frame])
+
+
 def audit_with_random_failure(
     chunk: Chunk,
     audit_task: Callable[..., AuditResult],
@@ -355,7 +382,9 @@ def audit_with_random_failure(
     if result.status == AuditStatus.PASSED and fail_rate > 0:
         rng = np.random.default_rng(seed=None)
         if rng.random() < fail_rate:
-            return AuditResult(status=AuditStatus.FAILED, score=result.score, reason='random_fail')
+            # replace() keeps the other fields (e.g. labeled_frames) of the wrapped result
+            from dataclasses import replace
+            return replace(result, status=AuditStatus.FAILED, reason='random_fail')
     return result
 
 def max_force_error(atoms_predicted: Atoms, atoms_labeled: Atoms) -> float:

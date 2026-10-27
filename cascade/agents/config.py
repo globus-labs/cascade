@@ -100,6 +100,10 @@ class AuditorConfig(CascadeAgentConfig):
     """Keyword arguments to audit_task"""
     executor: Executor
     """Where to run audit task"""
+    error_fn: Callable[[Atoms, Atoms], float]
+    """(predicted_atoms, labeled_atoms) -> observed error, recorded for frames the audit labeled"""
+    uq_field: str = 'uq_force_std_max'
+    """atoms.info key holding the UQ scalar recorded for frames the audit labeled"""
     random_fail_rate: float = 0.0
     """If > 0, the Auditor wraps audit_task so a PASSED result is randomly downgraded
     to FAILED at this frequency, independent of audit_task's own pass/fail logic"""
