@@ -36,6 +36,7 @@ from cascade.agents.agents import (
     Trainer,
     Controller,
 )
+from cascade.agents.executors import PriorityExecutor
 from cascade.agents.config import (
     DatabaseMonitorConfig,
     DynamicsRunnerConfig,
@@ -203,6 +204,15 @@ def parse_args() -> argparse.Namespace:
         help='Agents whose tasks run in a thread pool in this process instead of on the Parsl pool. '
              'Intended for cheap tasks (e.g., auditor with uq_threshold, sampler); local dynamics, '
              'labeler, or trainer use whatever device they name on the launch host'
+    )
+    parser.add_argument(
+        '--prioritize-non-dynamics',
+        type=int,
+        default=1,
+        help='If 1 (default), audit, sampling, labeling and training tasks on the Parsl pool jump ahead of '
+             'queued dynamics tasks (Parsl priority; running tasks are not preempted). With more trajectories '
+             'than tiles they otherwise wait behind the whole dynamics backlog, which delays retraining. '
+             'Set 0 to submit everything with no priority, as in earlier runs, for comparisons.'
     )
     parser.add_argument(
         '--audit-threshold',
@@ -405,6 +415,7 @@ def parse_args() -> argparse.Namespace:
     args.per_trajectory_threshold = bool(args.per_trajectory_threshold)
     args.early_stop_on_uq_spike = bool(args.early_stop_on_uq_spike)
     args.catch_dynamics_crashes = bool(args.catch_dynamics_crashes)
+    args.prioritize_non_dynamics = bool(args.prioritize_non_dynamics)
 
     return args
 
@@ -574,8 +585,13 @@ async def main():
         if local_pools:
             print(f'Running tasks locally for agents: {sorted(local_pools)}')
 
+        # tasks of every agent but dynamics run ahead of queued dynamics tasks (see --prioritize-non-dynamics)
+        priority_pool = PriorityExecutor(pool) if args.prioritize_non_dynamics else pool
+
         def executor_for(name: str) -> Executor:
-            return local_pools.get(name, pool)
+            if name in local_pools:
+                return local_pools[name]
+            return pool if name == 'dynamics' else priority_pool
 
         async with await Manager.from_exchange_factory(
             factory=LocalExchangeFactory(),
